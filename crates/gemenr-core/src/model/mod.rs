@@ -1,7 +1,11 @@
+mod anthropic;
+
 use async_trait::async_trait;
 
 use crate::error::ModelError;
 use crate::message::ChatMessage;
+
+pub use anthropic::AnthropicProvider;
 
 /// Reason why the model stopped generating.
 #[derive(Debug, Clone, PartialEq, Eq)]
