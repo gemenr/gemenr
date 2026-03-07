@@ -5,7 +5,6 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::debug;
 
-const DEFAULT_TEMPERATURE: f64 = 0.7;
 const CONFIG_FILE_NAME: &str = "gemenr.toml";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_API_ENDPOINT_ENV: &str = "ANTHROPIC_API_ENDPOINT";
@@ -50,8 +49,6 @@ pub struct ModelConfig {
     pub provider: String,
     /// Remote model name understood by the provider.
     pub model: String,
-    /// Sampling temperature (0.0 - 1.0).
-    pub temperature: f64,
     /// Maximum tokens to generate. `None` means provider default.
     pub max_tokens: Option<u32>,
 }
@@ -102,7 +99,6 @@ struct RawProviderConfig {
 struct RawModelConfig {
     provider: String,
     model: String,
-    temperature: Option<f64>,
     max_tokens: Option<u32>,
 }
 
@@ -182,15 +178,11 @@ fn build_models(
         let model_name = normalize_required_string(raw_model.model, || {
             format!("models.{model_id}.model must not be empty")
         })?;
-        let temperature = raw_model.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-        validate_temperature(&model_id, temperature)?;
-
         models.insert(
             model_id,
             ModelConfig {
                 provider,
                 model: model_name,
-                temperature,
                 max_tokens: raw_model.max_tokens,
             },
         );
@@ -320,16 +312,6 @@ fn normalize_required_string(
     normalize_optional_string(Some(value)).ok_or_else(|| ConfigError::Invalid(error_message()))
 }
 
-fn validate_temperature(model_id: &str, temperature: f64) -> Result<(), ConfigError> {
-    if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
-        return Err(ConfigError::Invalid(format!(
-            "models.{model_id}.temperature must be between 0.0 and 1.0, got {temperature}"
-        )));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -425,7 +407,6 @@ api_endpoint = "https://file.example/v1/messages"
 [models.default]
 provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
-temperature = 0.2
 max_tokens = 256
 "#,
         );
@@ -441,7 +422,6 @@ max_tokens = 256
         assert_eq!(config.model, "default");
         assert_eq!(selected_model.provider, "anthropic");
         assert_eq!(selected_model.model, "claude-haiku-4-5-20251001");
-        assert_eq!(selected_model.temperature, 0.2);
         assert_eq!(selected_model.max_tokens, Some(256));
         assert_eq!(selected_provider.provider_type, ProviderType::Anthropic);
         assert_eq!(selected_provider.api_key, "file-api-key");
@@ -477,12 +457,10 @@ api_key = "secondary-key"
 [models.primary]
 provider = "primary"
 model = "claude-haiku-4-5-20251001"
-temperature = 0.9
 
 [models.secondary]
 provider = "secondary"
 model = "claude-sonnet-4-20250514"
-temperature = 0.2
 "#,
         );
 
@@ -527,7 +505,6 @@ api_endpoint = "https://file.example/v1/messages"
 [models.default]
 provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
-temperature = 0.2
 max_tokens = 256
 "#,
         );
@@ -628,30 +605,6 @@ model = "gpt-4.1"
     }
 
     #[test]
-    fn load_rejects_invalid_temperature() {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let isolation = TestIsolation::new();
-        let config_path = write_config(
-            isolation.temp_dir(),
-            r#"
-model = "default"
-
-[providers.anthropic]
-type = "anthropic"
-api_key = "file-api-key"
-
-[models.default]
-provider = "anthropic"
-model = "claude-haiku-4-5-20251001"
-temperature = 1.5
-"#,
-        );
-
-        let error = Config::load_from(&config_path).expect_err("invalid temperature should error");
-        assert!(matches!(error, ConfigError::Invalid(message) if message.contains("temperature")));
-    }
-
-    #[test]
     fn load_rejects_old_flat_schema() {
         let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
         let isolation = TestIsolation::new();
@@ -660,7 +613,6 @@ temperature = 1.5
             r#"
 api_key = "flat-key"
 model = "claude-haiku-4-5-20251001"
-temperature = 0.7
 "#,
         );
 

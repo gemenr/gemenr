@@ -24,8 +24,6 @@ pub struct ModelRequest {
     pub messages: Vec<ChatMessage>,
     /// Model identifier (e.g., "claude-haiku-4-5-20251001").
     pub model: String,
-    /// Sampling temperature (0.0 - 1.0).
-    pub temperature: f64,
     /// Maximum tokens to generate. `None` means provider default.
     pub max_tokens: Option<u32>,
 }
@@ -80,7 +78,6 @@ mod tests {
                 ChatMessage::user("Hello!"),
             ],
             model: "claude-haiku-4-5-20251001".to_string(),
-            temperature: 0.3,
             max_tokens: Some(256),
         };
 
@@ -88,7 +85,6 @@ mod tests {
         assert_eq!(request.messages[0], ChatMessage::system("Be concise."));
         assert_eq!(request.messages[1], ChatMessage::user("Hello!"));
         assert_eq!(request.model, "claude-haiku-4-5-20251001");
-        assert_eq!(request.temperature, 0.3);
         assert_eq!(request.max_tokens, Some(256));
     }
 
@@ -110,7 +106,6 @@ mod tests {
             .complete(ModelRequest {
                 messages: vec![ChatMessage::user("Ping")],
                 model: "claude-haiku-4-5-20251001".to_string(),
-                temperature: 0.7,
                 max_tokens: None,
             })
             .await

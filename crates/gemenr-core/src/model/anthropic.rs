@@ -145,8 +145,6 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -194,7 +192,6 @@ fn build_request(request: &ModelRequest, default_model: &str) -> AnthropicReques
         max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         messages,
         system,
-        temperature: Some(request.temperature),
     }
 }
 
@@ -426,12 +423,11 @@ mod tests {
     }
 
     #[test]
-    fn request_serialization_omits_missing_system_and_keeps_temperature() {
+    fn request_serialization_omits_missing_system_and_temperature() {
         let request = build_request(
             &ModelRequest {
                 messages: vec![ChatMessage::user("Hello")],
                 model: "claude-haiku-4-5-20251001".to_string(),
-                temperature: 0.3,
                 max_tokens: None,
             },
             "fallback-model",
@@ -441,8 +437,8 @@ mod tests {
 
         assert_eq!(value["model"], json!("claude-haiku-4-5-20251001"));
         assert_eq!(value["max_tokens"], json!(DEFAULT_MAX_TOKENS));
-        assert_eq!(value["temperature"], json!(0.3));
         assert!(value.get("system").is_none());
+        assert!(value.get("temperature").is_none());
         assert_eq!(value["messages"][0]["role"], json!("user"));
         assert_eq!(value["messages"][0]["content"], json!("Hello"));
     }
@@ -464,13 +460,12 @@ mod tests {
             max_tokens: 128,
             messages: vec![],
             system: None,
-            temperature: Some(0.7),
         };
 
         let serialized = serde_json::to_string(&request).expect("request should serialize");
 
         assert!(!serialized.contains("\"system\""));
-        assert!(serialized.contains("\"temperature\":0.7"));
+        assert!(!serialized.contains("\"temperature\""));
     }
 
     #[test]
@@ -539,7 +534,6 @@ mod tests {
             ModelConfig {
                 provider: "anthropic".to_string(),
                 model: "claude-haiku-4-5-20251001".to_string(),
-                temperature: 0.7,
                 max_tokens: None,
             },
         );

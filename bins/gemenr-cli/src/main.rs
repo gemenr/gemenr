@@ -5,6 +5,8 @@ use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{ChatMessage, Config, ConfigError, ModelError, ModelProvider, ModelRequest};
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+
 /// Gemenr — an LLM-based agent runtime.
 #[derive(Debug, Parser)]
 #[command(name = "gemenr", version, about)]
@@ -58,7 +60,7 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
     tracing::info!(target: "gemenr::cli", "starting chat session");
 
     let stdin = io::stdin();
-    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut history = initial_history();
     let mut input = String::new();
 
     loop {
@@ -134,9 +136,12 @@ fn build_model_request(
     Ok(ModelRequest {
         messages: history.to_vec(),
         model: selected_model.model.clone(),
-        temperature: selected_model.temperature,
         max_tokens: selected_model.max_tokens,
     })
+}
+
+fn initial_history() -> Vec<ChatMessage> {
+    vec![ChatMessage::system(DEFAULT_SYSTEM_PROMPT)]
 }
 
 fn display_model_error(error: &ModelError) -> String {
@@ -156,7 +161,7 @@ fn display_model_error(error: &ModelError) -> String {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{build_model_request, display_model_error};
+    use super::{DEFAULT_SYSTEM_PROMPT, build_model_request, display_model_error, initial_history};
     use gemenr_core::{ChatMessage, Config, ModelConfig, ModelError, ProviderConfig, ProviderType};
 
     #[test]
@@ -172,8 +177,14 @@ mod tests {
 
         assert_eq!(request.messages, history);
         assert_eq!(request.model, "claude-haiku-4-5-20251001");
-        assert_eq!(request.temperature, 0.4);
         assert_eq!(request.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn initial_history_contains_default_system_prompt() {
+        let history = initial_history();
+
+        assert_eq!(history, vec![ChatMessage::system(DEFAULT_SYSTEM_PROMPT)]);
     }
 
     #[test]
@@ -221,7 +232,6 @@ mod tests {
             ModelConfig {
                 provider: "anthropic".to_string(),
                 model: "claude-haiku-4-5-20251001".to_string(),
-                temperature: 0.4,
                 max_tokens: Some(256),
             },
         );
