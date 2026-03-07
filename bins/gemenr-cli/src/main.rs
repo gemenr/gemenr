@@ -85,12 +85,7 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
             "sending request to model"
         );
 
-        let request = ModelRequest {
-            messages: history.clone(),
-            model: config.model.clone(),
-            temperature: config.temperature,
-            max_tokens: config.max_tokens,
-        };
+        let request = build_model_request(&history, config);
 
         match provider.complete(request).await {
             Ok(response) => {
@@ -117,6 +112,15 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
     tracing::info!(target: "gemenr::cli", "chat session ended");
 }
 
+fn build_model_request(history: &[ChatMessage], config: &Config) -> ModelRequest {
+    ModelRequest {
+        messages: history.to_vec(),
+        model: config.model.clone(),
+        temperature: config.temperature,
+        max_tokens: config.max_tokens,
+    }
+}
+
 fn display_model_error(error: &ModelError) -> String {
     match error {
         ModelError::Auth(message) => format!("authentication failed: {message}"),
@@ -127,5 +131,62 @@ fn display_model_error(error: &ModelError) -> String {
             format!("authentication failed: {message}")
         }
         _ => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_model_request, display_model_error};
+    use gemenr_core::{ChatMessage, Config, ModelError};
+
+    #[test]
+    fn build_model_request_preserves_history_and_config() {
+        let history = vec![
+            ChatMessage::system("Be concise."),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi"),
+        ];
+        let config = Config {
+            api_key: "test-key".to_string(),
+            api_endpoint: None,
+            model: "claude-haiku-4-5-20251001".to_string(),
+            temperature: 0.4,
+            max_tokens: Some(256),
+        };
+
+        let request = build_model_request(&history, &config);
+
+        assert_eq!(request.messages, history);
+        assert_eq!(request.model, config.model);
+        assert_eq!(request.temperature, config.temperature);
+        assert_eq!(request.max_tokens, config.max_tokens);
+    }
+
+    #[test]
+    fn display_model_error_maps_auth_status_codes_to_user_friendly_message() {
+        let unauthorized = ModelError::Api {
+            status: 401,
+            message: "bad key".to_string(),
+        };
+        let forbidden = ModelError::Api {
+            status: 403,
+            message: "request not allowed".to_string(),
+        };
+
+        assert_eq!(
+            display_model_error(&unauthorized),
+            "authentication failed: bad key"
+        );
+        assert_eq!(
+            display_model_error(&forbidden),
+            "authentication failed: request not allowed"
+        );
+    }
+
+    #[test]
+    fn display_model_error_leaves_non_auth_errors_unchanged() {
+        let timeout = ModelError::Timeout;
+
+        assert_eq!(display_model_error(&timeout), "request timed out");
     }
 }

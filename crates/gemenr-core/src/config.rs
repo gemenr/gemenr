@@ -5,10 +5,11 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::debug;
 
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const CONFIG_FILE_NAME: &str = "gemenr.toml";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const ANTHROPIC_API_ENDPOINT_ENV: &str = "ANTHROPIC_API_ENDPOINT";
 const GEMENR_MODEL_ENV: &str = "GEMENR_MODEL";
 const GEMENR_TEMPERATURE_ENV: &str = "GEMENR_TEMPERATURE";
 const GEMENR_MAX_TOKENS_ENV: &str = "GEMENR_MAX_TOKENS";
@@ -16,14 +17,16 @@ const GEMENR_MAX_TOKENS_ENV: &str = "GEMENR_MAX_TOKENS";
 /// Application configuration for Gemenr.
 ///
 /// Configuration is loaded with the following priority (highest first):
-/// 1. Environment variables
-/// 2. Configuration file (`gemenr.toml`)
+/// 1. Configuration file (`gemenr.toml`)
+/// 2. Environment variables
 /// 3. Built-in defaults
 #[derive(Debug, Clone)]
 pub struct Config {
     /// API key for the model provider.
     pub api_key: String,
-    /// Model identifier (e.g., `claude-sonnet-4-20250514`).
+    /// Optional API endpoint override for the model provider.
+    pub api_endpoint: Option<String>,
+    /// Model identifier (e.g., `claude-haiku-4-5-20251001`).
     pub model: String,
     /// Sampling temperature (0.0 - 1.0).
     pub temperature: f64,
@@ -56,6 +59,7 @@ pub enum ConfigError {
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     api_key: Option<String>,
+    api_endpoint: Option<String>,
     model: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
@@ -84,24 +88,30 @@ impl Config {
     fn from_sources(file_config: Option<ConfigFile>) -> Result<Self, ConfigError> {
         let file_config = file_config.unwrap_or_default();
 
-        let api_key = optional_env_string(ANTHROPIC_API_KEY_ENV)?
-            .or_else(|| normalize_optional_string(file_config.api_key))
+        let api_key = normalize_optional_string(file_config.api_key)
+            .or(optional_env_string(ANTHROPIC_API_KEY_ENV)?)
             .ok_or(ConfigError::ApiKeyMissing)?;
 
-        let model = optional_env_string(GEMENR_MODEL_ENV)?
-            .or_else(|| normalize_optional_string(file_config.model))
+        let api_endpoint = normalize_optional_string(file_config.api_endpoint)
+            .or(optional_env_string(ANTHROPIC_API_ENDPOINT_ENV)?);
+
+        let model = normalize_optional_string(file_config.model)
+            .or(optional_env_string(GEMENR_MODEL_ENV)?)
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-        let temperature = parse_optional_env::<f64>(GEMENR_TEMPERATURE_ENV)?
-            .or(file_config.temperature)
+        let temperature = file_config
+            .temperature
+            .or(parse_optional_env::<f64>(GEMENR_TEMPERATURE_ENV)?)
             .unwrap_or(DEFAULT_TEMPERATURE);
         validate_temperature(temperature)?;
 
-        let max_tokens =
-            parse_optional_env::<u32>(GEMENR_MAX_TOKENS_ENV)?.or(file_config.max_tokens);
+        let max_tokens = file_config
+            .max_tokens
+            .or(parse_optional_env::<u32>(GEMENR_MAX_TOKENS_ENV)?);
 
         Ok(Self {
             api_key,
+            api_endpoint,
             model,
             temperature,
             max_tokens,
@@ -185,8 +195,8 @@ pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_API_KEY_ENV, CONFIG_FILE_NAME, Config, ConfigError, DEFAULT_MODEL,
-        DEFAULT_TEMPERATURE, ENV_MUTEX, GEMENR_MAX_TOKENS_ENV, GEMENR_MODEL_ENV,
+        ANTHROPIC_API_ENDPOINT_ENV, ANTHROPIC_API_KEY_ENV, CONFIG_FILE_NAME, Config, ConfigError,
+        DEFAULT_MODEL, DEFAULT_TEMPERATURE, ENV_MUTEX, GEMENR_MAX_TOKENS_ENV, GEMENR_MODEL_ENV,
         GEMENR_TEMPERATURE_ENV,
     };
     use std::env;
@@ -195,8 +205,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const TEST_ENV_KEYS: [&str; 4] = [
+    const TEST_ENV_KEYS: [&str; 5] = [
         ANTHROPIC_API_KEY_ENV,
+        ANTHROPIC_API_ENDPOINT_ENV,
         GEMENR_MODEL_ENV,
         GEMENR_TEMPERATURE_ENV,
         GEMENR_MAX_TOKENS_ENV,
@@ -265,6 +276,10 @@ mod tests {
         let _isolation = TestIsolation::new();
 
         set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
+        set_env_var(
+            ANTHROPIC_API_ENDPOINT_ENV,
+            "https://env.example/v1/messages",
+        );
         set_env_var(GEMENR_MODEL_ENV, "claude-test-model");
         set_env_var(GEMENR_TEMPERATURE_ENV, "0.3");
         set_env_var(GEMENR_MAX_TOKENS_ENV, "512");
@@ -272,6 +287,10 @@ mod tests {
         let config = Config::load().expect("config should load from environment");
 
         assert_eq!(config.api_key, "env-api-key");
+        assert_eq!(
+            config.api_endpoint.as_deref(),
+            Some("https://env.example/v1/messages")
+        );
         assert_eq!(config.model, "claude-test-model");
         assert_eq!(config.temperature, 0.3);
         assert_eq!(config.max_tokens, Some(512));
@@ -296,6 +315,7 @@ mod tests {
         let config = Config::load().expect("config should load with defaults");
 
         assert_eq!(config.api_key, "env-api-key");
+        assert_eq!(config.api_endpoint, None);
         assert_eq!(config.model, DEFAULT_MODEL);
         assert_eq!(config.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(config.max_tokens, None);
@@ -309,6 +329,7 @@ mod tests {
             isolation.temp_dir(),
             r#"
 api_key = "file-api-key"
+api_endpoint = "https://file.example/v1/messages"
 model = "claude-file-model"
 temperature = 0.2
 max_tokens = 256
@@ -318,19 +339,24 @@ max_tokens = 256
         let config = Config::load_from(&config_path).expect("config file should parse");
 
         assert_eq!(config.api_key, "file-api-key");
+        assert_eq!(
+            config.api_endpoint.as_deref(),
+            Some("https://file.example/v1/messages")
+        );
         assert_eq!(config.model, "claude-file-model");
         assert_eq!(config.temperature, 0.2);
         assert_eq!(config.max_tokens, Some(256));
     }
 
     #[test]
-    fn environment_overrides_config_file_values() {
+    fn config_file_overrides_environment_values() {
         let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
         let isolation = TestIsolation::new();
         let config_path = write_config(
             isolation.temp_dir(),
             r#"
 api_key = "file-api-key"
+api_endpoint = "https://file.example/v1/messages"
 model = "claude-file-model"
 temperature = 0.2
 max_tokens = 256
@@ -338,14 +364,55 @@ max_tokens = 256
         );
 
         set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
+        set_env_var(
+            ANTHROPIC_API_ENDPOINT_ENV,
+            "https://env.example/v1/messages",
+        );
         set_env_var(GEMENR_MODEL_ENV, "claude-env-model");
         set_env_var(GEMENR_TEMPERATURE_ENV, "0.9");
         set_env_var(GEMENR_MAX_TOKENS_ENV, "1024");
 
-        let config = Config::load_from(&config_path).expect("env vars should override file values");
+        let config = Config::load_from(&config_path)
+            .expect("config file values should override environment values");
+
+        assert_eq!(config.api_key, "file-api-key");
+        assert_eq!(
+            config.api_endpoint.as_deref(),
+            Some("https://file.example/v1/messages")
+        );
+        assert_eq!(config.model, "claude-file-model");
+        assert_eq!(config.temperature, 0.2);
+        assert_eq!(config.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn environment_fills_missing_values_when_config_file_is_partial() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "claude-file-model"
+"#,
+        );
+
+        set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
+        set_env_var(
+            ANTHROPIC_API_ENDPOINT_ENV,
+            "https://env.example/v1/messages",
+        );
+        set_env_var(GEMENR_TEMPERATURE_ENV, "0.9");
+        set_env_var(GEMENR_MAX_TOKENS_ENV, "1024");
+
+        let config = Config::load_from(&config_path)
+            .expect("environment should fill values missing from config file");
 
         assert_eq!(config.api_key, "env-api-key");
-        assert_eq!(config.model, "claude-env-model");
+        assert_eq!(
+            config.api_endpoint.as_deref(),
+            Some("https://env.example/v1/messages")
+        );
+        assert_eq!(config.model, "claude-file-model");
         assert_eq!(config.temperature, 0.9);
         assert_eq!(config.max_tokens, Some(1024));
     }

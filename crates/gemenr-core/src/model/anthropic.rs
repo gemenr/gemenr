@@ -19,6 +19,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_SECS: u64 = 1;
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 
 /// Anthropic Claude API provider.
@@ -28,6 +29,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 pub struct AnthropicProvider {
     client: Client,
     api_key: String,
+    api_endpoint: String,
     default_model: String,
 }
 
@@ -38,6 +40,10 @@ impl AnthropicProvider {
         Self {
             client: Client::new(),
             api_key: config.api_key.clone(),
+            api_endpoint: config
+                .api_endpoint
+                .clone()
+                .unwrap_or_else(|| ANTHROPIC_API_URL.to_string()),
             default_model: config.model.clone(),
         }
     }
@@ -90,10 +96,11 @@ impl AnthropicProvider {
 
         let response = self
             .client
-            .post(ANTHROPIC_API_URL)
+            .post(&self.api_endpoint)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&request_body)
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .send()
             .await
             .map_err(map_request_error)?;
@@ -322,9 +329,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AnthropicRequest, DEFAULT_MAX_TOKENS, build_request, map_error_response,
-        parse_response_body, parse_retry_after, split_system_messages,
+        ANTHROPIC_API_URL, AnthropicProvider, AnthropicRequest, BASE_RETRY_DELAY_SECS,
+        DEFAULT_MAX_TOKENS, build_request, map_error_response, parse_response_body,
+        parse_retry_after, retry_delay, should_retry, split_system_messages,
     };
+    use crate::config::Config;
     use crate::error::ModelError;
     use crate::message::ChatMessage;
     use crate::model::{FinishReason, ModelRequest};
@@ -415,7 +424,7 @@ mod tests {
         let request = build_request(
             &ModelRequest {
                 messages: vec![ChatMessage::user("Hello")],
-                model: "claude-sonnet-4-20250514".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
                 temperature: 0.3,
                 max_tokens: None,
             },
@@ -424,7 +433,7 @@ mod tests {
 
         let value = serde_json::to_value(&request).expect("request should serialize");
 
-        assert_eq!(value["model"], json!("claude-sonnet-4-20250514"));
+        assert_eq!(value["model"], json!("claude-haiku-4-5-20251001"));
         assert_eq!(value["max_tokens"], json!(DEFAULT_MAX_TOKENS));
         assert_eq!(value["temperature"], json!(0.3));
         assert!(value.get("system").is_none());
@@ -445,7 +454,7 @@ mod tests {
     #[test]
     fn anthropic_request_skips_system_when_none() {
         let request = AnthropicRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             max_tokens: 128,
             messages: vec![],
             system: None,
@@ -456,5 +465,64 @@ mod tests {
 
         assert!(!serialized.contains("\"system\""));
         assert!(serialized.contains("\"temperature\":0.7"));
+    }
+
+    #[test]
+    fn provider_uses_default_api_endpoint_when_config_has_none() {
+        let provider = AnthropicProvider::new(&Config {
+            api_key: "test-key".to_string(),
+            api_endpoint: None,
+            model: "claude-haiku-4-5-20251001".to_string(),
+            temperature: 0.7,
+            max_tokens: None,
+        });
+
+        assert_eq!(provider.api_endpoint, ANTHROPIC_API_URL);
+    }
+
+    #[test]
+    fn provider_uses_configured_api_endpoint_override() {
+        let provider = AnthropicProvider::new(&Config {
+            api_key: "test-key".to_string(),
+            api_endpoint: Some("https://example.com/v1/messages".to_string()),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            temperature: 0.7,
+            max_tokens: None,
+        });
+
+        assert_eq!(provider.api_endpoint, "https://example.com/v1/messages");
+    }
+
+    #[test]
+    fn retry_logic_only_retries_timeouts_and_rate_limits() {
+        assert!(should_retry(&ModelError::Timeout));
+        assert!(should_retry(&ModelError::RateLimit { retry_after: None }));
+        assert!(!should_retry(&ModelError::Auth("bad key".to_string())));
+        assert!(!should_retry(&ModelError::Network("offline".to_string())));
+        assert!(!should_retry(&ModelError::Api {
+            status: 500,
+            message: "server error".to_string(),
+        }));
+    }
+
+    #[test]
+    fn retry_delay_uses_retry_after_or_exponential_backoff() {
+        assert_eq!(
+            retry_delay(0, &ModelError::Timeout),
+            Duration::from_secs(BASE_RETRY_DELAY_SECS)
+        );
+        assert_eq!(
+            retry_delay(2, &ModelError::Timeout),
+            Duration::from_secs(BASE_RETRY_DELAY_SECS * 4)
+        );
+        assert_eq!(
+            retry_delay(
+                1,
+                &ModelError::RateLimit {
+                    retry_after: Some(Duration::from_secs(7)),
+                }
+            ),
+            Duration::from_secs(7)
+        );
     }
 }

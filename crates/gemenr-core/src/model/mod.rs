@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::error::ModelError;
 use crate::message::ChatMessage;
 
+/// Re-export of the Anthropic model provider implementation.
 pub use anthropic::AnthropicProvider;
 
 /// Reason why the model stopped generating.
@@ -21,7 +22,7 @@ pub enum FinishReason {
 pub struct ModelRequest {
     /// The conversation messages to send.
     pub messages: Vec<ChatMessage>,
-    /// Model identifier (e.g., "claude-sonnet-4-20250514").
+    /// Model identifier (e.g., "claude-haiku-4-5-20251001").
     pub model: String,
     /// Sampling temperature (0.0 - 1.0).
     pub temperature: f64,
@@ -78,7 +79,7 @@ mod tests {
                 ChatMessage::system("Be concise."),
                 ChatMessage::user("Hello!"),
             ],
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             temperature: 0.3,
             max_tokens: Some(256),
         };
@@ -86,7 +87,7 @@ mod tests {
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0], ChatMessage::system("Be concise."));
         assert_eq!(request.messages[1], ChatMessage::user("Hello!"));
-        assert_eq!(request.model, "claude-sonnet-4-20250514");
+        assert_eq!(request.model, "claude-haiku-4-5-20251001");
         assert_eq!(request.temperature, 0.3);
         assert_eq!(request.max_tokens, Some(256));
     }
@@ -108,7 +109,7 @@ mod tests {
         let response = provider
             .complete(ModelRequest {
                 messages: vec![ChatMessage::user("Ping")],
-                model: "claude-sonnet-4-20250514".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
                 temperature: 0.7,
                 max_tokens: None,
             })
