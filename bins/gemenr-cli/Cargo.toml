@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 gemenr-core = { path = "../../crates/gemenr-core" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
