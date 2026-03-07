@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
-use gemenr_core::{ChatMessage, Config, ModelError, ModelProvider, ModelRequest};
+use gemenr_core::{ChatMessage, Config, ConfigError, ModelError, ModelProvider, ModelRequest};
 use tracing_subscriber::EnvFilter;
 
 /// Gemenr — an LLM-based agent runtime.
@@ -32,7 +32,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let provider = AnthropicProvider::new(&config);
+    let provider = match AnthropicProvider::new(&config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
 
     match cli.command {
         Commands::Chat => run_chat(&provider, &config).await,
@@ -78,14 +84,21 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
         }
 
         history.push(ChatMessage::user(trimmed));
+        let request = match build_model_request(&history, config) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                history.pop();
+                break;
+            }
+        };
         tracing::debug!(
             target: "gemenr::cli",
+            selected_model = %config.model,
+            remote_model = %request.model,
             message_count = history.len(),
-            model = %config.model,
             "sending request to model"
         );
-
-        let request = build_model_request(&history, config);
 
         match provider.complete(request).await {
             Ok(response) => {
@@ -112,13 +125,18 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
     tracing::info!(target: "gemenr::cli", "chat session ended");
 }
 
-fn build_model_request(history: &[ChatMessage], config: &Config) -> ModelRequest {
-    ModelRequest {
+fn build_model_request(
+    history: &[ChatMessage],
+    config: &Config,
+) -> Result<ModelRequest, ConfigError> {
+    let selected_model = config.selected_model()?;
+
+    Ok(ModelRequest {
         messages: history.to_vec(),
-        model: config.model.clone(),
-        temperature: config.temperature,
-        max_tokens: config.max_tokens,
-    }
+        model: selected_model.model.clone(),
+        temperature: selected_model.temperature,
+        max_tokens: selected_model.max_tokens,
+    })
 }
 
 fn display_model_error(error: &ModelError) -> String {
@@ -136,30 +154,26 @@ fn display_model_error(error: &ModelError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{build_model_request, display_model_error};
-    use gemenr_core::{ChatMessage, Config, ModelError};
+    use gemenr_core::{ChatMessage, Config, ModelConfig, ModelError, ProviderConfig, ProviderType};
 
     #[test]
-    fn build_model_request_preserves_history_and_config() {
+    fn build_model_request_uses_selected_model_config() {
         let history = vec![
             ChatMessage::system("Be concise."),
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi"),
         ];
-        let config = Config {
-            api_key: "test-key".to_string(),
-            api_endpoint: None,
-            model: "claude-haiku-4-5-20251001".to_string(),
-            temperature: 0.4,
-            max_tokens: Some(256),
-        };
+        let config = test_config();
 
-        let request = build_model_request(&history, &config);
+        let request = build_model_request(&history, &config).expect("request should build");
 
         assert_eq!(request.messages, history);
-        assert_eq!(request.model, config.model);
-        assert_eq!(request.temperature, config.temperature);
-        assert_eq!(request.max_tokens, config.max_tokens);
+        assert_eq!(request.model, "claude-haiku-4-5-20251001");
+        assert_eq!(request.temperature, 0.4);
+        assert_eq!(request.max_tokens, Some(256));
     }
 
     #[test]
@@ -188,5 +202,34 @@ mod tests {
         let timeout = ModelError::Timeout;
 
         assert_eq!(display_model_error(&timeout), "request timed out");
+    }
+
+    fn test_config() -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                api_key: "test-key".to_string(),
+                api_endpoint: None,
+            },
+        );
+
+        let mut models = HashMap::new();
+        models.insert(
+            "default".to_string(),
+            ModelConfig {
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                temperature: 0.4,
+                max_tokens: Some(256),
+            },
+        );
+
+        Config {
+            model: "default".to_string(),
+            providers,
+            models,
+        }
     }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
-use crate::config::Config;
+use crate::config::{Config, ConfigError, ProviderType};
 use crate::error::ModelError;
 use crate::message::{ChatMessage, ChatRole};
 use crate::model::{FinishReason, ModelProvider, ModelRequest, ModelResponse};
@@ -34,18 +34,27 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    /// Creates a new Anthropic provider with the given configuration.
-    #[must_use]
-    pub fn new(config: &Config) -> Self {
-        Self {
+    /// Creates a new Anthropic provider from the selected configuration entry.
+    pub fn new(config: &Config) -> Result<Self, ConfigError> {
+        let selected_model = config.selected_model()?;
+        let selected_provider = config.selected_provider()?;
+
+        if selected_provider.provider_type != ProviderType::Anthropic {
+            return Err(ConfigError::Invalid(format!(
+                "selected model `{}` uses unsupported provider type for AnthropicProvider",
+                config.model
+            )));
+        }
+
+        Ok(Self {
             client: Client::new(),
-            api_key: config.api_key.clone(),
-            api_endpoint: config
+            api_key: selected_provider.api_key.clone(),
+            api_endpoint: selected_provider
                 .api_endpoint
                 .clone()
                 .unwrap_or_else(|| ANTHROPIC_API_URL.to_string()),
-            default_model: config.model.clone(),
-        }
+            default_model: selected_model.model.clone(),
+        })
     }
 
     async fn complete_with_retry(
@@ -296,10 +305,6 @@ fn map_request_error(error: reqwest::Error) -> ModelError {
         return ModelError::Timeout;
     }
 
-    if error.is_connect() {
-        return ModelError::Network(truncate_error_message(&error.to_string()));
-    }
-
     ModelError::Network(truncate_error_message(&error.to_string()))
 }
 
@@ -320,6 +325,7 @@ fn retry_delay(attempt: u32, error: &ModelError) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use reqwest::{
@@ -333,7 +339,7 @@ mod tests {
         DEFAULT_MAX_TOKENS, build_request, map_error_response, parse_response_body,
         parse_retry_after, retry_delay, should_retry, split_system_messages,
     };
-    use crate::config::Config;
+    use crate::config::{Config, ModelConfig, ProviderConfig, ProviderType};
     use crate::error::ModelError;
     use crate::message::ChatMessage;
     use crate::model::{FinishReason, ModelRequest};
@@ -469,26 +475,16 @@ mod tests {
 
     #[test]
     fn provider_uses_default_api_endpoint_when_config_has_none() {
-        let provider = AnthropicProvider::new(&Config {
-            api_key: "test-key".to_string(),
-            api_endpoint: None,
-            model: "claude-haiku-4-5-20251001".to_string(),
-            temperature: 0.7,
-            max_tokens: None,
-        });
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
 
         assert_eq!(provider.api_endpoint, ANTHROPIC_API_URL);
     }
 
     #[test]
     fn provider_uses_configured_api_endpoint_override() {
-        let provider = AnthropicProvider::new(&Config {
-            api_key: "test-key".to_string(),
-            api_endpoint: Some("https://example.com/v1/messages".to_string()),
-            model: "claude-haiku-4-5-20251001".to_string(),
-            temperature: 0.7,
-            max_tokens: None,
-        });
+        let provider =
+            AnthropicProvider::new(&test_config(Some("https://example.com/v1/messages")))
+                .expect("provider should build");
 
         assert_eq!(provider.api_endpoint, "https://example.com/v1/messages");
     }
@@ -524,5 +520,34 @@ mod tests {
             ),
             Duration::from_secs(7)
         );
+    }
+
+    fn test_config(api_endpoint: Option<&str>) -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                api_key: "test-key".to_string(),
+                api_endpoint: api_endpoint.map(str::to_string),
+            },
+        );
+
+        let mut models = HashMap::new();
+        models.insert(
+            "default".to_string(),
+            ModelConfig {
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                temperature: 0.7,
+                max_tokens: None,
+            },
+        );
+
+        Config {
+            model: "default".to_string(),
+            providers,
+            models,
+        }
     }
 }

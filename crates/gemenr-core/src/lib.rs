@@ -11,6 +11,14 @@ pub mod model;
 
 /// Re-export of the application configuration type.
 pub use config::Config;
+/// Re-export of configuration loading errors.
+pub use config::ConfigError;
+/// Re-export of selectable model definitions.
+pub use config::ModelConfig;
+/// Re-export of provider definitions.
+pub use config::ProviderConfig;
+/// Re-export of supported provider types.
+pub use config::ProviderType;
 /// Re-export of model interaction errors.
 pub use error::ModelError;
 /// Re-export of the core chat message type.

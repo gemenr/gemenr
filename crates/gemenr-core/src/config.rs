@@ -1,32 +1,54 @@
-use std::fmt::Display;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::debug;
 
-const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const CONFIG_FILE_NAME: &str = "gemenr.toml";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_API_ENDPOINT_ENV: &str = "ANTHROPIC_API_ENDPOINT";
 const GEMENR_MODEL_ENV: &str = "GEMENR_MODEL";
-const GEMENR_TEMPERATURE_ENV: &str = "GEMENR_TEMPERATURE";
-const GEMENR_MAX_TOKENS_ENV: &str = "GEMENR_MAX_TOKENS";
 
 /// Application configuration for Gemenr.
 ///
-/// Configuration is loaded with the following priority (highest first):
-/// 1. Configuration file (`gemenr.toml`)
-/// 2. Environment variables
-/// 3. Built-in defaults
-#[derive(Debug, Clone)]
+/// Configuration is organized into provider definitions, model definitions,
+/// and a root model selector that chooses the active model entry.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// API key for the model provider.
+    /// The selected model configuration identifier from [`Config::models`].
+    pub model: String,
+    /// Available provider definitions keyed by provider identifier.
+    pub providers: HashMap<String, ProviderConfig>,
+    /// Available model definitions keyed by model identifier.
+    pub models: HashMap<String, ModelConfig>,
+}
+
+/// Configuration for a model provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    /// The provider implementation type.
+    pub provider_type: ProviderType,
+    /// API key used to authenticate provider requests.
     pub api_key: String,
-    /// Optional API endpoint override for the model provider.
+    /// Optional API endpoint override.
     pub api_endpoint: Option<String>,
-    /// Model identifier (e.g., `claude-haiku-4-5-20251001`).
+}
+
+/// Supported provider types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderType {
+    /// Anthropic Claude provider.
+    Anthropic,
+}
+
+/// Configuration for a selectable model entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelConfig {
+    /// Provider identifier in [`Config::providers`].
+    pub provider: String,
+    /// Remote model name understood by the provider.
     pub model: String,
     /// Sampling temperature (0.0 - 1.0).
     pub temperature: f64,
@@ -37,9 +59,9 @@ pub struct Config {
 /// Errors that can occur while loading configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// No API key was found in the environment or configuration file.
+    /// No API key was found for the selected Anthropic provider.
     #[error(
-        "API key not found: set ANTHROPIC_API_KEY environment variable or add it to gemenr.toml"
+        "API key not found for the selected Anthropic provider: set ANTHROPIC_API_KEY or add providers.<id>.api_key to gemenr.toml"
     )]
     ApiKeyMissing,
 
@@ -57,10 +79,29 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ConfigFile {
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    model: Option<String>,
+    #[serde(default)]
+    providers: HashMap<String, RawProviderConfig>,
+    #[serde(default)]
+    models: HashMap<String, RawModelConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProviderConfig {
+    #[serde(rename = "type")]
+    provider_type: String,
     api_key: Option<String>,
     api_endpoint: Option<String>,
-    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelConfig {
+    provider: String,
+    model: String,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
 }
@@ -85,37 +126,146 @@ impl Config {
         Self::from_sources(Some(file_config))
     }
 
-    fn from_sources(file_config: Option<ConfigFile>) -> Result<Self, ConfigError> {
-        let file_config = file_config.unwrap_or_default();
+    /// Returns the selected model definition.
+    pub fn selected_model(&self) -> Result<&ModelConfig, ConfigError> {
+        self.models.get(&self.model).ok_or_else(|| {
+            ConfigError::Invalid(format!("model `{}` not found in [models]", self.model))
+        })
+    }
 
-        let api_key = normalize_optional_string(file_config.api_key)
-            .or(optional_env_string(ANTHROPIC_API_KEY_ENV)?)
-            .ok_or(ConfigError::ApiKeyMissing)?;
+    /// Returns the provider definition for the selected model.
+    pub fn selected_provider(&self) -> Result<&ProviderConfig, ConfigError> {
+        let selected_model = self.selected_model()?;
+        self.providers.get(&selected_model.provider).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "provider `{}` not found in [providers]",
+                selected_model.provider
+            ))
+        })
+    }
 
-        let api_endpoint = normalize_optional_string(file_config.api_endpoint)
-            .or(optional_env_string(ANTHROPIC_API_ENDPOINT_ENV)?);
+    fn from_sources(file_config: Option<RawConfig>) -> Result<Self, ConfigError> {
+        let raw_config = file_config.unwrap_or_default();
+        let models = build_models(raw_config.models)?;
 
-        let model = normalize_optional_string(file_config.model)
+        let selected_model_id = normalize_optional_string(raw_config.model)
             .or(optional_env_string(GEMENR_MODEL_ENV)?)
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            .ok_or_else(|| {
+                ConfigError::Invalid("root `model` must select one entry from [models]".to_string())
+            })?;
 
-        let temperature = file_config
-            .temperature
-            .or(parse_optional_env::<f64>(GEMENR_TEMPERATURE_ENV)?)
-            .unwrap_or(DEFAULT_TEMPERATURE);
-        validate_temperature(temperature)?;
+        let selected_model = models.get(&selected_model_id).ok_or_else(|| {
+            ConfigError::Invalid(format!("model `{selected_model_id}` not found in [models]"))
+        })?;
+        let selected_provider_id = selected_model.provider.clone();
 
-        let max_tokens = file_config
-            .max_tokens
-            .or(parse_optional_env::<u32>(GEMENR_MAX_TOKENS_ENV)?);
+        let providers = build_providers(raw_config.providers, &selected_provider_id)?;
+        validate_model_references(&models, &providers)?;
 
         Ok(Self {
-            api_key,
-            api_endpoint,
-            model,
-            temperature,
-            max_tokens,
+            model: selected_model_id,
+            providers,
+            models,
         })
+    }
+}
+
+fn build_models(
+    raw_models: HashMap<String, RawModelConfig>,
+) -> Result<HashMap<String, ModelConfig>, ConfigError> {
+    let mut models = HashMap::with_capacity(raw_models.len());
+
+    for (model_id, raw_model) in raw_models {
+        let provider = normalize_required_string(raw_model.provider, || {
+            format!("models.{model_id}.provider must not be empty")
+        })?;
+        let model_name = normalize_required_string(raw_model.model, || {
+            format!("models.{model_id}.model must not be empty")
+        })?;
+        let temperature = raw_model.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+        validate_temperature(&model_id, temperature)?;
+
+        models.insert(
+            model_id,
+            ModelConfig {
+                provider,
+                model: model_name,
+                temperature,
+                max_tokens: raw_model.max_tokens,
+            },
+        );
+    }
+
+    Ok(models)
+}
+
+fn build_providers(
+    raw_providers: HashMap<String, RawProviderConfig>,
+    selected_provider_id: &str,
+) -> Result<HashMap<String, ProviderConfig>, ConfigError> {
+    let mut providers = HashMap::with_capacity(raw_providers.len());
+
+    for (provider_id, raw_provider) in raw_providers {
+        let provider_type = parse_provider_type(&provider_id, &raw_provider.provider_type)?;
+        let is_selected = provider_id == selected_provider_id;
+
+        let api_key = if is_selected && provider_type == ProviderType::Anthropic {
+            normalize_optional_string(raw_provider.api_key)
+                .or(optional_env_string(ANTHROPIC_API_KEY_ENV)?)
+        } else {
+            normalize_optional_string(raw_provider.api_key)
+        };
+
+        let api_endpoint = if is_selected && provider_type == ProviderType::Anthropic {
+            normalize_optional_string(raw_provider.api_endpoint)
+                .or(optional_env_string(ANTHROPIC_API_ENDPOINT_ENV)?)
+        } else {
+            normalize_optional_string(raw_provider.api_endpoint)
+        };
+
+        let api_key = api_key.ok_or_else(|| {
+            if is_selected && provider_type == ProviderType::Anthropic {
+                ConfigError::ApiKeyMissing
+            } else {
+                ConfigError::Invalid(format!("providers.{provider_id}.api_key must not be empty"))
+            }
+        })?;
+
+        providers.insert(
+            provider_id,
+            ProviderConfig {
+                provider_type,
+                api_key,
+                api_endpoint,
+            },
+        );
+    }
+
+    Ok(providers)
+}
+
+fn validate_model_references(
+    models: &HashMap<String, ModelConfig>,
+    providers: &HashMap<String, ProviderConfig>,
+) -> Result<(), ConfigError> {
+    for (model_id, model) in models {
+        if !providers.contains_key(&model.provider) {
+            return Err(ConfigError::Invalid(format!(
+                "models.{model_id}.provider references unknown provider `{}`",
+                model.provider
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_provider_type(provider_id: &str, value: &str) -> Result<ProviderType, ConfigError> {
+    match value.trim() {
+        "anthropic" => Ok(ProviderType::Anthropic),
+        other => Err(ConfigError::Invalid(format!(
+            "providers.{provider_id}.type `{other}` is not supported"
+        ))),
     }
 }
 
@@ -141,7 +291,7 @@ fn discover_config_path() -> Option<PathBuf> {
     path
 }
 
-fn read_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
+fn read_config_file(path: &Path) -> Result<RawConfig, ConfigError> {
     let contents = std::fs::read_to_string(path)?;
     Ok(toml::from_str(&contents)?)
 }
@@ -156,22 +306,6 @@ fn optional_env_string(key: &str) -> Result<Option<String>, ConfigError> {
     }
 }
 
-fn parse_optional_env<T>(key: &str) -> Result<Option<T>, ConfigError>
-where
-    T: std::str::FromStr,
-    T::Err: Display,
-{
-    optional_env_string(key)?
-        .map(|value| {
-            value.parse().map_err(|error| {
-                ConfigError::Invalid(format!(
-                    "failed to parse environment variable {key}: {error}"
-                ))
-            })
-        })
-        .transpose()
-}
-
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -179,10 +313,17 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
-fn validate_temperature(temperature: f64) -> Result<(), ConfigError> {
+fn normalize_required_string(
+    value: String,
+    error_message: impl FnOnce() -> String,
+) -> Result<String, ConfigError> {
+    normalize_optional_string(Some(value)).ok_or_else(|| ConfigError::Invalid(error_message()))
+}
+
+fn validate_temperature(model_id: &str, temperature: f64) -> Result<(), ConfigError> {
     if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
         return Err(ConfigError::Invalid(format!(
-            "temperature must be between 0.0 and 1.0, got {temperature}"
+            "models.{model_id}.temperature must be between 0.0 and 1.0, got {temperature}"
         )));
     }
 
@@ -196,8 +337,7 @@ pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::{
         ANTHROPIC_API_ENDPOINT_ENV, ANTHROPIC_API_KEY_ENV, CONFIG_FILE_NAME, Config, ConfigError,
-        DEFAULT_MODEL, DEFAULT_TEMPERATURE, ENV_MUTEX, GEMENR_MAX_TOKENS_ENV, GEMENR_MODEL_ENV,
-        GEMENR_TEMPERATURE_ENV,
+        ENV_MUTEX, GEMENR_MODEL_ENV, ProviderType,
     };
     use std::env;
     use std::ffi::{OsStr, OsString};
@@ -205,12 +345,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const TEST_ENV_KEYS: [&str; 5] = [
+    const TEST_ENV_KEYS: [&str; 3] = [
         ANTHROPIC_API_KEY_ENV,
         ANTHROPIC_API_ENDPOINT_ENV,
         GEMENR_MODEL_ENV,
-        GEMENR_TEMPERATURE_ENV,
-        GEMENR_MAX_TOKENS_ENV,
     ];
 
     struct TestIsolation {
@@ -271,81 +409,105 @@ mod tests {
     }
 
     #[test]
-    fn load_reads_values_from_environment() {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let _isolation = TestIsolation::new();
-
-        set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
-        set_env_var(
-            ANTHROPIC_API_ENDPOINT_ENV,
-            "https://env.example/v1/messages",
-        );
-        set_env_var(GEMENR_MODEL_ENV, "claude-test-model");
-        set_env_var(GEMENR_TEMPERATURE_ENV, "0.3");
-        set_env_var(GEMENR_MAX_TOKENS_ENV, "512");
-
-        let config = Config::load().expect("config should load from environment");
-
-        assert_eq!(config.api_key, "env-api-key");
-        assert_eq!(
-            config.api_endpoint.as_deref(),
-            Some("https://env.example/v1/messages")
-        );
-        assert_eq!(config.model, "claude-test-model");
-        assert_eq!(config.temperature, 0.3);
-        assert_eq!(config.max_tokens, Some(512));
-    }
-
-    #[test]
-    fn load_requires_api_key() {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let _isolation = TestIsolation::new();
-
-        let error = Config::load().expect_err("missing API key should error");
-        assert!(matches!(error, ConfigError::ApiKeyMissing));
-    }
-
-    #[test]
-    fn load_applies_default_values() {
-        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
-        let _isolation = TestIsolation::new();
-
-        set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
-
-        let config = Config::load().expect("config should load with defaults");
-
-        assert_eq!(config.api_key, "env-api-key");
-        assert_eq!(config.api_endpoint, None);
-        assert_eq!(config.model, DEFAULT_MODEL);
-        assert_eq!(config.temperature, DEFAULT_TEMPERATURE);
-        assert_eq!(config.max_tokens, None);
-    }
-
-    #[test]
-    fn load_from_parses_toml_configuration() {
+    fn load_from_parses_provider_and_model_tables() {
         let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
         let isolation = TestIsolation::new();
         let config_path = write_config(
             isolation.temp_dir(),
             r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
 api_key = "file-api-key"
 api_endpoint = "https://file.example/v1/messages"
-model = "claude-file-model"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
 temperature = 0.2
 max_tokens = 256
 "#,
         );
 
         let config = Config::load_from(&config_path).expect("config file should parse");
+        let selected_model = config
+            .selected_model()
+            .expect("selected model should exist");
+        let selected_provider = config
+            .selected_provider()
+            .expect("selected provider should exist");
 
-        assert_eq!(config.api_key, "file-api-key");
+        assert_eq!(config.model, "default");
+        assert_eq!(selected_model.provider, "anthropic");
+        assert_eq!(selected_model.model, "claude-haiku-4-5-20251001");
+        assert_eq!(selected_model.temperature, 0.2);
+        assert_eq!(selected_model.max_tokens, Some(256));
+        assert_eq!(selected_provider.provider_type, ProviderType::Anthropic);
+        assert_eq!(selected_provider.api_key, "file-api-key");
         assert_eq!(
-            config.api_endpoint.as_deref(),
+            selected_provider.api_endpoint.as_deref(),
             Some("https://file.example/v1/messages")
         );
-        assert_eq!(config.model, "claude-file-model");
-        assert_eq!(config.temperature, 0.2);
-        assert_eq!(config.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn load_requires_root_model_selection() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let _isolation = TestIsolation::new();
+
+        let error = Config::load().expect_err("missing root model should error");
+        assert!(matches!(error, ConfigError::Invalid(message) if message.contains("root `model`")));
+    }
+
+    #[test]
+    fn environment_selects_model_and_fills_selected_provider_credentials() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+[providers.primary]
+type = "anthropic"
+
+[providers.secondary]
+type = "anthropic"
+api_key = "secondary-key"
+
+[models.primary]
+provider = "primary"
+model = "claude-haiku-4-5-20251001"
+temperature = 0.9
+
+[models.secondary]
+provider = "secondary"
+model = "claude-sonnet-4-20250514"
+temperature = 0.2
+"#,
+        );
+
+        set_env_var(GEMENR_MODEL_ENV, "primary");
+        set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
+        set_env_var(
+            ANTHROPIC_API_ENDPOINT_ENV,
+            "https://env.example/v1/messages",
+        );
+
+        let config = Config::load_from(&config_path).expect("config should load");
+        let selected_provider = config
+            .selected_provider()
+            .expect("selected provider should exist");
+
+        assert_eq!(config.model, "primary");
+        assert_eq!(selected_provider.api_key, "env-api-key");
+        assert_eq!(
+            selected_provider.api_endpoint.as_deref(),
+            Some("https://env.example/v1/messages")
+        );
+        assert_eq!(
+            config.providers["secondary"].api_key, "secondary-key",
+            "non-selected providers keep file values"
+        );
     }
 
     #[test]
@@ -355,66 +517,177 @@ max_tokens = 256
         let config_path = write_config(
             isolation.temp_dir(),
             r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
 api_key = "file-api-key"
 api_endpoint = "https://file.example/v1/messages"
-model = "claude-file-model"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
 temperature = 0.2
 max_tokens = 256
 "#,
         );
 
+        set_env_var(GEMENR_MODEL_ENV, "env-selected");
         set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
         set_env_var(
             ANTHROPIC_API_ENDPOINT_ENV,
             "https://env.example/v1/messages",
         );
-        set_env_var(GEMENR_MODEL_ENV, "claude-env-model");
-        set_env_var(GEMENR_TEMPERATURE_ENV, "0.9");
-        set_env_var(GEMENR_MAX_TOKENS_ENV, "1024");
 
-        let config = Config::load_from(&config_path)
-            .expect("config file values should override environment values");
+        let config = Config::load_from(&config_path).expect("config should load");
+        let selected_provider = config
+            .selected_provider()
+            .expect("selected provider should exist");
 
-        assert_eq!(config.api_key, "file-api-key");
+        assert_eq!(config.model, "default");
+        assert_eq!(selected_provider.api_key, "file-api-key");
         assert_eq!(
-            config.api_endpoint.as_deref(),
+            selected_provider.api_endpoint.as_deref(),
             Some("https://file.example/v1/messages")
         );
-        assert_eq!(config.model, "claude-file-model");
-        assert_eq!(config.temperature, 0.2);
-        assert_eq!(config.max_tokens, Some(256));
     }
 
     #[test]
-    fn environment_fills_missing_values_when_config_file_is_partial() {
+    fn load_rejects_unknown_selected_model() {
         let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
         let isolation = TestIsolation::new();
         let config_path = write_config(
             isolation.temp_dir(),
             r#"
-model = "claude-file-model"
+model = "missing"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
 "#,
         );
 
-        set_env_var(ANTHROPIC_API_KEY_ENV, "env-api-key");
-        set_env_var(
-            ANTHROPIC_API_ENDPOINT_ENV,
-            "https://env.example/v1/messages",
+        let error = Config::load_from(&config_path).expect_err("unknown model should error");
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("model `missing` not found"))
         );
-        set_env_var(GEMENR_TEMPERATURE_ENV, "0.9");
-        set_env_var(GEMENR_MAX_TOKENS_ENV, "1024");
+    }
 
-        let config = Config::load_from(&config_path)
-            .expect("environment should fill values missing from config file");
+    #[test]
+    fn load_rejects_unknown_provider_reference() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
 
-        assert_eq!(config.api_key, "env-api-key");
-        assert_eq!(
-            config.api_endpoint.as_deref(),
-            Some("https://env.example/v1/messages")
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "missing"
+model = "claude-haiku-4-5-20251001"
+"#,
         );
-        assert_eq!(config.model, "claude-file-model");
-        assert_eq!(config.temperature, 0.9);
-        assert_eq!(config.max_tokens, Some(1024));
+
+        let error = Config::load_from(&config_path).expect_err("unknown provider should error");
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("unknown provider `missing`"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_provider_type() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.openai]
+type = "openai"
+api_key = "file-api-key"
+
+[models.default]
+provider = "openai"
+model = "gpt-4.1"
+"#,
+        );
+
+        let error = Config::load_from(&config_path).expect_err("unsupported provider should error");
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("not supported"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_temperature() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+temperature = 1.5
+"#,
+        );
+
+        let error = Config::load_from(&config_path).expect_err("invalid temperature should error");
+        assert!(matches!(error, ConfigError::Invalid(message) if message.contains("temperature")));
+    }
+
+    #[test]
+    fn load_rejects_old_flat_schema() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+api_key = "flat-key"
+model = "claude-haiku-4-5-20251001"
+temperature = 0.7
+"#,
+        );
+
+        let error = Config::load_from(&config_path).expect_err("old schema should be rejected");
+        assert!(matches!(error, ConfigError::FileParse(_)));
+    }
+
+    #[test]
+    fn example_config_matches_schema() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            include_str!("../../../gemenr.toml.example"),
+        );
+
+        let config = Config::load_from(&config_path).expect("example config should parse");
+        let selected_model = config
+            .selected_model()
+            .expect("selected model should exist");
+        let selected_provider = config
+            .selected_provider()
+            .expect("selected provider should exist");
+
+        assert_eq!(config.model, "default");
+        assert_eq!(selected_model.provider, "anthropic");
+        assert_eq!(selected_provider.provider_type, ProviderType::Anthropic);
     }
 
     fn write_config(dir: &Path, contents: &str) -> PathBuf {
