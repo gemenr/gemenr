@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Gemenr core library types and traits.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Core chat message types.
+pub mod message;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+/// Re-export of the core chat message type.
+pub use message::ChatMessage;
+/// Re-export of chat participant roles.
+pub use message::ChatRole;
