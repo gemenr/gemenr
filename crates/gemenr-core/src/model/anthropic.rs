@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::{
     Client, StatusCode,
-    header::{HeaderMap, RETRY_AFTER},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
@@ -21,6 +21,8 @@ const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_SECS: u64 = 1;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.71 (external, cli)";
+const CLAUDE_CLI_ANTHROPIC_BETA: &str = "claude-code-20250219,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24";
 
 /// Anthropic Claude API provider.
 ///
@@ -106,8 +108,8 @@ impl AnthropicProvider {
         let response = self
             .client
             .post(&self.api_endpoint)
+            .headers(default_claude_cli_headers())
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&request_body)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .send()
@@ -193,6 +195,62 @@ fn build_request(request: &ModelRequest, default_model: &str) -> AnthropicReques
         messages,
         system,
     }
+}
+
+fn default_claude_cli_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(USER_AGENT, HeaderValue::from_static(CLAUDE_CLI_USER_AGENT));
+    headers.insert(
+        HeaderName::from_static("x-stainless-arch"),
+        HeaderValue::from_static("arm64"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-lang"),
+        HeaderValue::from_static("js"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-os"),
+        HeaderValue::from_static("MacOS"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-package-version"),
+        HeaderValue::from_static("0.74.0"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-retry-count"),
+        HeaderValue::from_static("0"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-runtime"),
+        HeaderValue::from_static("node"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-runtime-version"),
+        HeaderValue::from_static("v24.3.0"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-timeout"),
+        HeaderValue::from_static("600"),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static(CLAUDE_CLI_ANTHROPIC_BETA),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static("x-app"),
+        HeaderValue::from_static("cli"),
+    );
+    headers
 }
 
 fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<AnthropicMessage>) {
@@ -327,14 +385,15 @@ mod tests {
 
     use reqwest::{
         StatusCode,
-        header::{HeaderMap, HeaderValue, RETRY_AFTER},
+        header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT},
     };
     use serde_json::json;
 
     use super::{
-        ANTHROPIC_API_URL, AnthropicProvider, AnthropicRequest, BASE_RETRY_DELAY_SECS,
-        DEFAULT_MAX_TOKENS, build_request, map_error_response, parse_response_body,
-        parse_retry_after, retry_delay, should_retry, split_system_messages,
+        ANTHROPIC_API_URL, ANTHROPIC_VERSION, AnthropicProvider, AnthropicRequest,
+        BASE_RETRY_DELAY_SECS, CLAUDE_CLI_ANTHROPIC_BETA, CLAUDE_CLI_USER_AGENT,
+        DEFAULT_MAX_TOKENS, build_request, default_claude_cli_headers, map_error_response,
+        parse_response_body, parse_retry_after, retry_delay, should_retry, split_system_messages,
     };
     use crate::config::{Config, ModelConfig, ProviderConfig, ProviderType};
     use crate::error::ModelError;
@@ -482,6 +541,34 @@ mod tests {
                 .expect("provider should build");
 
         assert_eq!(provider.api_endpoint, "https://example.com/v1/messages");
+    }
+
+    #[test]
+    fn default_headers_match_claude_cli_shape() {
+        let headers = default_claude_cli_headers();
+
+        assert_eq!(headers[ACCEPT], "application/json");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+        assert_eq!(headers[USER_AGENT], CLAUDE_CLI_USER_AGENT);
+        assert_eq!(headers["x-stainless-arch"], "arm64");
+        assert_eq!(headers["x-stainless-lang"], "js");
+        assert_eq!(headers["x-stainless-os"], "MacOS");
+        assert_eq!(headers["x-stainless-package-version"], "0.74.0");
+        assert_eq!(headers["x-stainless-retry-count"], "0");
+        assert_eq!(headers["x-stainless-runtime"], "node");
+        assert_eq!(headers["x-stainless-runtime-version"], "v24.3.0");
+        assert_eq!(headers["x-stainless-timeout"], "600");
+        assert_eq!(headers["anthropic-beta"], CLAUDE_CLI_ANTHROPIC_BETA);
+        assert_eq!(headers["anthropic-dangerous-direct-browser-access"], "true");
+        assert_eq!(headers["anthropic-version"], ANTHROPIC_VERSION);
+        assert_eq!(headers["x-app"], "cli");
+    }
+
+    #[test]
+    fn default_headers_do_not_set_connection_header() {
+        let headers = default_claude_cli_headers();
+
+        assert!(headers.get("connection").is_none());
     }
 
     #[test]
