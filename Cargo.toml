@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gemenr-core",
+    "bins/gemenr-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
