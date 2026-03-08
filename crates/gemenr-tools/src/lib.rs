@@ -11,10 +11,15 @@ use tracing::{debug, warn};
 
 pub mod builtin;
 pub mod handler;
+pub mod mcp;
 pub mod policy;
 pub mod sandbox;
 
 pub use handler::{ExecContext, ToolCallSpec, ToolError, ToolHandler, ToolOutput};
+pub use mcp::{
+    McpClient, McpError, McpRemoteTool, McpToolAdapter, McpToolResult, mcp_tool_name,
+    register_mcp_servers,
+};
 pub use policy::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};
 
 /// Catalog of all registered tools.
@@ -49,6 +54,14 @@ impl ToolPlane {
     /// Replace the policy evaluator used for subsequent checks.
     pub fn set_policy_evaluator(&mut self, policy_evaluator: Arc<dyn PolicyEvaluator>) {
         self.policy_evaluator = policy_evaluator;
+    }
+
+    /// Register enabled stdio MCP servers and their remote tools.
+    pub async fn register_mcp_servers(
+        &mut self,
+        config: &gemenr_core::McpConfig,
+    ) -> Result<(), crate::mcp::McpError> {
+        crate::mcp::register_mcp_servers(self, config).await
     }
 
     /// Register a tool with its specification and handler.
