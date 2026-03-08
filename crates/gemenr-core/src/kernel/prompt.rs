@@ -1,4 +1,4 @@
-use crate::agent::dispatcher::ToolDispatcher;
+use crate::agent::dispatcher::SelectedToolDispatcher;
 use crate::message::ChatMessage;
 use crate::model::ChatRequest;
 use crate::tool_spec::ToolSpec;
@@ -25,7 +25,7 @@ impl PromptComposer {
         system_prompt: &str,
         context_messages: Vec<ChatMessage>,
         tools: &[ToolSpec],
-        dispatcher: &dyn ToolDispatcher,
+        dispatcher: &SelectedToolDispatcher,
         model: &str,
         max_tokens: Option<u32>,
     ) -> ChatRequest {

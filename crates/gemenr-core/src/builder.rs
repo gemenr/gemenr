@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
+use crate::agent::dispatcher::{NativeToolDispatcher, SelectedToolDispatcher, XmlToolDispatcher};
 use crate::context::{ContextManager, SoulManager, TapeStore, TokenBudget};
 use crate::kernel::{
     AgentRuntime, ApprovalHandler, DenyAllApprovals, EventSink, NoopEventSink, PromptComposer,
@@ -152,12 +152,7 @@ impl RuntimeBuilder {
         system_prompt: String,
         session_id: SessionId,
     ) -> AgentRuntime {
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match self.tool_dispatcher_config.as_str() {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if self.model.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
+        let tool_dispatcher = self.select_tool_dispatcher();
 
         let request_context = self.request_timeout.map_or_else(
             || RequestContext::new(Arc::new(AtomicBool::new(false))),
@@ -180,6 +175,15 @@ impl RuntimeBuilder {
             Arc::clone(&self.event_sink),
         )
     }
+
+    fn select_tool_dispatcher(&self) -> SelectedToolDispatcher {
+        match self.tool_dispatcher_config.as_str() {
+            "native" => NativeToolDispatcher,
+            "xml" => XmlToolDispatcher,
+            _ if self.model.supports_native_tools() => NativeToolDispatcher,
+            _ => XmlToolDispatcher,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +197,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::RuntimeBuilder;
+    use crate::agent::SelectedToolDispatcher;
     use crate::context::{InMemoryTapeStore, SoulManager, TapeStore};
     use crate::error::ModelError;
     use crate::model::{
@@ -361,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_selects_native_dispatcher_when_provider_supports_it() {
+    async fn builder_selects_native_dispatcher_enum_when_provider_supports_it() {
         let model = Arc::new(RecordingModelProvider::new(ModelCapabilities {
             native_tool_calling: true,
             vision: false,
@@ -374,6 +379,11 @@ mod tests {
             .model_name("test-model".to_string());
         let mut runtime = builder.build("system".to_string());
 
+        assert_eq!(
+            runtime.selected_tool_dispatcher(),
+            SelectedToolDispatcher::Native
+        );
+
         runtime
             .run_turn("hello")
             .await
@@ -383,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_selects_xml_dispatcher_when_provider_lacks_native_tools() {
+    async fn builder_selects_xml_dispatcher_enum_when_provider_lacks_native_tools() {
         let model = Arc::new(RecordingModelProvider::new(ModelCapabilities::default()));
         let model_for_assertions = model.clone();
         let tools = Arc::new(StaticToolInvoker::new(vec![sample_tool()]));
@@ -392,6 +402,11 @@ mod tests {
             .tool_dispatcher("auto".to_string())
             .model_name("test-model".to_string());
         let mut runtime = builder.build("system".to_string());
+
+        assert_eq!(
+            runtime.selected_tool_dispatcher(),
+            SelectedToolDispatcher::Xml
+        );
 
         runtime
             .run_turn("hello")

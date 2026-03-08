@@ -11,6 +11,27 @@ pub enum ActionDecision {
     CompleteTurn,
 }
 
+/// High-level phase executed inside one turn-loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    /// Rebuild provider-visible context from tape and in-memory history.
+    BuildContext,
+    /// Call the model and classify the response.
+    CallModel,
+    /// Execute an emitted batch of tool calls.
+    ExecuteTools,
+    /// Finish the turn successfully.
+    Complete,
+    /// Finish the turn with an error.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ModelStepOutcome {
+    Complete(String),
+    InvokeTools(Vec<ParsedToolCall>),
+}
+
 /// Stateless controller that chooses the next runtime action.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TurnController;

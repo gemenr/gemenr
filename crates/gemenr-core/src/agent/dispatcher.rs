@@ -48,164 +48,177 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolExecutionResult>),
 }
 
-/// Strategy interface for parsing and formatting tool calls.
-pub trait ToolDispatcher: Send + Sync {
-    /// Extracts assistant text and parsed tool calls from a provider response.
-    fn parse_response(&self, response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>);
-
-    /// Formats tool execution results into an internal history entry.
-    fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage;
-
-    /// Builds system-prompt instructions for the tool-calling protocol.
-    fn prompt_instructions(&self, tools: &[ToolSpec]) -> String;
-
-    /// Projects internal history into provider-consumable chat messages.
-    fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage>;
-
-    /// Returns whether provider-native tool definitions should be sent via API.
-    fn should_send_tool_specs(&self) -> bool;
+/// Closed-world tool protocol selection for the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedToolDispatcher {
+    /// Provider-native structured tool calling.
+    Native,
+    /// XML-tagged tool calling embedded in assistant text.
+    Xml,
 }
 
-/// Dispatcher for providers with native structured tool-calling support.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeToolDispatcher;
+/// Native structured tool-calling mode.
+#[allow(non_upper_case_globals)]
+pub const NativeToolDispatcher: SelectedToolDispatcher = SelectedToolDispatcher::Native;
 
-impl ToolDispatcher for NativeToolDispatcher {
-    fn parse_response(&self, response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>) {
-        let calls = response
-            .tool_calls
-            .iter()
-            .map(|tool_call| ParsedToolCall {
-                id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                arguments: serde_json::from_str(&tool_call.arguments)
+/// XML-tagged tool-calling mode.
+#[allow(non_upper_case_globals)]
+pub const XmlToolDispatcher: SelectedToolDispatcher = SelectedToolDispatcher::Xml;
+
+impl SelectedToolDispatcher {
+    /// Extract assistant text and parsed tool calls from a provider response.
+    #[must_use]
+    pub fn parse_response(&self, response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>) {
+        match self {
+            Self::Native => native_parse_response(response),
+            Self::Xml => xml_parse_response(response),
+        }
+    }
+
+    /// Format tool execution results into an internal history entry.
+    #[must_use]
+    pub fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
+        match self {
+            Self::Native => ConversationMessage::ToolResults(results.to_vec()),
+            Self::Xml => {
+                ConversationMessage::Chat(ChatMessage::user(render_xml_tool_results(results)))
+            }
+        }
+    }
+
+    /// Build system-prompt instructions for the active tool-calling protocol.
+    #[must_use]
+    pub fn prompt_instructions(&self, tools: &[ToolSpec]) -> String {
+        match self {
+            Self::Native => String::new(),
+            Self::Xml => xml_prompt_instructions(tools),
+        }
+    }
+
+    /// Project internal history into provider-consumable chat messages.
+    #[must_use]
+    pub fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
+        match self {
+            Self::Native => native_to_provider_messages(history),
+            Self::Xml => xml_to_provider_messages(history),
+        }
+    }
+
+    /// Return whether provider-native tool definitions should be sent via API.
+    #[must_use]
+    pub fn should_send_tool_specs(&self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
+fn native_parse_response(response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>) {
+    let calls = response
+        .tool_calls
+        .iter()
+        .map(|tool_call| ParsedToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: serde_json::from_str(&tool_call.arguments)
+                .unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+
+    (response.text.clone(), calls)
+}
+
+fn native_to_provider_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .flat_map(|message| match message {
+            ConversationMessage::Chat(chat) => vec![chat.clone()],
+            ConversationMessage::AssistantToolCalls { text, tool_calls } => vec![
+                ChatMessage::assistant(text.clone().unwrap_or_default()).with_metadata(
+                    "tool_calls",
+                    serde_json::to_string(tool_calls)
+                        .expect("tool calls should serialize to metadata"),
+                ),
+            ],
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .map(|result| {
+                    ChatMessage::user(result.content.clone())
+                        .with_metadata("tool_result_for", result.call_id.clone())
+                        .with_metadata("tool_name", result.name.clone())
+                        .with_metadata("is_error", result.is_error.to_string())
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn xml_parse_response(response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>) {
+    let text = response.text.as_deref().unwrap_or_default();
+    let regex = tool_call_regex();
+    let calls = regex
+        .captures_iter(text)
+        .filter_map(|captures| captures.get(1))
+        .filter_map(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload.as_str().trim()).ok()
+        })
+        .filter_map(|parsed| {
+            let name = parsed.get("name").and_then(serde_json::Value::as_str)?;
+            if name.is_empty() {
+                return None;
+            }
+
+            Some(ParsedToolCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                arguments: parsed
+                    .get("arguments")
+                    .cloned()
                     .unwrap_or(serde_json::Value::Null),
             })
-            .collect();
+        })
+        .collect();
 
-        (response.text.clone(), calls)
-    }
+    let cleaned = regex.replace_all(text, "");
+    let cleaned = cleaned.trim();
+    let cleaned = if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    };
 
-    fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
-        ConversationMessage::ToolResults(results.to_vec())
-    }
-
-    fn prompt_instructions(&self, _tools: &[ToolSpec]) -> String {
-        String::new()
-    }
-
-    fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .flat_map(|message| match message {
-                ConversationMessage::Chat(chat) => vec![chat.clone()],
-                ConversationMessage::AssistantToolCalls { text, tool_calls } => vec![
-                    ChatMessage::assistant(text.clone().unwrap_or_default()).with_metadata(
-                        "tool_calls",
-                        serde_json::to_string(tool_calls)
-                            .expect("tool calls should serialize to metadata"),
-                    ),
-                ],
-                ConversationMessage::ToolResults(results) => results
-                    .iter()
-                    .map(|result| {
-                        ChatMessage::user(result.content.clone())
-                            .with_metadata("tool_result_for", result.call_id.clone())
-                            .with_metadata("tool_name", result.name.clone())
-                            .with_metadata("is_error", result.is_error.to_string())
-                    })
-                    .collect(),
-            })
-            .collect()
-    }
-
-    fn should_send_tool_specs(&self) -> bool {
-        true
-    }
+    (cleaned, calls)
 }
 
-/// Dispatcher for providers that use XML tags in plain-text responses.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct XmlToolDispatcher;
+fn xml_prompt_instructions(tools: &[ToolSpec]) -> String {
+    let mut instructions = String::from(
+        "You have access to the following tools. To call a tool, output a <tool_call> tag containing a JSON object with \"name\" and \"arguments\".\n\n",
+    );
+    instructions.push_str(
+        "Example:\n<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value\"}}</tool_call>\n\n",
+    );
+    instructions.push_str("Available tools:\n\n");
 
-impl ToolDispatcher for XmlToolDispatcher {
-    fn parse_response(&self, response: &ChatResponse) -> (Option<String>, Vec<ParsedToolCall>) {
-        let text = response.text.as_deref().unwrap_or_default();
-        let regex = tool_call_regex();
-        let calls = regex
-            .captures_iter(text)
-            .filter_map(|captures| captures.get(1))
-            .filter_map(|payload| {
-                serde_json::from_str::<serde_json::Value>(payload.as_str().trim()).ok()
-            })
-            .filter_map(|parsed| {
-                let name = parsed.get("name").and_then(serde_json::Value::as_str)?;
-                if name.is_empty() {
-                    return None;
-                }
-
-                Some(ParsedToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: name.to_string(),
-                    arguments: parsed
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                })
-            })
-            .collect();
-
-        let cleaned = regex.replace_all(text, "");
-        let cleaned = cleaned.trim();
-        let cleaned = if cleaned.is_empty() {
-            None
-        } else {
-            Some(cleaned.to_string())
-        };
-
-        (cleaned, calls)
+    for tool in tools {
+        let _ = writeln!(instructions, "- **{}**: {}", tool.name, tool.description);
+        let _ = writeln!(instructions, "  Parameters: {}", tool.input_schema);
+        instructions.push('\n');
     }
 
-    fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
-        ConversationMessage::Chat(ChatMessage::user(render_xml_tool_results(results)))
-    }
+    instructions
+}
 
-    fn prompt_instructions(&self, tools: &[ToolSpec]) -> String {
-        let mut instructions = String::from(
-            "You have access to the following tools. To call a tool, output a <tool_call> tag containing a JSON object with \"name\" and \"arguments\".\n\n",
-        );
-        instructions.push_str(
-            "Example:\n<tool_call>{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value\"}}</tool_call>\n\n",
-        );
-        instructions.push_str("Available tools:\n\n");
-
-        for tool in tools {
-            let _ = writeln!(instructions, "- **{}**: {}", tool.name, tool.description);
-            let _ = writeln!(instructions, "  Parameters: {}", tool.input_schema);
-            instructions.push('\n');
-        }
-
-        instructions
-    }
-
-    fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .flat_map(|message| match message {
-                ConversationMessage::Chat(chat) => vec![chat.clone()],
-                ConversationMessage::AssistantToolCalls { text, .. } => {
-                    vec![ChatMessage::assistant(text.clone().unwrap_or_default())]
-                }
-                ConversationMessage::ToolResults(results) => {
-                    vec![ChatMessage::user(render_xml_tool_results(results))]
-                }
-            })
-            .collect()
-    }
-
-    fn should_send_tool_specs(&self) -> bool {
-        false
-    }
+fn xml_to_provider_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .flat_map(|message| match message {
+            ConversationMessage::Chat(chat) => vec![chat.clone()],
+            ConversationMessage::AssistantToolCalls { text, .. } => {
+                vec![ChatMessage::assistant(text.clone().unwrap_or_default())]
+            }
+            ConversationMessage::ToolResults(results) => {
+                vec![ChatMessage::user(render_xml_tool_results(results))]
+            }
+        })
+        .collect()
 }
 
 fn tool_call_regex() -> &'static Regex {
@@ -233,7 +246,7 @@ fn render_xml_tool_results(results: &[ToolExecutionResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationMessage, NativeToolDispatcher, ToolDispatcher, ToolExecutionResult,
+        ConversationMessage, NativeToolDispatcher, SelectedToolDispatcher, ToolExecutionResult,
         XmlToolDispatcher,
     };
     use crate::message::{ChatMessage, ChatRole};
@@ -653,6 +666,94 @@ mod tests {
 
         let messages = dispatcher.to_provider_messages(&history);
         assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], ChatMessage::assistant("Need output"));
+        assert!(
+            messages[1]
+                .content
+                .contains("<tool_result name=\"shell\" status=\"ok\">done</tool_result>")
+        );
+    }
+
+    #[test]
+    fn selected_dispatcher_native_behavior_matches_previous_trait_impl() {
+        let dispatcher = SelectedToolDispatcher::Native;
+        let response = ChatResponse {
+            text: Some("working".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }],
+            usage: None,
+        };
+
+        let (text, calls) = dispatcher.parse_response(&response);
+        let history = vec![
+            ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls: response.tool_calls.clone(),
+            },
+            dispatcher.format_results(&[ToolExecutionResult {
+                call_id: calls[0].id.clone(),
+                name: calls[0].name.clone(),
+                content: "ok".to_string(),
+                is_error: false,
+            }]),
+        ];
+
+        assert!(
+            dispatcher
+                .prompt_instructions(&[sample_tool_spec()])
+                .is_empty()
+        );
+        assert!(dispatcher.should_send_tool_specs());
+        let messages = dispatcher.to_provider_messages(&history);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ChatRole::Assistant);
+        assert_eq!(messages[0].content, "working");
+        assert_eq!(messages[1].role, ChatRole::User);
+        assert_eq!(messages[1].content, "ok");
+        assert_eq!(
+            messages[0].metadata.get("tool_calls").map(String::as_str),
+            Some(r#"[{"id":"call-1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]"#)
+        );
+    }
+
+    #[test]
+    fn selected_dispatcher_xml_behavior_matches_previous_trait_impl() {
+        let dispatcher = SelectedToolDispatcher::Xml;
+        let response = ChatResponse {
+            text: Some(
+                "Need output\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
+                    .to_string(),
+            ),
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+
+        let (text, calls) = dispatcher.parse_response(&response);
+        let history = vec![
+            ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls: vec![ToolCall {
+                    id: calls[0].id.clone(),
+                    name: calls[0].name.clone(),
+                    arguments: serde_json::to_string(&calls[0].arguments)
+                        .expect("arguments should serialize"),
+                }],
+            },
+            dispatcher.format_results(&[ToolExecutionResult {
+                call_id: calls[0].id.clone(),
+                name: calls[0].name.clone(),
+                content: "done".to_string(),
+                is_error: false,
+            }]),
+        ];
+
+        let instructions = dispatcher.prompt_instructions(&[sample_tool_spec()]);
+        assert!(instructions.contains("<tool_call>"));
+        assert!(!dispatcher.should_send_tool_specs());
+        let messages = dispatcher.to_provider_messages(&history);
         assert_eq!(messages[0], ChatMessage::assistant("Need output"));
         assert!(
             messages[1]

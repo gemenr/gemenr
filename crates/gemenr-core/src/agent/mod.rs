@@ -3,6 +3,6 @@
 pub mod dispatcher;
 
 pub use dispatcher::{
-    ConversationMessage, NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult,
-    XmlToolDispatcher,
+    ConversationMessage, NativeToolDispatcher, ParsedToolCall, SelectedToolDispatcher,
+    ToolExecutionResult, XmlToolDispatcher,
 };

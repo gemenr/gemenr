@@ -49,8 +49,8 @@ pub use agent::ConversationMessage;
 pub use agent::NativeToolDispatcher;
 /// Re-export of parsed tool call values.
 pub use agent::ParsedToolCall;
-/// Re-export of the shared tool dispatcher trait.
-pub use agent::ToolDispatcher;
+/// Re-export of the selected tool dispatcher enum.
+pub use agent::SelectedToolDispatcher;
 /// Re-export of tool execution result values.
 pub use agent::ToolExecutionResult;
 /// Re-export of the XML tool dispatcher.
