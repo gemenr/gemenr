@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::task;
 use tracing::debug;
 
 use crate::protocol::{EventEnvelope, EventKind, SessionId};
@@ -89,16 +90,36 @@ impl JsonlTapeStore {
     fn session_path(&self, session_id: &SessionId) -> PathBuf {
         self.base_dir.join(format!("{}.jsonl", session_id.0))
     }
+
+    async fn run_blocking_io<T, F>(operation: F) -> Result<T, TapeError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, TapeError> + Send + 'static,
+    {
+        task::spawn_blocking(operation).await.map_err(|error| {
+            TapeError::Io(std::io::Error::other(format!(
+                "tape blocking task failed: {error}"
+            )))
+        })?
+    }
 }
 
 #[async_trait]
 impl TapeStore for JsonlTapeStore {
     async fn append(&self, session_id: &SessionId, event: EventEnvelope) -> Result<(), TapeError> {
         let path = self.session_path(session_id);
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let write_path = path.clone();
         let line = serde_json::to_string(&event)?;
+        Self::run_blocking_io(move || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&write_path)?;
+            writeln!(file, "{line}")?;
+            Ok(())
+        })
+        .await?;
 
-        writeln!(file, "{line}")?;
         debug!(session_id = %session_id.0, path = %path.display(), "appended event to tape");
         Ok(())
     }
@@ -135,22 +156,28 @@ impl TapeStore for JsonlTapeStore {
 
     async fn load_all(&self, session_id: &SessionId) -> Result<Vec<EventEnvelope>, TapeError> {
         let path = self.session_path(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let file = fs::File::open(&path)?;
-        let reader = BufReader::new(file);
-        let mut events = Vec::new();
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        let read_path = path.clone();
+        let events = Self::run_blocking_io(move || {
+            if !read_path.exists() {
+                return Ok(Vec::new());
             }
 
-            events.push(serde_json::from_str::<EventEnvelope>(&line)?);
-        }
+            let file = fs::File::open(&read_path)?;
+            let reader = BufReader::new(file);
+            let mut events = Vec::new();
+
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                events.push(serde_json::from_str::<EventEnvelope>(&line)?);
+            }
+
+            Ok(events)
+        })
+        .await?;
 
         debug!(session_id = %session_id.0, path = %path.display(), count = events.len(), "loaded events from tape");
         Ok(events)
@@ -302,6 +329,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_tape_store_semantics_remain_unchanged() {
+        let store = InMemoryTapeStore::new();
+        let session_id = SessionId::new();
+        let before_anchor = event(&session_id, EventKind::UserInput, json!({"text": "before"}));
+        let anchor = anchor_event(&session_id, "anchor-1", "summary");
+        let after_anchor = event(
+            &session_id,
+            EventKind::ToolCompleted,
+            json!({"name": "shell", "result": "ok"}),
+        );
+
+        store
+            .append(&session_id, before_anchor.clone())
+            .await
+            .expect("append should succeed");
+        store
+            .append(&session_id, anchor.clone())
+            .await
+            .expect("append should succeed");
+        store
+            .append(&session_id, after_anchor.clone())
+            .await
+            .expect("append should succeed");
+
+        let all_events = store
+            .load_all(&session_id)
+            .await
+            .expect("load should succeed");
+        let latest_anchor = store
+            .load_last_anchor(&session_id)
+            .await
+            .expect("anchor load should succeed")
+            .expect("anchor should exist");
+        let since_anchor = store
+            .load_since_anchor(&session_id)
+            .await
+            .expect("load since anchor should succeed");
+
+        assert_eq!(
+            all_events,
+            vec![before_anchor, anchor, after_anchor.clone()]
+        );
+        assert_eq!(latest_anchor.anchor_id, "anchor-1");
+        assert_eq!(latest_anchor.summary, "summary");
+        assert_eq!(since_anchor, vec![after_anchor]);
+    }
+
+    #[tokio::test]
     async fn in_memory_tape_store_returns_empty_for_unknown_session() {
         let store = InMemoryTapeStore::new();
         let events = store
@@ -398,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jsonl_tape_store_appends_and_loads_events() {
+    async fn jsonl_tape_store_appends_and_loads_with_async_runtime() {
         let directory = temp_dir("jsonl-append-load");
         let store = JsonlTapeStore::new(directory.clone()).expect("store should be created");
         let session_id = SessionId::new();
@@ -422,8 +497,14 @@ mod tests {
             .load_all(&session_id)
             .await
             .expect("load should succeed");
+        let path = directory.join(format!("{}.jsonl", session_id.0));
 
         assert_eq!(events, vec![first, second]);
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert_eq!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("jsonl")
+        );
         fs::remove_dir_all(directory).expect("temp directory should be removed");
     }
 
@@ -466,7 +547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jsonl_tape_store_returns_empty_for_missing_file() {
+    async fn jsonl_tape_store_handles_missing_file_without_blocking_errors() {
         let directory = temp_dir("jsonl-missing");
         let store = JsonlTapeStore::new(directory.clone()).expect("store should be created");
         let events = store
@@ -479,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jsonl_tape_store_finds_latest_anchor() {
+    async fn jsonl_tape_store_preserves_anchor_lookup_after_async_offload() {
         let directory = temp_dir("jsonl-anchor");
         let store = JsonlTapeStore::new(directory.clone()).expect("store should be created");
         let session_id = SessionId::new();
