@@ -139,6 +139,8 @@ pub use kernel::NoopEventSink;
 pub use kernel::PromptComposer;
 /// Re-export of turn decision helpers.
 pub use kernel::TurnController;
+/// Re-export of structured runtime turn input.
+pub use kernel::TurnInput;
 /// Re-export of the core chat message type.
 pub use message::ChatMessage;
 /// Re-export of chat participant roles.

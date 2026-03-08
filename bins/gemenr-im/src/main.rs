@@ -7,9 +7,9 @@ use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AccessError, AccessInbound, AccessOutbound, Config, ConfigError, ConversationDriver,
     DenyAllApprovals, InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter, ProviderType,
-    RuntimeBuilder, RuntimeManager, SoulManager, TapeStore,
+    RuntimeBuilder, RuntimeManager, SoulManager, TapeStore, ToolInvoker,
 };
-use gemenr_tools::{ToolPlane, builtin};
+use gemenr_tools::{RuleBasedPolicyEvaluator, ToolPlane, builtin};
 use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::EnvFilter;
 
@@ -41,7 +41,7 @@ async fn main() {
         }
     };
 
-    let builder = match build_runtime_builder(&config) {
+    let builder = match build_runtime_builder(&config).await {
         Ok(builder) => builder,
         Err(error) => {
             eprintln!("Error: {error}");
@@ -123,15 +123,12 @@ fn load_soul_manager(app_dir: &Path) -> Arc<RwLock<SoulManager>> {
     }
 }
 
-fn build_runtime_builder(config: &Config) -> Result<RuntimeBuilder, ConfigError> {
+async fn build_runtime_builder(config: &Config) -> Result<RuntimeBuilder, ConfigError> {
     let provider = build_model_provider(config)?;
     let workspace = current_workspace();
     let app_dir = workspace.join(".gemenr");
     let soul = load_soul_manager(&app_dir);
-
-    let mut tool_plane = ToolPlane::new();
-    builtin::register_builtin_tools(&mut tool_plane, Arc::clone(&soul));
-    let tools = Arc::new(tool_plane);
+    let tools = build_tool_invoker(config, Arc::clone(&soul)).await?;
 
     let tape_store: Arc<dyn TapeStore> = match JsonlTapeStore::new(app_dir.join("tapes")) {
         Ok(store) => Arc::new(store),
@@ -143,6 +140,24 @@ fn build_runtime_builder(config: &Config) -> Result<RuntimeBuilder, ConfigError>
         .model_name(selected_model.model.clone())
         .tool_dispatcher(config.tool_dispatcher.clone())
         .approval_handler(Arc::new(DenyAllApprovals)))
+}
+
+async fn build_tool_invoker(
+    config: &Config,
+    soul: Arc<RwLock<SoulManager>>,
+) -> Result<Arc<dyn ToolInvoker>, ConfigError> {
+    let tooling = config.tooling_view();
+    let mut tool_plane = ToolPlane::with_policy_evaluator(Arc::new(
+        RuleBasedPolicyEvaluator::from_config(&tooling.policy),
+    ));
+    builtin::register_builtin_tools(&mut tool_plane, soul);
+    tool_plane
+        .register_mcp_servers(&tooling.mcp)
+        .await
+        .map_err(|error| {
+            ConfigError::Invalid(format!("failed to register enabled MCP servers: {error}"))
+        })?;
+    Ok(Arc::new(tool_plane))
 }
 
 fn build_model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, ConfigError> {
@@ -176,4 +191,191 @@ fn build_model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, Confi
     }
 
     Ok(Arc::new(router))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::sync::RwLock;
+
+    use super::{build_tool_invoker, load_soul_manager};
+    use gemenr_core::{
+        AuthorizationDecision, Config, ConfigError, McpServerConfig, ModelConfig, PolicyContext,
+        PolicyEffect, PolicyRuleConfig, ProviderConfig, ProviderType, SandboxKind,
+        ScopedPolicyConfig,
+    };
+
+    #[tokio::test]
+    async fn builder_wires_rule_based_policy_evaluator_from_config() {
+        let mut config = test_config();
+        config.policy.conversations = vec![ScopedPolicyConfig {
+            id: "conv-1".to_string(),
+            rules: vec![PolicyRuleConfig {
+                tool: "shell".to_string(),
+                effect: PolicyEffect::Deny,
+                sandbox: SandboxKind::None,
+            }],
+        }];
+
+        let tools = build_tool_invoker(&config, test_soul())
+            .await
+            .expect("tool invoker should build");
+        let decision = tools.authorize(
+            &gemenr_core::ToolCallRequest {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({}),
+            },
+            &PolicyContext {
+                conversation_id: Some("conv-1".to_string()),
+                ..PolicyContext::default()
+            },
+        );
+
+        assert!(matches!(decision, AuthorizationDecision::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn builder_registers_enabled_mcp_servers() {
+        let mut config = test_config();
+        config.mcp.servers = vec![mock_mcp_server_config()];
+
+        let tools = build_tool_invoker(&config, test_soul())
+            .await
+            .expect("tool invoker should build");
+
+        assert!(
+            tools
+                .list_specs()
+                .iter()
+                .any(|spec| spec.name == "mcp.mock.echo")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_mcp_server_configuration_is_not_silently_ignored() {
+        let mut config = test_config();
+        config.mcp.servers = vec![McpServerConfig {
+            name: "missing".to_string(),
+            command: "/definitely-missing-gemenr-mcp".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+        }];
+
+        let error = build_tool_invoker(&config, test_soul())
+            .await
+            .err()
+            .expect("missing MCP executable should fail");
+
+        assert!(matches!(error, ConfigError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to register enabled MCP servers")
+        );
+    }
+
+    fn test_config() -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                api_key: "test-key".to_string(),
+                api_endpoint: None,
+            },
+        );
+
+        let mut models = HashMap::new();
+        models.insert(
+            "default".to_string(),
+            ModelConfig {
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                max_tokens: Some(256),
+            },
+        );
+
+        Config {
+            model: "default".to_string(),
+            providers,
+            models,
+            tool_dispatcher: "auto".to_string(),
+            access: Default::default(),
+            cron: Vec::new(),
+            policy: Default::default(),
+            fallback: None,
+            mcp: Default::default(),
+        }
+    }
+
+    fn test_soul() -> Arc<RwLock<gemenr_core::SoulManager>> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "gemenr-im-test-soul-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("test soul workspace should exist");
+        load_soul_manager(&workspace)
+    }
+
+    fn mock_mcp_server_config() -> McpServerConfig {
+        McpServerConfig {
+            name: "mock".to_string(),
+            command: "python3".to_string(),
+            args: vec![
+                "-u".to_string(),
+                "-c".to_string(),
+                framed_server_script().to_string(),
+            ],
+            env: HashMap::new(),
+            enabled: true,
+        }
+    }
+
+    fn framed_server_script() -> &'static str {
+        r#"
+import json, sys
+
+def read_msg():
+    headers = b''
+    while b'\r\n\r\n' not in headers:
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        headers += chunk
+    header_text = headers.decode('utf-8')
+    length = 0
+    for line in header_text.split('\r\n'):
+        if line.lower().startswith('content-length:'):
+            length = int(line.split(':', 1)[1].strip())
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body.decode('utf-8'))
+
+def write_msg(payload):
+    body = json.dumps(payload).encode('utf-8')
+    sys.stdout.buffer.write(f'Content-Length: {len(body)}\r\n\r\n'.encode('utf-8'))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_msg()
+    if message is None:
+        break
+    method = message.get('method')
+    if method == 'initialize':
+        write_msg({'jsonrpc':'2.0','id':message['id'],'result':{'serverInfo':{'name':'mock'}}})
+    elif method == 'tools/list':
+        write_msg({'jsonrpc':'2.0','id':message['id'],'result':{'tools':[{'name':'echo','description':'Echo text','inputSchema':{'type':'object'}}]}})
+    elif method == 'tools/call':
+        write_msg({'jsonrpc':'2.0','id':message['id'],'result':{'content':[{'type':'text','text':'echo'}],'isError':False}})
+"#
+    }
 }

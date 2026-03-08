@@ -68,6 +68,15 @@ pub struct ApprovalRequest {
     pub message: String,
 }
 
+/// Runtime input for one complete turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnInput {
+    /// User-visible text to append to the conversation tape.
+    pub text: String,
+    /// Policy context forwarded to tool authorization.
+    pub policy_context: PolicyContext,
+}
+
 /// Decision returned by an approval handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
@@ -183,10 +192,10 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Execute a complete agent turn.
-    pub async fn run_turn(&mut self, user_input: &str) -> Result<String, AgentError> {
+    /// Execute a complete agent turn with explicit runtime input.
+    pub async fn run_turn_with_input(&mut self, input: TurnInput) -> Result<String, AgentError> {
         let turn_id = TurnId::new();
-        let result = self.run_turn_inner(&turn_id, user_input).await;
+        let result = self.run_turn_inner(&turn_id, &input).await;
 
         match &result {
             Ok(response) => self.append_turn_completed(&turn_id, response).await?,
@@ -200,13 +209,22 @@ impl AgentRuntime {
         result
     }
 
+    /// Execute a complete agent turn with the default empty policy context.
+    pub async fn run_turn(&mut self, user_input: &str) -> Result<String, AgentError> {
+        self.run_turn_with_input(TurnInput {
+            text: user_input.to_string(),
+            policy_context: PolicyContext::default(),
+        })
+        .await
+    }
+
     async fn run_turn_inner(
         &mut self,
         turn_id: &TurnId,
-        user_input: &str,
+        input: &TurnInput,
     ) -> Result<String, AgentError> {
         self.check_cancelled()?;
-        self.append_user_input(turn_id, user_input).await?;
+        self.append_user_input(turn_id, &input.text).await?;
 
         let mut history = Vec::new();
 
@@ -303,8 +321,7 @@ impl AgentRuntime {
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
                         };
-                        let policy_context = PolicyContext::default();
-                        let prepared = match self.tools.authorize(&request, &policy_context) {
+                        let prepared = match self.tools.authorize(&request, &input.policy_context) {
                             AuthorizationDecision::Prepared(prepared) => prepared,
                             AuthorizationDecision::NeedConfirmation { prepared, message } => {
                                 let approval = self
@@ -845,6 +862,7 @@ mod tests {
     struct ScriptedToolInvoker {
         specs: HashMap<String, ToolSpec>,
         policies: HashMap<String, ExecutionPolicy>,
+        authorization_contexts: Mutex<Vec<PolicyContext>>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
         cancellation_handles: Mutex<Vec<Arc<AtomicBool>>>,
         delay: Duration,
@@ -861,6 +879,7 @@ mod tests {
             Self {
                 specs,
                 policies: HashMap::new(),
+                authorization_contexts: Mutex::new(Vec::new()),
                 outputs: Mutex::new(HashMap::new()),
                 cancellation_handles: Mutex::new(Vec::new()),
                 delay: Duration::from_millis(0),
@@ -903,6 +922,13 @@ mod tests {
                 .last()
                 .cloned()
         }
+
+        fn authorization_contexts(&self) -> Vec<PolicyContext> {
+            self.authorization_contexts
+                .lock()
+                .expect("authorization contexts lock should not be poisoned")
+                .clone()
+        }
     }
 
     impl ToolCatalog for ScriptedToolInvoker {
@@ -919,8 +945,12 @@ mod tests {
         fn authorize(
             &self,
             request: &ToolCallRequest,
-            _context: &PolicyContext,
+            context: &PolicyContext,
         ) -> AuthorizationDecision {
+            self.authorization_contexts
+                .lock()
+                .expect("authorization contexts lock should not be poisoned")
+                .push(context.clone());
             let policy =
                 self.policies
                     .get(&request.name)
@@ -1536,6 +1566,64 @@ mod tests {
         assert_eq!(response, "handled confirmation");
         assert_eq!(tools.invocation_count(), 1);
         assert_eq!(approval_handler.confirmation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_turn_with_input_forwards_policy_context() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_output(
+                "echo",
+                Ok(ToolInvokeResult {
+                    content: "hello".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools.clone(),
+            tape_store,
+            Box::new(NativeToolDispatcher),
+        );
+        let policy_context = PolicyContext {
+            organization_id: Some("org-1".to_string()),
+            workspace_id: Some("ws-1".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+        };
+
+        let response = runtime
+            .run_turn_with_input(TurnInput {
+                text: "hello".to_string(),
+                policy_context: policy_context.clone(),
+            })
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(response, "done");
+        assert_eq!(tools.authorization_contexts(), vec![policy_context]);
     }
 
     #[tokio::test]

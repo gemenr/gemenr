@@ -6,8 +6,9 @@ use thiserror::Error;
 
 use crate::access::{AccessInbound, AccessOutbound, ConversationId};
 use crate::builder::RuntimeBuilder;
-use crate::kernel::{AgentError, AgentRuntime};
+use crate::kernel::{AgentError, AgentRuntime, TurnInput};
 use crate::protocol::SessionId;
+use crate::tool_invoker::PolicyContext;
 
 /// Manages long-lived conversations on top of [`AgentRuntime`].
 pub struct RuntimeManager {
@@ -150,7 +151,9 @@ impl RuntimeManager {
                 conversation.needs_restore = false;
             }
 
-            let content = runtime.run_turn(&inbound.text).await?;
+            let content = runtime
+                .run_turn_with_input(turn_input_from_inbound(&inbound))
+                .await?;
             conversation.last_activity = Instant::now();
             last_outbound = Some(AccessOutbound {
                 conversation_id: inbound.conversation_id,
@@ -164,6 +167,24 @@ impl RuntimeManager {
     }
 }
 
+fn turn_input_from_inbound(inbound: &AccessInbound) -> TurnInput {
+    TurnInput {
+        text: inbound.text.clone(),
+        policy_context: PolicyContext {
+            organization_id: metadata_string(&inbound.metadata, "organization_id"),
+            workspace_id: metadata_string(&inbound.metadata, "workspace_id"),
+            conversation_id: Some(inbound.conversation_id.0.clone()),
+        },
+    }
+}
+
+fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
@@ -174,11 +195,12 @@ mod tests {
     use serde_json::json;
     use tokio::sync::RwLock;
 
-    use super::RuntimeManager;
+    use super::{RuntimeManager, turn_input_from_inbound};
     use crate::access::{AccessInbound, ConversationId, ReplyRoute};
     use crate::builder::RuntimeBuilder;
     use crate::context::{InMemoryTapeStore, SoulManager, TapeStore};
     use crate::error::ModelError;
+    use crate::kernel::TurnInput;
     use crate::message::ChatRole;
     use crate::model::{
         ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
@@ -329,6 +351,33 @@ mod tests {
             route: stdio_route(),
             metadata: json!({"source": "test"}),
         }
+    }
+
+    #[test]
+    fn dispatch_maps_access_inbound_to_turn_input() {
+        let inbound = AccessInbound {
+            conversation_id: ConversationId("conv-42".to_string()),
+            user_id: "user-1".to_string(),
+            text: "hello".to_string(),
+            route: stdio_route(),
+            metadata: json!({
+                "organization_id": "org-9",
+                "workspace_id": "ws-7",
+                "source": "test"
+            }),
+        };
+
+        assert_eq!(
+            turn_input_from_inbound(&inbound),
+            TurnInput {
+                text: "hello".to_string(),
+                policy_context: PolicyContext {
+                    organization_id: Some("org-9".to_string()),
+                    workspace_id: Some("ws-7".to_string()),
+                    conversation_id: Some("conv-42".to_string()),
+                },
+            }
+        );
     }
 
     #[tokio::test]
