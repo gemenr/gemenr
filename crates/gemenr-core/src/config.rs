@@ -22,6 +22,11 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     /// Available model definitions keyed by model identifier.
     pub models: HashMap<String, ModelConfig>,
+    /// Tool dispatcher strategy override.
+    ///
+    /// Valid values are `native`, `xml`, and `auto`. The default is `auto`,
+    /// which lets the runtime choose based on provider capabilities.
+    pub tool_dispatcher: String,
 }
 
 /// Configuration for a model provider.
@@ -75,14 +80,27 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     model: Option<String>,
+    #[serde(default = "default_tool_dispatcher")]
+    tool_dispatcher: String,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
     #[serde(default)]
     models: HashMap<String, RawModelConfig>,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            tool_dispatcher: default_tool_dispatcher(),
+            providers: HashMap::new(),
+            models: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +161,7 @@ impl Config {
     fn from_sources(file_config: Option<RawConfig>) -> Result<Self, ConfigError> {
         let raw_config = file_config.unwrap_or_default();
         let models = build_models(raw_config.models)?;
+        let tool_dispatcher = parse_tool_dispatcher(raw_config.tool_dispatcher)?;
 
         let selected_model_id = normalize_optional_string(raw_config.model)
             .or(optional_env_string(GEMENR_MODEL_ENV)?)
@@ -162,7 +181,25 @@ impl Config {
             model: selected_model_id,
             providers,
             models,
+            tool_dispatcher,
         })
+    }
+}
+
+fn default_tool_dispatcher() -> String {
+    "auto".to_string()
+}
+
+fn parse_tool_dispatcher(tool_dispatcher: String) -> Result<String, ConfigError> {
+    let normalized = normalize_required_string(tool_dispatcher, || {
+        "root `tool_dispatcher` must not be empty".to_string()
+    })?;
+
+    match normalized.as_str() {
+        "auto" | "native" | "xml" => Ok(normalized),
+        _ => Err(ConfigError::Invalid(
+            "root `tool_dispatcher` must be one of `auto`, `native`, or `xml`".to_string(),
+        )),
     }
 }
 
@@ -420,6 +457,7 @@ max_tokens = 256
             .expect("selected provider should exist");
 
         assert_eq!(config.model, "default");
+        assert_eq!(config.tool_dispatcher, "auto");
         assert_eq!(selected_model.provider, "anthropic");
         assert_eq!(selected_model.model, "claude-haiku-4-5-20251001");
         assert_eq!(selected_model.max_tokens, Some(256));
@@ -438,6 +476,82 @@ max_tokens = 256
 
         let error = Config::load().expect_err("missing root model should error");
         assert!(matches!(error, ConfigError::Invalid(message) if message.contains("root `model`")));
+    }
+
+    #[test]
+    fn load_defaults_tool_dispatcher_to_auto() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should load");
+
+        assert_eq!(config.tool_dispatcher, "auto");
+    }
+
+    #[test]
+    fn load_accepts_custom_tool_dispatcher() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+tool_dispatcher = "native"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should load");
+
+        assert_eq!(config.tool_dispatcher, "native");
+    }
+
+    #[test]
+    fn load_old_config_without_tool_dispatcher_still_works() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+max_tokens = 256
+"#,
+        );
+
+        let config =
+            Config::load_from(&config_path).expect("config should stay backward compatible");
+
+        assert_eq!(config.model, "default");
+        assert_eq!(config.tool_dispatcher, "auto");
     }
 
     #[test]

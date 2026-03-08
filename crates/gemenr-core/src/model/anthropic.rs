@@ -629,6 +629,7 @@ mod tests {
             model: "default".to_string(),
             providers,
             models,
+            tool_dispatcher: "auto".to_string(),
         }
     }
 }

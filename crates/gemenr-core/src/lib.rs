@@ -10,6 +10,10 @@ pub mod message;
 pub mod model;
 /// Runtime protocol types.
 pub mod protocol;
+/// Tool invocation abstraction shared with the runtime.
+pub mod tool_invoker;
+/// Tool specification types shared across providers and tools.
+pub mod tool_spec;
 
 /// Re-export of the application configuration type.
 pub use config::Config;
@@ -27,14 +31,28 @@ pub use error::ModelError;
 pub use message::ChatMessage;
 /// Re-export of chat participant roles.
 pub use message::ChatRole;
+/// Re-export of structured chat requests.
+pub use model::ChatRequest;
+/// Re-export of structured chat responses.
+pub use model::ChatResponse;
 /// Re-export of model completion finish reasons.
 pub use model::FinishReason;
+/// Re-export of model provider capability declarations.
+pub use model::ModelCapabilities;
 /// Re-export of the model provider trait.
 pub use model::ModelProvider;
 /// Re-export of model completion requests.
 pub use model::ModelRequest;
 /// Re-export of model completion responses.
 pub use model::ModelResponse;
+/// Re-export of model router abstraction.
+pub use model::ModelRouter;
+/// Re-export of model token usage statistics.
+pub use model::TokenUsage;
+/// Re-export of structured model tool calls.
+pub use model::ToolCall;
+/// Re-export of provider-specific tool payloads.
+pub use model::ToolsPayload;
 /// Re-export of unified event envelopes.
 pub use protocol::EventEnvelope;
 /// Re-export of event identifiers.
@@ -51,3 +69,15 @@ pub use protocol::SessionHint;
 pub use protocol::SessionId;
 /// Re-export of turn identifiers.
 pub use protocol::TurnId;
+/// Re-export of tool policy decisions.
+pub use tool_invoker::PolicyDecision;
+/// Re-export of tool invocation errors.
+pub use tool_invoker::ToolInvokeError;
+/// Re-export of successful tool invocation results.
+pub use tool_invoker::ToolInvokeResult;
+/// Re-export of the tool invocation trait.
+pub use tool_invoker::ToolInvoker;
+/// Re-export of tool risk levels.
+pub use tool_spec::RiskLevel;
+/// Re-export of unified tool specifications.
+pub use tool_spec::ToolSpec;
