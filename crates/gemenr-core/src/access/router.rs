@@ -44,10 +44,11 @@ impl AccessRouter {
             }
 
             let (chat_id, thread_id) = match target.split_once('/') {
-                Some((chat_id, thread_id)) if !chat_id.is_empty() => {
+                Some((chat_id, thread_id)) if !chat_id.is_empty() && !thread_id.is_empty() => {
                     (chat_id.to_string(), Some(thread_id.to_string()))
                 }
-                _ => (target.to_string(), None),
+                Some(_) => return Err(AccessError::InvalidRoute(raw.to_string())),
+                None => (target.to_string(), None),
             };
 
             return Ok(ReplyRoute::Lark { chat_id, thread_id });
@@ -146,6 +147,16 @@ mod tests {
             .parse_route("discord:123")
             .expect_err("route should be invalid");
         assert!(matches!(error, AccessError::InvalidRoute(route) if route == "discord:123"));
+    }
+
+    #[test]
+    fn rejects_lark_route_with_empty_thread_id() {
+        let router = AccessRouter::new();
+
+        let error = router
+            .parse_route("lark:oc_xxx/")
+            .expect_err("route should be invalid");
+        assert!(matches!(error, AccessError::InvalidRoute(route) if route == "lark:oc_xxx/"));
     }
 
     #[tokio::test]
