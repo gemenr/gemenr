@@ -14,7 +14,7 @@ pub mod handler;
 pub mod policy;
 
 pub use handler::{ExecContext, ToolCallSpec, ToolError, ToolHandler, ToolOutput};
-pub use policy::{PolicyDecision, evaluate_policy};
+pub use policy::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};
 
 /// Catalog of all registered tools.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -26,15 +26,28 @@ pub struct ToolCatalog {
 /// Central registry and execution engine for tools.
 pub struct ToolPlane {
     tools: HashMap<String, (ToolSpec, Box<dyn ToolHandler>)>,
+    policy_evaluator: Arc<dyn PolicyEvaluator>,
 }
 
 impl ToolPlane {
     /// Create an empty tool plane.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_policy_evaluator(Arc::new(RuleBasedPolicyEvaluator::default()))
+    }
+
+    /// Create an empty tool plane with a custom policy evaluator.
+    #[must_use]
+    pub fn with_policy_evaluator(policy_evaluator: Arc<dyn PolicyEvaluator>) -> Self {
         Self {
             tools: HashMap::new(),
+            policy_evaluator,
         }
+    }
+
+    /// Replace the policy evaluator used for subsequent checks.
+    pub fn set_policy_evaluator(&mut self, policy_evaluator: Arc<dyn PolicyEvaluator>) {
+        self.policy_evaluator = policy_evaluator;
     }
 
     /// Register a tool with its specification and handler.
@@ -69,14 +82,23 @@ impl ToolPlane {
         ctx: &ExecContext,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ToolOutput, ToolError> {
-        let Some((_, handler)) = self.tools.get(&call.name) else {
+        let Some((spec, handler)) = self.tools.get(&call.name) else {
             return Err(ToolError::NotFound(call.name.clone()));
         };
 
         debug!(call_id = %call.call_id, tool = %call.name, "invoking tool");
 
+        let mut execution_context = ctx.clone();
+        if execution_context.execution_policy.is_none() {
+            execution_context.execution_policy = Some(self.policy_evaluator.evaluate(
+                &execution_context.policy_context,
+                spec,
+                call,
+            ));
+        }
+
         let execution = async {
-            let tool_future = handler.execute(ctx, call.arguments.clone());
+            let tool_future = handler.execute(&execution_context, call.arguments.clone());
             tokio::pin!(tool_future);
 
             loop {
@@ -122,7 +144,7 @@ impl tool_invoker::ToolInvoker for ToolPlane {
         &self,
         name: &str,
         arguments: &serde_json::Value,
-        _context: &tool_invoker::PolicyContext,
+        context: &tool_invoker::PolicyContext,
     ) -> tool_invoker::ExecutionPolicy {
         let Some(spec) = self.lookup(name) else {
             return tool_invoker::ExecutionPolicy::Deny {
@@ -136,20 +158,7 @@ impl tool_invoker::ToolInvoker for ToolPlane {
             arguments: arguments.clone(),
         };
 
-        match evaluate_policy(spec, &call) {
-            crate::policy::PolicyDecision::Allow => tool_invoker::ExecutionPolicy::Allow {
-                sandbox: tool_invoker::SandboxKind::None,
-            },
-            crate::policy::PolicyDecision::NeedConfirmation(message) => {
-                tool_invoker::ExecutionPolicy::NeedConfirmation {
-                    message,
-                    sandbox: tool_invoker::SandboxKind::None,
-                }
-            }
-            crate::policy::PolicyDecision::Deny(reason) => {
-                tool_invoker::ExecutionPolicy::Deny { reason }
-            }
-        }
+        self.policy_evaluator.evaluate(context, spec, &call)
     }
 
     async fn invoke(
@@ -164,7 +173,14 @@ impl tool_invoker::ToolInvoker for ToolPlane {
             name: name.to_string(),
             arguments,
         };
-        let ctx = ExecContext::default();
+        let ctx = ExecContext {
+            execution_policy: Some(self.check_policy(
+                name,
+                &call.arguments,
+                &tool_invoker::PolicyContext::default(),
+            )),
+            ..ExecContext::default()
+        };
 
         match ToolPlane::invoke(self, &call, &ctx, cancelled).await {
             Ok(output) => Ok(tool_invoker::ToolInvokeResult {
@@ -186,10 +202,13 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use gemenr_core::RiskLevel;
+    use gemenr_core::{ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind};
     use serde_json::json;
 
-    use super::{ExecContext, ToolCallSpec, ToolError, ToolHandler, ToolOutput, ToolPlane};
+    use super::{
+        ExecContext, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator, ToolCallSpec, ToolError,
+        ToolHandler, ToolOutput, ToolPlane,
+    };
 
     struct StaticHandler {
         content: &'static str,
@@ -314,6 +333,7 @@ mod tests {
         let context = ExecContext {
             working_dir: std::env::temp_dir().join("gemenr-context-test"),
             timeout: Duration::from_secs(1),
+            ..ExecContext::default()
         };
 
         let output = plane
@@ -347,6 +367,7 @@ mod tests {
         let context = ExecContext {
             working_dir: std::env::current_dir().expect("current dir should exist"),
             timeout: Duration::from_millis(10),
+            ..ExecContext::default()
         };
 
         let error = plane
@@ -369,5 +390,37 @@ mod tests {
             .expect_err("cancelled tool should fail");
 
         assert_eq!(error, ToolError::Cancelled);
+    }
+
+    #[test]
+    fn check_policy_returns_execution_plan_from_evaluator() {
+        let mut plane = ToolPlane::with_policy_evaluator(Arc::new(RuleBasedPolicyEvaluator {
+            rules: vec![PolicyRule {
+                scope: PolicyScope::Conversation("conv-1".to_string()),
+                tool_name: "shell".to_string(),
+                effect: gemenr_core::PolicyEffect::NeedConfirmation,
+                sandbox: SandboxKind::Seatbelt,
+            }],
+        }));
+        plane.register(spec("shell"), Box::new(StaticHandler { content: "ok" }));
+
+        let plan = <ToolPlane as gemenr_core::ToolInvoker>::check_policy(
+            &plane,
+            "shell",
+            &json!({"command": "pwd"}),
+            &PolicyContext {
+                organization_id: None,
+                workspace_id: None,
+                conversation_id: Some("conv-1".to_string()),
+            },
+        );
+
+        assert_eq!(
+            plan,
+            ExecutionPolicy::NeedConfirmation {
+                message: "Tool 'shell' requires confirmation".to_string(),
+                sandbox: SandboxKind::Seatbelt,
+            }
+        );
     }
 }

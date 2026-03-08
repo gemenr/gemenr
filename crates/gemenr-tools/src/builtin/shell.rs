@@ -170,6 +170,7 @@ mod tests {
         let context = ExecContext {
             working_dir: directory.clone(),
             timeout: Duration::from_secs(5),
+            ..ExecContext::default()
         };
         let command = if cfg!(target_os = "windows") {
             "cd"

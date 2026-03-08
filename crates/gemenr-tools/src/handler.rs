@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use gemenr_core::{ExecutionPolicy, PolicyContext};
 use serde::{Deserialize, Serialize};
 
 /// Handler for executing a registered tool.
@@ -44,6 +45,10 @@ pub struct ExecContext {
     pub working_dir: PathBuf,
     /// Timeout applied to the tool execution.
     pub timeout: Duration,
+    /// Policy context associated with the invocation.
+    pub policy_context: PolicyContext,
+    /// Effective execution policy selected for the call.
+    pub execution_policy: Option<ExecutionPolicy>,
 }
 
 impl Default for ExecContext {
@@ -51,6 +56,8 @@ impl Default for ExecContext {
         Self {
             working_dir: std::env::current_dir().unwrap_or_default(),
             timeout: Duration::from_secs(120),
+            policy_context: PolicyContext::default(),
+            execution_policy: None,
         }
     }
 }

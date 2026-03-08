@@ -162,6 +162,7 @@ mod tests {
         let context = ExecContext {
             working_dir: directory.clone(),
             timeout: Duration::from_secs(5),
+            ..ExecContext::default()
         };
         let output = handler
             .execute(&context, json!({"path": "nested/sample.txt"}))
