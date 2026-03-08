@@ -1,5 +1,7 @@
 //! Gemenr core library types and traits.
 
+/// Agent loop components such as tool dispatch strategies.
+pub mod agent;
 /// Configuration loading for model providers.
 pub mod config;
 /// Context persistence and reconstruction primitives.
@@ -17,6 +19,18 @@ pub mod tool_invoker;
 /// Tool specification types shared across providers and tools.
 pub mod tool_spec;
 
+/// Re-export of the application configuration type.
+pub use agent::ConversationMessage;
+/// Re-export of the native tool dispatcher.
+pub use agent::NativeToolDispatcher;
+/// Re-export of parsed tool call values.
+pub use agent::ParsedToolCall;
+/// Re-export of the shared tool dispatcher trait.
+pub use agent::ToolDispatcher;
+/// Re-export of tool execution result values.
+pub use agent::ToolExecutionResult;
+/// Re-export of the XML tool dispatcher.
+pub use agent::XmlToolDispatcher;
 /// Re-export of the application configuration type.
 pub use config::Config;
 /// Re-export of configuration loading errors.
