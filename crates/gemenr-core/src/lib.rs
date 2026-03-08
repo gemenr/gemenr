@@ -2,6 +2,8 @@
 
 /// Agent loop components such as tool dispatch strategies.
 pub mod agent;
+/// Runtime builder for assembling agent runtimes.
+pub mod builder;
 /// Configuration loading for model providers.
 pub mod config;
 /// Context persistence and reconstruction primitives.
@@ -33,6 +35,8 @@ pub use agent::ToolDispatcher;
 pub use agent::ToolExecutionResult;
 /// Re-export of the XML tool dispatcher.
 pub use agent::XmlToolDispatcher;
+/// Re-export of runtime builder.
+pub use builder::RuntimeBuilder;
 /// Re-export of the application configuration type.
 pub use config::Config;
 /// Re-export of configuration loading errors.
@@ -69,6 +73,10 @@ pub use context::TokenBudget;
 pub use error::ModelError;
 /// Re-export of turn action decisions.
 pub use kernel::ActionDecision;
+/// Re-export of runtime errors.
+pub use kernel::AgentError;
+/// Re-export of agent runtime.
+pub use kernel::AgentRuntime;
 /// Re-export of prompt composition helpers.
 pub use kernel::PromptComposer;
 /// Re-export of turn decision helpers.
