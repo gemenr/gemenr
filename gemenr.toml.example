@@ -12,3 +12,11 @@ api_endpoint = "https://api.anthropic.com/v1/messages"
 provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
 max_tokens = 1024
+
+
+# Lark long-connection adapter.
+[access.lark]
+app_id = "cli_aabbccddeeff"
+app_secret = "replace-me"
+ws_endpoint = "wss://open.feishu.cn/ws"
+debounce_ms = 500

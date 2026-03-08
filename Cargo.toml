@@ -4,6 +4,7 @@ members = [
     "crates/gemenr-core",
     "crates/gemenr-tools",
     "bins/gemenr-cli",
+    "bins/gemenr-im",
 ]
 
 [workspace.package]
@@ -37,3 +38,7 @@ clap = { version = "4", features = ["derive"] }
 # Config
 toml = "0.8"
 regex = "1"
+
+# WebSocket
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
