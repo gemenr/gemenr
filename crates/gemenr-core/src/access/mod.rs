@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+/// Access transport adapter contracts.
 pub mod adapter;
+/// Access routing primitives.
 pub mod router;
 
 pub use adapter::{AccessAdapter, ConversationDriver};

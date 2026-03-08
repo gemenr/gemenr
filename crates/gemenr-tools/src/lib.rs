@@ -9,10 +9,15 @@ use async_trait::async_trait;
 use gemenr_core::{ToolSpec, tool_invoker};
 use tracing::{debug, warn};
 
+/// Built-in tool implementations.
 pub mod builtin;
+/// Tool execution handler contracts.
 pub mod handler;
+/// MCP stdio integration.
 pub mod mcp;
+/// Scoped policy evaluation.
 pub mod policy;
+/// Sandbox backend selection.
 pub mod sandbox;
 
 pub use handler::{ExecContext, ToolCallSpec, ToolError, ToolHandler, ToolOutput};
@@ -267,6 +272,7 @@ impl tool_invoker::ToolExecutor for ToolPlane {
         cancelled: Arc<AtomicBool>,
     ) -> Result<tool_invoker::ToolInvokeResult, tool_invoker::ToolInvokeError> {
         let ctx = ExecContext {
+            cancelled: Arc::clone(&cancelled),
             ..ExecContext::default()
         };
 

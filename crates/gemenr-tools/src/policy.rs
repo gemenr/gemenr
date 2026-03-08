@@ -96,8 +96,12 @@ impl PolicyEvaluator for RuleBasedPolicyEvaluator {
         &self,
         ctx: &PolicyContext,
         spec: &ToolSpec,
-        _call: &ToolCallRequest,
+        call: &ToolCallRequest,
     ) -> ExecutionPolicy {
+        if let Some(policy) = parameter_sensitive_override(spec, call) {
+            return policy;
+        }
+
         for level in [
             ScopeLevel::Conversation,
             ScopeLevel::Workspace,
@@ -118,6 +122,51 @@ impl PolicyEvaluator for RuleBasedPolicyEvaluator {
 
         phase_one_default(spec)
     }
+}
+
+fn parameter_sensitive_override(
+    spec: &ToolSpec,
+    call: &ToolCallRequest,
+) -> Option<ExecutionPolicy> {
+    if spec.name == "shell" {
+        let command = call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)?;
+        let normalized = command.to_ascii_lowercase();
+        if ["rm -rf", "sudo ", "mkfs", "shutdown", "reboot"]
+            .iter()
+            .any(|needle| normalized.contains(needle))
+        {
+            return Some(ExecutionPolicy::Deny {
+                reason: format!(
+                    "Tool '{}' is denied by policy because command arguments are high risk",
+                    spec.name
+                ),
+            });
+        }
+    }
+
+    if spec.name == "fs.write" {
+        let path = call
+            .arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)?;
+        if [".ssh/", "/etc/", ".git/"]
+            .iter()
+            .any(|needle| path.contains(needle))
+        {
+            return Some(ExecutionPolicy::NeedConfirmation {
+                message: format!(
+                    "Tool '{}' targets a sensitive path and requires confirmation",
+                    spec.name
+                ),
+                sandbox: SandboxKind::None,
+            });
+        }
+    }
+
+    None
 }
 
 /// Shared pointer to a policy evaluator implementation.
@@ -335,6 +384,49 @@ mod tests {
             evaluator.evaluate(&ctx, &spec(RiskLevel::Low), &call()),
             ExecutionPolicy::Deny {
                 reason: "Tool 'shell' is denied by policy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn high_risk_shell_arguments_are_denied() {
+        let evaluator = RuleBasedPolicyEvaluator::default();
+        let call = ToolCallRequest {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "rm -rf /tmp/demo"}),
+        };
+
+        assert_eq!(
+            evaluator.evaluate(&PolicyContext::default(), &spec(RiskLevel::Medium), &call),
+            ExecutionPolicy::Deny {
+                reason: "Tool 'shell' is denied by policy because command arguments are high risk"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sensitive_fs_write_paths_require_confirmation() {
+        let evaluator = RuleBasedPolicyEvaluator::default();
+        let call = ToolCallRequest {
+            call_id: "call-1".to_string(),
+            name: "fs.write".to_string(),
+            arguments: json!({"path": "/etc/hosts", "content": "127.0.0.1 example"}),
+        };
+        let spec = ToolSpec {
+            name: "fs.write".to_string(),
+            description: "Write a file".to_string(),
+            input_schema: json!({"type": "object"}),
+            risk_level: RiskLevel::Low,
+        };
+
+        assert_eq!(
+            evaluator.evaluate(&PolicyContext::default(), &spec, &call),
+            ExecutionPolicy::NeedConfirmation {
+                message: "Tool 'fs.write' targets a sensitive path and requires confirmation"
+                    .to_string(),
+                sandbox: SandboxKind::None,
             }
         );
     }

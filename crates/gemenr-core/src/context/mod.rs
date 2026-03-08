@@ -12,7 +12,9 @@ use crate::protocol::{
     AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolResultPayload,
 };
 
+/// SOUL.md persistence and reload support.
 pub mod soul;
+/// Tape storage backends and anchor loading.
 pub mod tape;
 
 pub use soul::{SoulError, SoulManager};

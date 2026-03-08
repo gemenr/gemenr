@@ -100,7 +100,7 @@ pub struct EventEnvelope {
     pub session_id: SessionId,
     /// Turn within the session (None for session-level events).
     pub turn_id: Option<TurnId>,
-    /// Event kind identifier (e.g., "tool.started", "model.response", "anchor.created").
+    /// Event kind identifier (e.g., `tool_started`, `model_response`, `anchor_created`).
     pub kind: EventKind,
     /// When this event occurred.
     pub timestamp: DateTime<Utc>,

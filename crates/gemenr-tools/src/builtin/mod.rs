@@ -1,8 +1,12 @@
 //! Built-in tool handlers available in Phase 1.
 
+/// Built-in file read tool.
 pub mod fs_read;
+/// Built-in file write tool.
 pub mod fs_write;
+/// Built-in shell tool.
 pub mod shell;
+/// Built-in SOUL update tool.
 pub mod update_soul;
 
 use std::sync::Arc;

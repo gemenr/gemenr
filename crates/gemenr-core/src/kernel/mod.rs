@@ -22,7 +22,9 @@ use crate::tool_invoker::{
     ToolInvokeResult, ToolInvoker,
 };
 
+/// Prompt assembly helpers.
 pub mod prompt;
+/// Turn-state transitions and decisions.
 pub mod turn;
 
 pub use prompt::PromptComposer;

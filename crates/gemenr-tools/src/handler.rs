@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,7 +33,7 @@ pub struct ToolOutput {
 pub type ToolCallSpec = ToolCallRequest;
 
 /// Context for tool execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExecContext {
     /// Working directory for the tool execution.
     pub working_dir: PathBuf,
@@ -41,6 +43,8 @@ pub struct ExecContext {
     pub policy_context: PolicyContext,
     /// Effective execution policy selected for the call.
     pub execution_policy: Option<ExecutionPolicy>,
+    /// Shared cancellation flag propagated from the runtime.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl Default for ExecContext {
@@ -50,6 +54,7 @@ impl Default for ExecContext {
             timeout: Duration::from_secs(120),
             policy_context: PolicyContext::default(),
             execution_policy: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -94,6 +99,7 @@ pub enum ToolError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use serde_json::json;
@@ -118,6 +124,13 @@ mod tests {
         let context = ExecContext::default();
 
         assert_eq!(context.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn exec_context_defaults_to_uncancelled_flag() {
+        let context = ExecContext::default();
+
+        assert!(!context.cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
