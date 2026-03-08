@@ -138,6 +138,14 @@ impl AgentRuntime {
         }
     }
 
+    /// Restore the latest persisted anchor and post-anchor events for this session.
+    pub async fn restore_from_tape(&mut self) -> Result<(), AgentError> {
+        self.context
+            .restore_from_tape()
+            .await
+            .map_err(|error| AgentError::Context(error.to_string()))
+    }
+
     /// Execute a complete agent turn.
     pub async fn run_turn(&mut self, user_input: &str) -> Result<String, AgentError> {
         self.check_cancelled()?;
@@ -638,6 +646,16 @@ mod tests {
         tape_store: Arc<dyn TapeStore>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
     ) -> AgentRuntime {
+        runtime_with_session(SessionId::new(), model, tools, tape_store, tool_dispatcher)
+    }
+
+    fn runtime_with_session(
+        session_id: SessionId,
+        model: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolInvoker>,
+        tape_store: Arc<dyn TapeStore>,
+        tool_dispatcher: Box<dyn ToolDispatcher>,
+    ) -> AgentRuntime {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-runtime");
         std::fs::create_dir_all(&workspace).expect("test workspace should be created");
         let soul = Arc::new(RwLock::new(
@@ -645,7 +663,7 @@ mod tests {
         ));
 
         AgentRuntime::new(
-            ContextManager::new(SessionId::new(), tape_store, soul),
+            ContextManager::new(session_id, tape_store, soul),
             model,
             tools,
             tool_dispatcher,
@@ -911,5 +929,155 @@ mod tests {
 
         let result = handle.await.expect("task should join");
         assert!(matches!(result, Err(AgentError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_recovers_existing_history_for_new_runtime() {
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let session_id = SessionId::new();
+
+        let initial_model = Arc::new(ScriptedModelProvider::new(
+            vec![ChatResponse {
+                text: Some("first answer".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }],
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(ScriptedToolInvoker::new(Vec::new()));
+        let mut initial_runtime = runtime_with_session(
+            session_id.clone(),
+            initial_model,
+            tools.clone(),
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        initial_runtime
+            .run_turn("first question")
+            .await
+            .expect("initial turn should succeed");
+
+        let restored_model = Arc::new(ScriptedModelProvider::new(
+            vec![ChatResponse {
+                text: Some("second answer".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }],
+            ModelCapabilities::default(),
+        ));
+        let restored_model_for_assertions = restored_model.clone();
+        let mut restored_runtime = runtime_with_session(
+            session_id,
+            restored_model,
+            tools,
+            tape_store,
+            Box::new(NativeToolDispatcher),
+        );
+
+        restored_runtime
+            .restore_from_tape()
+            .await
+            .expect("runtime should restore tape");
+        restored_runtime
+            .run_turn("second question")
+            .await
+            .expect("restored turn should succeed");
+
+        let request = &restored_model_for_assertions.requests()[0];
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::User && message.content == "first question"
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::Assistant && message.content == "first answer"
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::User && message.content == "second question"
+        }));
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_recovers_anchor_and_post_anchor_context() {
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let session_id = SessionId::new();
+
+        let initial_model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: Some("before answer".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("after answer".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(ScriptedToolInvoker::new(Vec::new()));
+        let mut initial_runtime = runtime_with_session(
+            session_id.clone(),
+            initial_model,
+            tools.clone(),
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        initial_runtime
+            .run_turn("before anchor")
+            .await
+            .expect("pre-anchor turn should succeed");
+        initial_runtime
+            .context
+            .create_anchor("earlier summary".to_string())
+            .await
+            .expect("anchor should be created");
+        initial_runtime
+            .run_turn("after anchor")
+            .await
+            .expect("post-anchor turn should succeed");
+
+        let restored_model = Arc::new(ScriptedModelProvider::new(
+            vec![ChatResponse {
+                text: Some("current answer".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }],
+            ModelCapabilities::default(),
+        ));
+        let restored_model_for_assertions = restored_model.clone();
+        let mut restored_runtime = runtime_with_session(
+            session_id,
+            restored_model,
+            tools,
+            tape_store,
+            Box::new(NativeToolDispatcher),
+        );
+
+        restored_runtime
+            .restore_from_tape()
+            .await
+            .expect("runtime should restore tape");
+        restored_runtime
+            .run_turn("current question")
+            .await
+            .expect("restored turn should succeed");
+
+        let request = &restored_model_for_assertions.requests()[0];
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::System
+                && message.content == "Summary of earlier context:\nearlier summary"
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::User && message.content == "after anchor"
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::Assistant && message.content == "after answer"
+        }));
+        assert!(request.messages.iter().any(|message| {
+            message.role == ChatRole::User && message.content == "current question"
+        }));
     }
 }

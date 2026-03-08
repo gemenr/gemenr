@@ -15,7 +15,7 @@ use crate::error::ModelError;
 use crate::message::{ChatMessage, ChatRole};
 use crate::model::{
     ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-    ModelResponse, TokenUsage, ToolCall, ToolsPayload,
+    ModelResponse, TokenUsage, ToolCall, ToolsPayload, convert_request_tools,
 };
 use crate::tool_spec::ToolSpec;
 
@@ -160,7 +160,7 @@ impl ModelProvider for AnthropicProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        let request_body = build_chat_request(&request, &self.default_model);
+        let request_body = build_chat_request(self, &request, &self.default_model)?;
         debug!(
             model = %request_body.model,
             message_count = request_body.messages.len(),
@@ -273,20 +273,20 @@ fn build_request(request: &ModelRequest, default_model: &str) -> AnthropicReques
     }
 }
 
-fn build_chat_request(request: &ChatRequest, default_model: &str) -> AnthropicRequest {
+fn build_chat_request(
+    provider: &dyn ModelProvider,
+    request: &ChatRequest,
+    default_model: &str,
+) -> Result<AnthropicRequest, ModelError> {
     let (system, messages) = split_system_messages(&request.messages);
 
-    AnthropicRequest {
+    Ok(AnthropicRequest {
         model: resolve_model(&request.model, default_model),
         max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         messages,
         system,
-        tools: request
-            .tools
-            .as_deref()
-            .filter(|tools| !tools.is_empty())
-            .map(convert_anthropic_tools),
-    }
+        tools: anthropic_tools_payload(convert_request_tools(provider, request.tools.as_deref()))?,
+    })
 }
 
 fn resolve_model(model: &str, default_model: &str) -> String {
@@ -308,6 +308,31 @@ fn convert_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn anthropic_tools_payload(
+    payload: Option<ToolsPayload>,
+) -> Result<Option<Vec<Value>>, ModelError> {
+    match payload {
+        None => Ok(None),
+        Some(ToolsPayload::Anthropic { tools }) if tools.is_empty() => Ok(None),
+        Some(ToolsPayload::Anthropic { tools }) => Ok(Some(tools)),
+        Some(other) => Err(ModelError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            message: format!(
+                "anthropic provider expected Anthropic tool payload, got {}",
+                tools_payload_kind(&other)
+            ),
+        }),
+    }
+}
+
+fn tools_payload_kind(payload: &ToolsPayload) -> &'static str {
+    match payload {
+        ToolsPayload::OpenAI { .. } => "OpenAI",
+        ToolsPayload::Anthropic { .. } => "Anthropic",
+        ToolsPayload::PromptGuided { .. } => "PromptGuided",
+    }
 }
 
 fn default_claude_cli_headers() -> HeaderMap {
@@ -584,9 +609,9 @@ mod tests {
     use super::{
         ANTHROPIC_API_URL, ANTHROPIC_VERSION, AnthropicProvider, AnthropicRequest,
         BASE_RETRY_DELAY_SECS, CLAUDE_CLI_ANTHROPIC_BETA, CLAUDE_CLI_USER_AGENT,
-        DEFAULT_MAX_TOKENS, build_chat_request, build_request, default_claude_cli_headers,
-        map_error_response, parse_chat_response_body, parse_response_body, parse_retry_after,
-        retry_delay, should_retry, split_system_messages,
+        DEFAULT_MAX_TOKENS, anthropic_tools_payload, build_chat_request, build_request,
+        default_claude_cli_headers, map_error_response, parse_chat_response_body,
+        parse_response_body, parse_retry_after, retry_delay, should_retry, split_system_messages,
     };
     use crate::config::{Config, ModelConfig, ProviderConfig, ProviderType};
     use crate::error::ModelError;
@@ -640,6 +665,40 @@ mod tests {
                 );
             }
             other => panic!("expected Anthropic tools payload, got {other:?}"),
+        }
+    }
+
+    struct StubAnthropicPayloadProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StubAnthropicPayloadProvider {
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+        ) -> Result<crate::model::ModelResponse, ModelError> {
+            unreachable!("stub provider should not be used for completion")
+        }
+
+        fn convert_tools(&self, _tools: &[ToolSpec]) -> ToolsPayload {
+            ToolsPayload::Anthropic {
+                tools: vec![json!({
+                    "name": "shell_from_provider",
+                    "description": "Converted by provider",
+                    "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+                })],
+            }
+        }
+    }
+
+    struct StubPromptGuidedProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for StubPromptGuidedProvider {
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+        ) -> Result<crate::model::ModelResponse, ModelError> {
+            unreachable!("stub provider should not be used for completion")
         }
     }
 
@@ -873,7 +932,9 @@ mod tests {
 
     #[test]
     fn chat_request_serialization_includes_tools_when_present() {
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
         let request = build_chat_request(
+            &provider,
             &ChatRequest {
                 messages: vec![ChatMessage::user("Use a tool")],
                 model: "claude-haiku-4-5-20251001".to_string(),
@@ -881,7 +942,8 @@ mod tests {
                 tools: Some(vec![test_tool_spec()]),
             },
             "fallback-model",
-        );
+        )
+        .expect("request should build");
 
         let value = serde_json::to_value(&request).expect("request should serialize");
 
@@ -903,8 +965,37 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_serialization_omits_tools_when_absent() {
+    fn chat_request_uses_provider_tool_conversion_payload() {
         let request = build_chat_request(
+            &StubAnthropicPayloadProvider,
+            &ChatRequest {
+                messages: vec![ChatMessage::user("Use a tool")],
+                model: "claude-haiku-4-5-20251001".to_string(),
+                max_tokens: Some(256),
+                tools: Some(vec![test_tool_spec()]),
+            },
+            "fallback-model",
+        )
+        .expect("request should build");
+
+        let value = serde_json::to_value(&request).expect("request should serialize");
+
+        assert_eq!(value["tools"][0]["name"], json!("shell_from_provider"));
+        assert_eq!(
+            value["tools"][0]["description"],
+            json!("Converted by provider")
+        );
+        assert_eq!(
+            value["tools"][0]["input_schema"]["properties"]["cmd"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
+    fn chat_request_serialization_omits_tools_when_absent() {
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
+        let request = build_chat_request(
+            &provider,
             &ChatRequest {
                 messages: vec![ChatMessage::user("Hello")],
                 model: "claude-haiku-4-5-20251001".to_string(),
@@ -912,11 +1003,28 @@ mod tests {
                 tools: None,
             },
             "fallback-model",
-        );
+        )
+        .expect("request should build");
 
         let value = serde_json::to_value(&request).expect("request should serialize");
 
         assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_payload_rejects_non_anthropic_payloads() {
+        let error = anthropic_tools_payload(Some(
+            StubPromptGuidedProvider.convert_tools(&[test_tool_spec()]),
+        ))
+        .expect_err("prompt-guided payload should be rejected");
+
+        match error {
+            ModelError::Api { status, message } => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                assert!(message.contains("PromptGuided"));
+            }
+            other => panic!("expected API error, got {other:?}"),
+        }
     }
 
     #[test]

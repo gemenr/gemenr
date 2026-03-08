@@ -105,6 +105,23 @@ impl RuntimeBuilder {
     /// Build an independent runtime for one task or conversation.
     #[must_use]
     pub fn build(&self, system_prompt: String) -> AgentRuntime {
+        self.build_with_runtime_session(system_prompt, SessionId::new())
+    }
+
+    /// Build a runtime bound to an existing session identifier.
+    ///
+    /// Call [`AgentRuntime::restore_from_tape`] before running turns when the
+    /// session already has persisted context that should be restored.
+    #[must_use]
+    pub fn build_with_session(&self, system_prompt: String, session_id: SessionId) -> AgentRuntime {
+        self.build_with_runtime_session(system_prompt, session_id)
+    }
+
+    fn build_with_runtime_session(
+        &self,
+        system_prompt: String,
+        session_id: SessionId,
+    ) -> AgentRuntime {
         let tool_dispatcher: Box<dyn ToolDispatcher> = match self.tool_dispatcher_config.as_str() {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
@@ -113,7 +130,7 @@ impl RuntimeBuilder {
         };
 
         AgentRuntime::new(
-            ContextManager::new(SessionId::new(), self.tape_store.clone(), self.soul.clone()),
+            ContextManager::new(session_id, self.tape_store.clone(), self.soul.clone()),
             self.model.clone(),
             self.tools.clone(),
             tool_dispatcher,
@@ -147,6 +164,7 @@ mod tests {
         ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
         ModelResponse,
     };
+    use crate::protocol::SessionId;
     use crate::tool_invoker::{PolicyDecision, ToolInvokeError, ToolInvokeResult, ToolInvoker};
     use crate::tool_spec::{RiskLevel, ToolSpec};
 
@@ -359,5 +377,20 @@ mod tests {
         let runtime_two = builder.build("system".to_string());
 
         assert_ne!(runtime_one.session_id(), runtime_two.session_id());
+    }
+
+    #[test]
+    fn build_with_session_uses_provided_session_identifier() {
+        let model = Arc::new(RecordingModelProvider::new(ModelCapabilities::default()));
+        let tools = Arc::new(StaticToolInvoker::new(vec![sample_tool()]));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let builder = RuntimeBuilder::new(model, tools, soul(), tape_store)
+            .tool_dispatcher("auto".to_string())
+            .model_name("test-model".to_string());
+        let session_id = SessionId::new();
+
+        let runtime = builder.build_with_session("system".to_string(), session_id.clone());
+
+        assert_eq!(runtime.session_id(), &session_id);
     }
 }

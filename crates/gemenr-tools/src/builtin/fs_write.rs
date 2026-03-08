@@ -1,18 +1,22 @@
 //! Built-in file write tool.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use gemenr_core::{RiskLevel, ToolSpec};
 
-use crate::handler::{ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
 
 /// Tool handler for writing text files to disk.
 pub struct FsWriteHandler;
 
 #[async_trait]
 impl ToolHandler for FsWriteHandler {
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        ctx: &ExecContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
         let path = args
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -25,8 +29,9 @@ impl ToolHandler for FsWriteHandler {
             .ok_or_else(|| ToolError::Input {
                 message: "missing required field 'content'".to_string(),
             })?;
+        let resolved_path = resolve_path(ctx, path);
 
-        if let Some(parent) = Path::new(path).parent()
+        if let Some(parent) = resolved_path.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent)
@@ -37,7 +42,7 @@ impl ToolHandler for FsWriteHandler {
                 })?;
         }
 
-        tokio::fs::write(path, content)
+        tokio::fs::write(&resolved_path, content)
             .await
             .map_err(|error| ToolError::Execution {
                 exit_code: None,
@@ -47,6 +52,15 @@ impl ToolHandler for FsWriteHandler {
         Ok(ToolOutput {
             content: format!("wrote {} bytes to {}", content.len(), path),
         })
+    }
+}
+
+fn resolve_path(ctx: &ExecContext, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ctx.working_dir.join(path)
     }
 }
 
@@ -80,12 +94,12 @@ pub fn fs_write_spec() -> ToolSpec {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
     use super::FsWriteHandler;
-    use crate::ToolHandler;
+    use crate::{ExecContext, ToolHandler};
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -103,9 +117,10 @@ mod tests {
         let directory = temp_dir("new-file");
         let file_path = directory.join("sample.txt");
         let handler = FsWriteHandler;
+        let context = ExecContext::default();
 
         handler
-            .execute(json!({"path": file_path, "content": "hello"}))
+            .execute(&context, json!({"path": file_path, "content": "hello"}))
             .await
             .expect("write should succeed");
 
@@ -122,9 +137,13 @@ mod tests {
         let file_path = directory.join("sample.txt");
         fs::write(&file_path, "old").expect("initial file should be written");
         let handler = FsWriteHandler;
+        let context = ExecContext::default();
 
         handler
-            .execute(json!({"path": file_path, "content": "new content"}))
+            .execute(
+                &context,
+                json!({"path": file_path, "content": "new content"}),
+            )
             .await
             .expect("overwrite should succeed");
 
@@ -140,15 +159,44 @@ mod tests {
         let directory = temp_dir("nested");
         let file_path = directory.join("nested/path/sample.txt");
         let handler = FsWriteHandler;
+        let context = ExecContext::default();
 
         handler
-            .execute(json!({"path": file_path, "content": "hello nested"}))
+            .execute(
+                &context,
+                json!({"path": file_path, "content": "hello nested"}),
+            )
             .await
             .expect("nested write should succeed");
 
         assert_eq!(
             fs::read_to_string(&file_path).expect("nested file should exist"),
             "hello nested"
+        );
+        fs::remove_dir_all(directory).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn resolves_relative_paths_from_context_working_directory() {
+        let directory = temp_dir("relative");
+        let file_path = directory.join("nested/path/sample.txt");
+        let handler = FsWriteHandler;
+        let context = ExecContext {
+            working_dir: directory.clone(),
+            timeout: Duration::from_secs(5),
+        };
+
+        handler
+            .execute(
+                &context,
+                json!({"path": "nested/path/sample.txt", "content": "hello relative"}),
+            )
+            .await
+            .expect("relative write should succeed");
+
+        assert_eq!(
+            fs::read_to_string(&file_path).expect("nested file should exist"),
+            "hello relative"
         );
         fs::remove_dir_all(directory).expect("temp directory should be removed");
     }

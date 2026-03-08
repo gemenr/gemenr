@@ -2,6 +2,7 @@ mod anthropic;
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,20 @@ pub trait ModelProvider: Send + Sync {
     }
 }
 
+/// Shared handle to a model provider.
+pub type SharedModelProvider = Arc<dyn ModelProvider>;
+
+/// Convert optional unified tools into a provider-specific payload.
+#[must_use]
+pub fn convert_request_tools(
+    provider: &dyn ModelProvider,
+    tools: Option<&[ToolSpec]>,
+) -> Option<ToolsPayload> {
+    tools
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| provider.convert_tools(tools))
+}
+
 /// Build a text description of tools for prompt-guided tool calling.
 ///
 /// Providers that do not support native tool calling use this helper to inject
@@ -193,17 +208,18 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 /// Phase 1 uses a single default provider, but the router keeps provider
 /// selection out of the runtime so future multi-provider support stays
 /// backward compatible.
+#[derive(Clone)]
 pub struct ModelRouter {
-    providers: HashMap<String, Box<dyn ModelProvider>>,
+    providers: HashMap<String, SharedModelProvider>,
     default: String,
 }
 
 impl ModelRouter {
     /// Create a new router with a default provider.
     #[must_use]
-    pub fn new(name: String, provider: Box<dyn ModelProvider>) -> Self {
+    pub fn new(name: String, provider: impl Into<SharedModelProvider>) -> Self {
         let mut providers = HashMap::new();
-        providers.insert(name.clone(), provider);
+        providers.insert(name.clone(), provider.into());
 
         Self {
             providers,
@@ -212,21 +228,21 @@ impl ModelRouter {
     }
 
     /// Add an additional provider.
-    pub fn add_provider(&mut self, name: String, provider: Box<dyn ModelProvider>) {
-        self.providers.insert(name, provider);
+    pub fn add_provider(&mut self, name: String, provider: impl Into<SharedModelProvider>) {
+        self.providers.insert(name, provider.into());
     }
 
-    /// Get the default provider.
+    /// Get a shared handle to the default provider.
     #[must_use]
-    pub fn default_provider(&self) -> &dyn ModelProvider {
+    pub fn default_provider(&self) -> SharedModelProvider {
         self.provider(&self.default)
             .expect("default provider must exist in router")
     }
 
-    /// Get a provider by name.
+    /// Get a shared handle to a provider by name.
     #[must_use]
-    pub fn provider(&self, name: &str) -> Option<&dyn ModelProvider> {
-        self.providers.get(name).map(Box::as_ref)
+    pub fn provider(&self, name: &str) -> Option<SharedModelProvider> {
+        self.providers.get(name).cloned()
     }
 }
 
@@ -236,8 +252,8 @@ mod tests {
 
     use super::{
         ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, ModelRouter, TokenUsage, ToolCall, ToolsPayload,
-        build_tool_instructions_text,
+        ModelResponse, ModelRouter, SharedModelProvider, TokenUsage, ToolCall, ToolsPayload,
+        build_tool_instructions_text, convert_request_tools,
     };
     use crate::message::ChatMessage;
     use crate::tool_spec::{RiskLevel, ToolSpec};
@@ -338,6 +354,17 @@ mod tests {
         assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
     }
 
+    #[test]
+    fn convert_request_tools_skips_missing_and_empty_inputs() {
+        let provider = DummyProvider {
+            response_text: "",
+            native_tool_calling: false,
+        };
+
+        assert_eq!(convert_request_tools(&provider, None), None);
+        assert_eq!(convert_request_tools(&provider, Some(&[])), None);
+    }
+
     #[tokio::test]
     async fn default_chat_delegates_to_complete() {
         let provider = DummyProvider {
@@ -385,13 +412,13 @@ mod tests {
 
     #[tokio::test]
     async fn model_router_returns_default_provider() {
-        let router = ModelRouter::new(
-            "primary".to_string(),
-            Box::new(DummyProvider {
-                response_text: "primary",
-                native_tool_calling: false,
-            }),
-        );
+        let primary: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "primary",
+            native_tool_calling: false,
+        });
+        let router = ModelRouter::new("primary".to_string(), primary.clone());
+
+        assert!(Arc::ptr_eq(&router.default_provider(), &primary));
 
         let response = router
             .default_provider()
@@ -408,24 +435,24 @@ mod tests {
 
     #[tokio::test]
     async fn model_router_can_lookup_named_providers() {
-        let mut router = ModelRouter::new(
-            "primary".to_string(),
-            Box::new(DummyProvider {
-                response_text: "primary",
-                native_tool_calling: false,
-            }),
-        );
-        router.add_provider(
-            "backup".to_string(),
-            Box::new(DummyProvider {
-                response_text: "backup",
-                native_tool_calling: false,
-            }),
-        );
+        let primary: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "primary",
+            native_tool_calling: false,
+        });
+        let backup: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "backup",
+            native_tool_calling: false,
+        });
 
-        let response = router
+        let mut router = ModelRouter::new("primary".to_string(), primary);
+        router.add_provider("backup".to_string(), backup.clone());
+
+        let routed_provider = router
             .provider("backup")
-            .expect("named provider should exist")
+            .expect("named provider should exist");
+        assert!(Arc::ptr_eq(&routed_provider, &backup));
+
+        let response = routed_provider
             .complete(ModelRequest {
                 messages: vec![ChatMessage::user("Hello")],
                 model: "claude-haiku-4-5-20251001".to_string(),

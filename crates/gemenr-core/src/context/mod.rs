@@ -174,25 +174,30 @@ fn events_to_messages(events: &[EventEnvelope]) -> Vec<ChatMessage> {
                 .get("text")
                 .and_then(serde_json::Value::as_str)
                 .map(ChatMessage::assistant),
-            EventKind::ToolCompleted => {
-                let name = event
-                    .payload
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("tool");
-                let result = event
-                    .payload
-                    .get("result")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-
-                Some(ChatMessage::user(format!(
-                    "[Tool result from {name}]: {result}"
-                )))
-            }
+            EventKind::ToolCompleted => tool_event_message(event, "result"),
+            EventKind::ToolFailed => tool_event_message(event, "error"),
             _ => None,
         })
         .collect()
+}
+
+fn tool_event_message(event: &EventEnvelope, status: &str) -> Option<ChatMessage> {
+    let name = event
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tool");
+    let content = event
+        .payload
+        .get("result")
+        .or_else(|| event.payload.get("error"))
+        .or_else(|| event.payload.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    Some(ChatMessage::user(format!(
+        "[Tool {status} from {name}]: {content}"
+    )))
 }
 
 fn estimated_tokens(messages: &[ChatMessage]) -> usize {
@@ -336,6 +341,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_context_includes_failed_tool_results() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut manager, workspace) = manager(session_id.clone(), tape_store);
+
+        manager
+            .append(event(
+                &session_id,
+                EventKind::ToolFailed,
+                json!({"name": "shell", "result": "Denied: policy blocked"}),
+            ))
+            .await
+            .expect("append should succeed");
+
+        assert_eq!(
+            manager.build_context(&TokenBudget::default()),
+            ContextBuildResult::Ready(vec![ChatMessage::user(
+                "[Tool error from shell]: Denied: policy blocked",
+            )])
+        );
+
+        fs::remove_dir_all(workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
     async fn create_anchor_clears_buffered_events() {
         let session_id = SessionId::new();
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
@@ -466,6 +496,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_from_tape_keeps_failed_tool_context_after_anchor() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut first_manager, first_workspace) =
+            manager(session_id.clone(), Arc::clone(&tape_store));
+
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::UserInput,
+                json!({"text": "before anchor"}),
+            ))
+            .await
+            .expect("append should succeed");
+        first_manager
+            .create_anchor("phase summary".to_string())
+            .await
+            .expect("anchor creation should succeed");
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ToolFailed,
+                json!({"name": "shell", "result": "command exited with status 1"}),
+            ))
+            .await
+            .expect("append should succeed");
+
+        let (mut restored_manager, restored_workspace) = manager(session_id.clone(), tape_store);
+        restored_manager
+            .restore_from_tape()
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(
+            restored_manager.build_context(&TokenBudget::default()),
+            ContextBuildResult::Ready(vec![
+                ChatMessage::system("Summary of earlier context:\nphase summary"),
+                ChatMessage::user("[Tool error from shell]: command exited with status 1"),
+            ])
+        );
+
+        fs::remove_dir_all(first_workspace).expect("temp directory should be removed");
+        fs::remove_dir_all(restored_workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_keeps_summary_context_after_apply_summary() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut first_manager, first_workspace) =
+            manager(session_id.clone(), Arc::clone(&tape_store));
+
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::UserInput,
+                json!({"text": "before summary"}),
+            ))
+            .await
+            .expect("append should succeed");
+        first_manager
+            .apply_summary("summarized context".to_string())
+            .await
+            .expect("summary application should succeed");
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ContextSummarized,
+                json!({"summary": "summarized context"}),
+            ))
+            .await
+            .expect("append should succeed");
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ToolFailed,
+                json!({"name": "shell", "result": "Tool execution cancelled"}),
+            ))
+            .await
+            .expect("append should succeed");
+
+        let (mut restored_manager, restored_workspace) = manager(session_id.clone(), tape_store);
+        restored_manager
+            .restore_from_tape()
+            .await
+            .expect("restore should succeed");
+
+        assert_eq!(
+            restored_manager.build_context(&TokenBudget::default()),
+            ContextBuildResult::Ready(vec![
+                ChatMessage::system("Summary of earlier context:\nsummarized context"),
+                ChatMessage::user("[Tool error from shell]: Tool execution cancelled"),
+            ])
+        );
+
+        fs::remove_dir_all(first_workspace).expect("temp directory should be removed");
+        fs::remove_dir_all(restored_workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
     async fn soul_content_returns_current_soul_markdown() {
         let session_id = SessionId::new();
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
@@ -494,7 +624,11 @@ mod tests {
                 EventKind::ToolCompleted,
                 json!({"name": "shell", "result": "ok"}),
             ),
-            event(&session_id, EventKind::ToolFailed, json!({"error": "boom"})),
+            event(
+                &session_id,
+                EventKind::ToolFailed,
+                json!({"name": "shell", "error": "boom"}),
+            ),
         ]);
 
         assert_eq!(
@@ -503,6 +637,7 @@ mod tests {
                 ChatMessage::user("hello"),
                 ChatMessage::assistant("world"),
                 ChatMessage::user("[Tool result from shell]: ok"),
+                ChatMessage::user("[Tool error from shell]: boom"),
             ]
         );
     }

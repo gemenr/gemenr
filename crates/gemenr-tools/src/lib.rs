@@ -76,7 +76,7 @@ impl ToolPlane {
         debug!(call_id = %call.call_id, tool = %call.name, "invoking tool");
 
         let execution = async {
-            let tool_future = handler.execute(call.arguments.clone());
+            let tool_future = handler.execute(ctx, call.arguments.clone());
             tokio::pin!(tool_future);
 
             loop {
@@ -189,7 +189,11 @@ mod tests {
 
     #[async_trait]
     impl ToolHandler for StaticHandler {
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _ctx: &ExecContext,
+            _args: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput {
                 content: self.content.to_string(),
             })
@@ -200,10 +204,29 @@ mod tests {
 
     #[async_trait]
     impl ToolHandler for SlowHandler {
-        async fn execute(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _ctx: &ExecContext,
+            _args: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(ToolOutput {
                 content: "done".to_string(),
+            })
+        }
+    }
+
+    struct ContextEchoHandler;
+
+    #[async_trait]
+    impl ToolHandler for ContextEchoHandler {
+        async fn execute(
+            &self,
+            ctx: &ExecContext,
+            _args: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: ctx.working_dir.display().to_string(),
             })
         }
     }
@@ -274,6 +297,23 @@ mod tests {
             .expect("tool should execute");
 
         assert_eq!(output.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn invoke_passes_execution_context_to_handler() {
+        let mut plane = ToolPlane::new();
+        plane.register(spec("shell"), Box::new(ContextEchoHandler));
+        let context = ExecContext {
+            working_dir: std::env::temp_dir().join("gemenr-context-test"),
+            timeout: Duration::from_secs(1),
+        };
+
+        let output = plane
+            .invoke(&call("shell"), &context, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("tool should receive context");
+
+        assert_eq!(output.content, context.working_dir.display().to_string());
     }
 
     #[tokio::test]

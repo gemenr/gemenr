@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use gemenr_core::{RiskLevel, SoulManager, ToolSpec};
 use tokio::sync::RwLock;
 
-use crate::handler::{ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
 
 /// Tool handler for updating persistent `SOUL.md` memory.
 pub struct UpdateSoulHandler {
@@ -23,7 +23,11 @@ impl UpdateSoulHandler {
 
 #[async_trait]
 impl ToolHandler for UpdateSoulHandler {
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _ctx: &ExecContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
         let section = args
             .get("section")
             .and_then(serde_json::Value::as_str)
@@ -117,7 +121,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::UpdateSoulHandler;
-    use crate::{ToolError, ToolHandler};
+    use crate::{ExecContext, ToolError, ToolHandler};
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -138,13 +142,17 @@ mod tests {
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
         let handler = UpdateSoulHandler::new(Arc::clone(&soul));
+        let context = ExecContext::default();
 
         handler
-            .execute(json!({
-                "section": "Experiences",
-                "action": "append",
-                "content": "- Validate after each step"
-            }))
+            .execute(
+                &context,
+                json!({
+                    "section": "Experiences",
+                    "action": "append",
+                    "content": "- Validate after each step"
+                }),
+            )
             .await
             .expect("append should succeed");
 
@@ -161,13 +169,17 @@ mod tests {
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
         let handler = UpdateSoulHandler::new(Arc::clone(&soul));
+        let context = ExecContext::default();
 
         handler
-            .execute(json!({
-                "section": "Notes",
-                "action": "replace",
-                "content": "Keep commits focused."
-            }))
+            .execute(
+                &context,
+                json!({
+                    "section": "Notes",
+                    "action": "replace",
+                    "content": "Keep commits focused."
+                }),
+            )
             .await
             .expect("replace should succeed");
 
@@ -184,13 +196,17 @@ mod tests {
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
         let handler = UpdateSoulHandler::new(soul);
+        let context = ExecContext::default();
 
         let error = handler
-            .execute(json!({
-                "section": "Unknown",
-                "action": "append",
-                "content": "test"
-            }))
+            .execute(
+                &context,
+                json!({
+                    "section": "Unknown",
+                    "action": "append",
+                    "content": "test"
+                }),
+            )
             .await
             .expect_err("invalid section should fail");
 
@@ -210,13 +226,17 @@ mod tests {
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
         let handler = UpdateSoulHandler::new(soul);
+        let context = ExecContext::default();
 
         let error = handler
-            .execute(json!({
-                "section": "Notes",
-                "action": "merge",
-                "content": "test"
-            }))
+            .execute(
+                &context,
+                json!({
+                    "section": "Notes",
+                    "action": "merge",
+                    "content": "test"
+                }),
+            )
             .await
             .expect_err("invalid action should fail");
 

@@ -7,11 +7,16 @@ use serde::{Deserialize, Serialize};
 /// Handler for executing a registered tool.
 ///
 /// Each tool implements this trait to define its execution behavior.
-/// The handler receives JSON arguments and returns a structured result.
+/// The handler receives the execution context plus JSON arguments and returns
+/// a structured result.
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
-    /// Execute the tool with the given arguments.
-    async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError>;
+    /// Execute the tool with the given context and arguments.
+    async fn execute(
+        &self,
+        ctx: &ExecContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// Successful output from a tool execution.
