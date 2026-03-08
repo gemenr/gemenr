@@ -8,6 +8,8 @@ pub mod config;
 pub mod context;
 /// Structured errors for configuration and model interactions.
 pub mod error;
+/// Runtime kernel components for prompt composition and turn decisions.
+pub mod kernel;
 /// Core chat message types.
 pub mod message;
 /// Model provider abstractions and request/response types.
@@ -65,6 +67,12 @@ pub use context::TapeStore;
 pub use context::TokenBudget;
 /// Re-export of model interaction errors.
 pub use error::ModelError;
+/// Re-export of turn action decisions.
+pub use kernel::ActionDecision;
+/// Re-export of prompt composition helpers.
+pub use kernel::PromptComposer;
+/// Re-export of turn decision helpers.
+pub use kernel::TurnController;
 /// Re-export of the core chat message type.
 pub use message::ChatMessage;
 /// Re-export of chat participant roles.
