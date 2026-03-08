@@ -104,6 +104,10 @@ impl StdioAdapter {
             stderr: Mutex::new(stderr),
         }
     }
+
+    fn route() -> ReplyRoute {
+        ReplyRoute::new("stdio", "", serde_json::json!({}))
+    }
 }
 
 impl Default for StdioAdapter {
@@ -123,7 +127,7 @@ impl AccessAdapter for StdioAdapter {
     }
 
     fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
-        Ok((raw == "stdio:").then(ReplyRoute::stdio))
+        Ok((raw == "stdio:").then(Self::route))
     }
 
     async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
@@ -201,7 +205,7 @@ fn build_stdio_inbound(conversation_id: ConversationId, text: impl Into<String>)
         conversation_id,
         user_id: "stdio-user".to_string(),
         text: text.into(),
-        route: ReplyRoute::stdio(),
+        route: StdioAdapter::route(),
         metadata: serde_json::json!({}),
     }
 }
@@ -619,8 +623,7 @@ mod tests {
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
         ChatRequest, ChatResponse, Config, ConversationDriver, ConversationId, InMemoryTapeStore,
         ModelCapabilities, ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType,
-        ReplyRoute, SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker,
-        ToolSpec,
+        SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
     };
 
     #[test]
@@ -754,7 +757,7 @@ mod tests {
         adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::stdio(),
+                route: StdioAdapter::route(),
                 content: "hello".to_string(),
                 metadata: serde_json::json!({}),
             })
@@ -763,7 +766,7 @@ mod tests {
         adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::stdio(),
+                route: StdioAdapter::route(),
                 content: "oops".to_string(),
                 metadata: serde_json::json!({"stream": "stderr"}),
             })

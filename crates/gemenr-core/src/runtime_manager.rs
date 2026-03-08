@@ -303,12 +303,16 @@ mod tests {
         .model_name("test-model".to_string())
     }
 
+    fn stdio_route() -> ReplyRoute {
+        ReplyRoute::new("stdio", "", json!({}))
+    }
+
     fn inbound(conversation_id: &str, text: &str) -> AccessInbound {
         AccessInbound {
             conversation_id: ConversationId(conversation_id.to_string()),
             user_id: "user-1".to_string(),
             text: text.to_string(),
-            route: ReplyRoute::stdio(),
+            route: stdio_route(),
             metadata: json!({"source": "test"}),
         }
     }

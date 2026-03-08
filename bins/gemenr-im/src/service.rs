@@ -115,7 +115,7 @@ mod tests {
 
     use async_trait::async_trait;
     use gemenr_core::{
-        AccessError, AccessInbound, AccessOutbound, ConversationDriver, ConversationId, ReplyRoute,
+        AccessError, AccessInbound, AccessOutbound, ConversationDriver, ConversationId,
     };
     use serde_json::json;
 
@@ -221,7 +221,7 @@ mod tests {
             conversation_id: ConversationId("conv".to_string()),
             user_id: "user".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::lark("chat", Some("thread".to_string())),
+            route: crate::lark::LarkAdapter::route("chat", Some("thread".to_string())),
             metadata: json!({}),
         };
         let driver = EchoDriver;

@@ -163,6 +163,14 @@ impl LarkAdapter {
         }
     }
 
+    pub(crate) fn route(chat_id: impl Into<String>, thread_id: Option<String>) -> ReplyRoute {
+        let metadata = match thread_id {
+            Some(thread_id) => json!({ "thread_id": thread_id }),
+            None => json!({}),
+        };
+        ReplyRoute::new("lark", chat_id.into(), metadata)
+    }
+
     /// Run one long-connection session until the connection closes.
     pub async fn run(
         &self,
@@ -290,7 +298,7 @@ impl LarkAdapter {
                 .open_id
                 .unwrap_or_else(|| "unknown-user".to_string()),
             text,
-            route: ReplyRoute::lark(event.message.chat_id, event.message.thread_id),
+            route: Self::route(event.message.chat_id, event.message.thread_id),
             metadata: json!({ "message_id": event.message.message_id, "chat_type": event.message.chat_type }),
         }))
     }
@@ -431,7 +439,7 @@ impl AccessAdapter for LarkAdapter {
             None => (target.to_string(), None),
         };
 
-        Ok(Some(ReplyRoute::lark(chat_id, thread_id)))
+        Ok(Some(Self::route(chat_id, thread_id)))
     }
 
     async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
@@ -601,14 +609,14 @@ mod tests {
             conversation_id: ConversationId("conv-1".to_string()),
             user_id: "user".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::stdio(),
+            route: stdio_route(),
             metadata: json!({}),
         };
         let second = AccessInbound {
             conversation_id: ConversationId("conv-1".to_string()),
             user_id: "user".to_string(),
             text: "world".to_string(),
-            route: ReplyRoute::stdio(),
+            route: stdio_route(),
             metadata: json!({}),
         };
 
@@ -627,6 +635,10 @@ mod tests {
             ws_endpoint: Some("ws://127.0.0.1:9".to_string()),
             debounce_ms: 500,
         })
+    }
+
+    fn stdio_route() -> ReplyRoute {
+        ReplyRoute::new("stdio", "", json!({}))
     }
 
     struct EchoDriver;
@@ -649,7 +661,7 @@ mod tests {
         let error = adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::stdio(),
+                route: stdio_route(),
                 content: "hello".to_string(),
                 metadata: json!({}),
             })
@@ -665,7 +677,7 @@ mod tests {
             conversation_id: ConversationId("conv-2".to_string()),
             user_id: "user".to_string(),
             text: "queued".to_string(),
-            route: ReplyRoute::lark("chat", None),
+            route: LarkAdapter::route("chat", None),
             metadata: json!({}),
         };
         assert!(adapter.push_debounced(inbound).is_empty());
@@ -681,7 +693,7 @@ mod tests {
                 conversation_id: ConversationId("conv-3".to_string()),
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
-                route: ReplyRoute::stdio(),
+                route: stdio_route(),
                 metadata: json!({}),
             })
             .await

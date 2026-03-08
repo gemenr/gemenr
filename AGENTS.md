@@ -98,7 +98,7 @@ The real runtime path today is:
 
 Do not bypass this pipeline casually. If you need new behavior, prefer extending an existing seam (`ModelProvider`, `ToolInvoker`, `ApprovalHandler`, `EventSink`, `AccessAdapter`, `ConversationDriver`) instead of inserting ad-hoc side paths.
 
-For access-layer work specifically, keep route grammar and route metadata parsing inside the owning `AccessAdapter`. `AccessRouter` should stay a registry that dispatches by route scheme rather than a place that hardcodes transport variants.
+For access-layer work specifically, keep route grammar, route metadata parsing, and transport-specific route helper constructors inside the owning `AccessAdapter`. `AccessRouter` should stay a registry that dispatches by route scheme rather than a place that hardcodes transport variants, and `ReplyRoute` should remain a transport-agnostic value object.
 
 ## 5) Architectural Boundaries
 

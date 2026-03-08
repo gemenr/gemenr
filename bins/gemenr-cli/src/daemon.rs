@@ -88,6 +88,14 @@ impl LarkReportAdapter {
         }
     }
 
+    fn route(chat_id: impl Into<String>, thread_id: Option<String>) -> ReplyRoute {
+        let metadata = match thread_id {
+            Some(thread_id) => json!({ "thread_id": thread_id }),
+            None => json!({}),
+        };
+        ReplyRoute::new("lark", chat_id.into(), metadata)
+    }
+
     async fn refresh_tenant_token(&self) -> Result<String, AccessError> {
         let now = Instant::now();
         if let Some(cached) = self.tenant_token.read().await.clone()
@@ -146,7 +154,7 @@ impl AccessAdapter for LarkReportAdapter {
             None => (target.to_string(), None),
         };
 
-        Ok(Some(ReplyRoute::lark(chat_id, thread_id)))
+        Ok(Some(Self::route(chat_id, thread_id)))
     }
 
     async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
@@ -360,7 +368,7 @@ mod tests {
 
         fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
             if self.scheme() == "stdio" {
-                return Ok((raw == "stdio:").then(ReplyRoute::stdio));
+                return Ok((raw == "stdio:").then(|| ReplyRoute::new("stdio", "", json!({}))));
             }
 
             let prefix = format!("{}:", self.scheme());

@@ -109,6 +109,12 @@ mod tests {
     #[derive(Default)]
     struct StdioStub;
 
+    impl StdioStub {
+        fn route() -> ReplyRoute {
+            ReplyRoute::new("stdio", "", json!({}))
+        }
+    }
+
     #[async_trait]
     impl AccessAdapter for StdioStub {
         fn name(&self) -> &'static str {
@@ -120,7 +126,7 @@ mod tests {
         }
 
         fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
-            Ok((raw == "stdio:").then(ReplyRoute::stdio))
+            Ok((raw == "stdio:").then(Self::route))
         }
 
         async fn send(&self, _outbound: AccessOutbound) -> Result<(), AccessError> {
@@ -134,7 +140,7 @@ mod tests {
 
         assert_eq!(
             router.parse_route("stdio:").expect("route should parse"),
-            ReplyRoute::stdio()
+            StdioStub::route()
         );
     }
 

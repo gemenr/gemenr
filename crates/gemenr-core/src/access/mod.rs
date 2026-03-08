@@ -1,7 +1,7 @@
 //! Shared access-layer message models and adapter contracts.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use thiserror::Error;
 
 pub mod adapter;
@@ -51,22 +51,6 @@ impl ReplyRoute {
             target: target.into(),
             metadata,
         }
-    }
-
-    /// Create a stdio route.
-    #[must_use]
-    pub fn stdio() -> Self {
-        Self::new("stdio", "", json!({}))
-    }
-
-    /// Create a Lark route.
-    #[must_use]
-    pub fn lark(chat_id: impl Into<String>, thread_id: Option<String>) -> Self {
-        let metadata = match thread_id {
-            Some(thread_id) => json!({ "thread_id": thread_id }),
-            None => json!({}),
-        };
-        Self::new("lark", chat_id.into(), metadata)
     }
 
     /// Return whether the route belongs to the given scheme.
@@ -122,7 +106,7 @@ mod tests {
             conversation_id: ConversationId("conv-42".to_string()),
             user_id: "user-7".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::lark("chat-1", Some("thread-9".to_string())),
+            route: ReplyRoute::new("lark", "chat-1", json!({ "thread_id": "thread-9" })),
             metadata: json!({"source": "lark", "mentions": ["bot"]}),
         };
 
@@ -135,7 +119,7 @@ mod tests {
 
     #[test]
     fn lark_reply_route_serializes_as_open_structure() {
-        let route = ReplyRoute::lark("chat-100", Some("thread-200".to_string()));
+        let route = ReplyRoute::new("lark", "chat-100", json!({ "thread_id": "thread-200" }));
 
         let encoded = serde_json::to_value(&route).expect("route should serialize");
 
