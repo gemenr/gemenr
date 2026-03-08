@@ -17,6 +17,8 @@ use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
+mod daemon;
+
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
 /// Gemenr — an LLM-based agent runtime.
@@ -42,6 +44,9 @@ enum Commands {
         /// The task description for the agent to execute.
         task: String,
     },
+
+    /// Run the cron daemon.
+    Daemon,
 }
 
 #[tokio::main]
@@ -60,6 +65,7 @@ async fn main() {
     match cli.command {
         Commands::Chat => run_chat(&config).await,
         Commands::Run { session, task } => run_task(&task, session.as_deref(), &config).await,
+        Commands::Daemon => run_daemon(&config).await,
     }
 }
 
@@ -371,6 +377,60 @@ Use the available tools to complete the task. When done, provide a summary of wh
     tracing::info!(target: "gemenr::cli", "task execution completed");
 }
 
+async fn run_daemon(config: &Config) {
+    let workspace = current_workspace();
+    let app_dir = workspace.join(".gemenr");
+    let soul = load_soul_manager(&app_dir);
+    let tools = match build_tool_invoker(config, Arc::clone(&soul)) {
+        Ok(tools) => tools,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let tape_store: Arc<dyn TapeStore> = match JsonlTapeStore::new(app_dir.join("tapes")) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::warn!(target: "gemenr::cli", error = %error, "failed to create tape store; using in-memory fallback");
+            Arc::new(InMemoryTapeStore::new())
+        }
+    };
+    let provider = match build_model_provider(config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let builder = match configure_runtime_builder(
+        RuntimeBuilder::new(provider, Arc::clone(&tools), soul, tape_store),
+        config,
+        Some(4096),
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut router = AccessRouter::new().with_stdio(Arc::new(StdioAdapter::default()));
+    if let Some(lark) = config.access.lark.clone() {
+        router = router.with_lark(Arc::new(daemon::LarkReportAdapter::new(lark)));
+    }
+
+    let daemon = daemon::CronDaemon::new(
+        Arc::new(router),
+        builder,
+        tools,
+        DEFAULT_SYSTEM_PROMPT.to_string(),
+    );
+    if let Err(error) = daemon.run(config).await {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
 fn current_workspace() -> PathBuf {
     match std::env::current_dir() {
         Ok(path) => path,
@@ -418,10 +478,7 @@ fn build_runtime_builder(
     let workspace = current_workspace();
     let app_dir = workspace.join(".gemenr");
     let soul = load_soul_manager(&app_dir);
-
-    let mut tool_plane = ToolPlane::new();
-    builtin::register_builtin_tools(&mut tool_plane, Arc::clone(&soul));
-    let tools: Arc<dyn ToolInvoker> = Arc::new(tool_plane);
+    let tools = build_tool_invoker(config, Arc::clone(&soul))?;
 
     let tape_store: Arc<dyn TapeStore> = match JsonlTapeStore::new(app_dir.join("tapes")) {
         Ok(store) => Arc::new(store),
@@ -437,6 +494,15 @@ fn build_runtime_builder(
 
     let builder = RuntimeBuilder::new(provider, tools, soul, tape_store);
     configure_runtime_builder(builder, config, default_max_tokens)
+}
+
+fn build_tool_invoker(
+    _config: &Config,
+    soul: Arc<RwLock<SoulManager>>,
+) -> Result<Arc<dyn ToolInvoker>, ConfigError> {
+    let mut tool_plane = ToolPlane::new();
+    builtin::register_builtin_tools(&mut tool_plane, soul);
+    Ok(Arc::new(tool_plane))
 }
 
 fn build_model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, ConfigError> {
@@ -560,7 +626,7 @@ mod tests {
                 assert_eq!(session, None);
                 assert_eq!(task, "list files");
             }
-            Commands::Chat => panic!("expected run command"),
+            Commands::Chat | Commands::Daemon => panic!("expected run command"),
         }
     }
 
@@ -574,7 +640,7 @@ mod tests {
                 assert_eq!(session.as_deref(), Some("session-123"));
                 assert_eq!(task, "list files");
             }
-            Commands::Chat => panic!("expected run command"),
+            Commands::Chat | Commands::Daemon => panic!("expected run command"),
         }
     }
 

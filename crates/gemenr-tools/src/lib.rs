@@ -1,6 +1,6 @@
 //! Tool registration, policy evaluation, and execution primitives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +21,71 @@ pub use mcp::{
     register_mcp_servers,
 };
 pub use policy::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};
+
+/// Create a filtered tool invoker view that only exposes `allowed` tools.
+#[must_use]
+pub fn allowlist_tool_invoker(
+    inner: Arc<dyn tool_invoker::ToolInvoker>,
+    allowed: &[String],
+) -> Arc<dyn tool_invoker::ToolInvoker> {
+    Arc::new(AllowlistedToolInvoker {
+        inner,
+        allowed: allowed.iter().cloned().collect(),
+    })
+}
+
+struct AllowlistedToolInvoker {
+    inner: Arc<dyn tool_invoker::ToolInvoker>,
+    allowed: HashSet<String>,
+}
+
+#[async_trait]
+impl tool_invoker::ToolInvoker for AllowlistedToolInvoker {
+    fn lookup(&self, name: &str) -> Option<&ToolSpec> {
+        if self.allowed.contains(name) {
+            self.inner.lookup(name)
+        } else {
+            None
+        }
+    }
+
+    fn list_specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .list_specs()
+            .into_iter()
+            .filter(|spec| self.allowed.contains(&spec.name))
+            .collect()
+    }
+
+    fn check_policy(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &tool_invoker::PolicyContext,
+    ) -> tool_invoker::ExecutionPolicy {
+        if self.allowed.contains(name) {
+            self.inner.check_policy(name, arguments, context)
+        } else {
+            tool_invoker::ExecutionPolicy::Deny {
+                reason: format!("tool `{name}` is not available for this job"),
+            }
+        }
+    }
+
+    async fn invoke(
+        &self,
+        call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<tool_invoker::ToolInvokeResult, tool_invoker::ToolInvokeError> {
+        if self.allowed.contains(name) {
+            self.inner.invoke(call_id, name, arguments, cancelled).await
+        } else {
+            Err(tool_invoker::ToolInvokeError::NotFound(name.to_string()))
+        }
+    }
+}
 
 /// Catalog of all registered tools.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -435,6 +500,88 @@ mod tests {
                 message: "Tool 'shell' requires confirmation".to_string(),
                 sandbox: SandboxKind::Seatbelt,
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use async_trait::async_trait;
+    use gemenr_core::{RiskLevel, ToolInvokeError, ToolInvokeResult, ToolInvoker};
+    use serde_json::json;
+
+    use super::allowlist_tool_invoker;
+
+    struct StaticInvoker;
+
+    #[async_trait]
+    impl ToolInvoker for StaticInvoker {
+        fn lookup(&self, name: &str) -> Option<&gemenr_core::ToolSpec> {
+            match name {
+                "shell" => Some(Box::leak(Box::new(gemenr_core::ToolSpec {
+                    name: "shell".to_string(),
+                    description: "shell".to_string(),
+                    input_schema: json!({}),
+                    risk_level: RiskLevel::Low,
+                }))),
+                "fs.read" => Some(Box::leak(Box::new(gemenr_core::ToolSpec {
+                    name: "fs.read".to_string(),
+                    description: "fs.read".to_string(),
+                    input_schema: json!({}),
+                    risk_level: RiskLevel::Low,
+                }))),
+                _ => None,
+            }
+        }
+
+        fn list_specs(&self) -> Vec<gemenr_core::ToolSpec> {
+            ["shell", "fs.read"]
+                .into_iter()
+                .map(|name| gemenr_core::ToolSpec {
+                    name: name.to_string(),
+                    description: name.to_string(),
+                    input_schema: json!({}),
+                    risk_level: RiskLevel::Low,
+                })
+                .collect()
+        }
+
+        fn check_policy(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+            _context: &gemenr_core::PolicyContext,
+        ) -> gemenr_core::ExecutionPolicy {
+            gemenr_core::ExecutionPolicy::Allow {
+                sandbox: gemenr_core::SandboxKind::None,
+            }
+        }
+
+        async fn invoke(
+            &self,
+            _call_id: &str,
+            name: &str,
+            _arguments: serde_json::Value,
+            _cancelled: Arc<AtomicBool>,
+        ) -> Result<ToolInvokeResult, ToolInvokeError> {
+            Ok(ToolInvokeResult {
+                content: name.to_string(),
+                is_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlist_view_filters_catalog_and_invocation() {
+        let view = allowlist_tool_invoker(Arc::new(StaticInvoker), &["shell".to_string()]);
+        let specs = view.list_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "shell");
+        assert!(
+            matches!(view.invoke("1", "fs.read", json!({}), Arc::new(AtomicBool::new(false))).await, Err(ToolInvokeError::NotFound(name)) if name == "fs.read")
         );
     }
 }

@@ -42,3 +42,6 @@ regex = "1"
 # WebSocket
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+
+# Scheduler
+tokio-cron-scheduler = "0.15.1"

@@ -20,3 +20,11 @@ app_id = "cli_aabbccddeeff"
 app_secret = "replace-me"
 ws_endpoint = "wss://open.feishu.cn/ws"
 debounce_ms = 500
+
+# Cron daemon jobs. Run with `gemenr daemon`.
+[[cron]]
+name = "daily-summary"
+schedule = "0 0 9 * * *"
+prompt = "Summarize the latest workspace status and report blockers."
+tools = ["fs.read"]
+report_to = "stdio:"

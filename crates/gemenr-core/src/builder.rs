@@ -103,6 +103,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Replace the tool invoker used by runtimes built from this builder.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<dyn ToolInvoker>) -> Self {
+        self.tools = tools;
+        self
+    }
+
     /// Build an independent runtime for one task or conversation.
     #[must_use]
     pub fn build(&self, system_prompt: String) -> AgentRuntime {
