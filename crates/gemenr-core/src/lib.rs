@@ -59,10 +59,14 @@ pub use agent::XmlToolDispatcher;
 pub use builder::RuntimeBuilder;
 /// Re-export of access-layer configuration.
 pub use config::AccessConfig;
+/// Re-export of access-layer composition-root configuration view.
+pub use config::AccessConfigView;
 /// Re-export of the application configuration type.
 pub use config::Config;
 /// Re-export of configuration loading errors.
 pub use config::ConfigError;
+/// Re-export of runtime composition-root configuration view.
+pub use config::CoreRuntimeConfigView;
 /// Re-export of cron job configuration.
 pub use config::CronJobConfig;
 /// Re-export of Lark access configuration.
@@ -87,6 +91,8 @@ pub use config::ProviderConfig;
 pub use config::ProviderType;
 /// Re-export of configured policy scopes.
 pub use config::ScopedPolicyConfig;
+/// Re-export of tool-plane composition-root configuration view.
+pub use config::ToolingConfigView;
 /// Re-export of anchor checkpoint entries.
 pub use context::AnchorEntry;
 /// Re-export of anchor identifiers.

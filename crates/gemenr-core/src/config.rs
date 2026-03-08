@@ -42,6 +42,33 @@ pub struct Config {
     pub mcp: McpConfig,
 }
 
+/// Read-only runtime configuration needed by the core composition root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreRuntimeConfigView {
+    /// Selected model identifier from [`Config::models`].
+    pub model_id: String,
+    /// Tool dispatcher strategy used to build the runtime.
+    pub tool_dispatcher: String,
+}
+
+/// Read-only tool-plane configuration used by binary composition roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolingConfigView {
+    /// Policy rules used to evaluate tool execution.
+    pub policy: PolicyConfig,
+    /// External MCP server registrations.
+    pub mcp: McpConfig,
+}
+
+/// Read-only access-layer configuration used by binary composition roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessConfigView {
+    /// Transport-specific access configuration.
+    pub access: AccessConfig,
+    /// Cron-triggered jobs and their reporting routes.
+    pub cron: Vec<CronJobConfig>,
+}
+
 /// Access-layer related configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccessConfig {
@@ -372,6 +399,30 @@ impl Config {
                 selected_model.provider
             ))
         })
+    }
+
+    /// Returns the runtime-facing subset of configuration for core assembly.
+    pub fn core_runtime_view(&self) -> CoreRuntimeConfigView {
+        CoreRuntimeConfigView {
+            model_id: self.model.clone(),
+            tool_dispatcher: self.tool_dispatcher.clone(),
+        }
+    }
+
+    /// Returns the tool-plane subset of configuration for policy and MCP wiring.
+    pub fn tooling_view(&self) -> ToolingConfigView {
+        ToolingConfigView {
+            policy: self.policy.clone(),
+            mcp: self.mcp.clone(),
+        }
+    }
+
+    /// Returns the access-layer subset of configuration for transports and cron.
+    pub fn access_view(&self) -> AccessConfigView {
+        AccessConfigView {
+            access: self.access.clone(),
+            cron: self.cron.clone(),
+        }
     }
 
     fn from_sources(file_config: Option<RawConfig>) -> Result<Self, ConfigError> {
@@ -791,8 +842,10 @@ pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_API_ENDPOINT_ENV, ANTHROPIC_API_KEY_ENV, CONFIG_FILE_NAME, Config, ConfigError,
-        ENV_MUTEX, GEMENR_MODEL_ENV, ProviderType,
+        ANTHROPIC_API_ENDPOINT_ENV, ANTHROPIC_API_KEY_ENV, AccessConfig, AccessConfigView,
+        CONFIG_FILE_NAME, Config, ConfigError, CoreRuntimeConfigView, CronJobConfig, ENV_MUTEX,
+        GEMENR_MODEL_ENV, LarkConfig, McpConfig, McpServerConfig, PolicyConfig, PolicyEffect,
+        PolicyRuleConfig, ProviderType, ScopedPolicyConfig, ToolingConfigView,
     };
     use std::env;
     use std::ffi::{OsStr, OsString};
@@ -1116,6 +1169,217 @@ ROOT = "/tmp/project"
             Some("/tmp/project")
         );
         assert!(!server.enabled);
+    }
+
+    #[test]
+    fn core_runtime_view_exposes_only_runtime_fields() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+tool_dispatcher = "native"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[[cron]]
+name = "daily-system-check"
+schedule = "0 9 * * *"
+prompt = "run checks"
+
+[policy]
+
+[[mcp.servers]]
+name = "filesystem"
+command = "node"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+        let view = config.core_runtime_view();
+        let CoreRuntimeConfigView {
+            model_id,
+            tool_dispatcher,
+        } = view;
+
+        assert_eq!(model_id, "default");
+        assert_eq!(tool_dispatcher, "native");
+    }
+
+    #[test]
+    fn tooling_view_contains_policy_and_mcp_without_model_selection() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+tool_dispatcher = "xml"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[[policy.organizations]]
+id = "org-1"
+
+[[policy.organizations.rules]]
+tool = "shell"
+effect = "allow"
+
+[[mcp.servers]]
+name = "filesystem"
+command = "node"
+args = ["server.js"]
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+        let view = config.tooling_view();
+        let ToolingConfigView { policy, mcp } = view;
+
+        assert_eq!(
+            policy,
+            PolicyConfig {
+                organizations: vec![ScopedPolicyConfig {
+                    id: "org-1".to_string(),
+                    rules: vec![PolicyRuleConfig {
+                        tool: "shell".to_string(),
+                        effect: PolicyEffect::Allow,
+                        sandbox: super::SandboxKind::None,
+                    }],
+                }],
+                workspaces: Vec::new(),
+                conversations: Vec::new(),
+            }
+        );
+        assert_eq!(
+            mcp,
+            McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "filesystem".to_string(),
+                    command: "node".to_string(),
+                    args: vec!["server.js".to_string()],
+                    env: Default::default(),
+                    enabled: true,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn access_view_contains_access_and_cron() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[access.lark]
+app_id = "cli-app"
+app_secret = "cli-secret"
+debounce_ms = 750
+
+[[cron]]
+name = "daily-system-check"
+schedule = "0 9 * * *"
+prompt = "run checks"
+tools = ["shell"]
+report_to = "lark:chat-id"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+        let view = config.access_view();
+        let AccessConfigView { access, cron } = view;
+
+        assert_eq!(
+            access,
+            AccessConfig {
+                lark: Some(LarkConfig {
+                    app_id: "cli-app".to_string(),
+                    app_secret: "cli-secret".to_string(),
+                    ws_endpoint: None,
+                    debounce_ms: 750,
+                }),
+            }
+        );
+        assert_eq!(
+            cron,
+            vec![CronJobConfig {
+                name: "daily-system-check".to_string(),
+                schedule: "0 9 * * *".to_string(),
+                prompt: "run checks".to_string(),
+                tools: Some(vec!["shell".to_string()]),
+                report_to: Some("lark:chat-id".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_phase_one_config_still_loads_with_views_available() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+max_tokens = 256
+"#,
+        );
+
+        let config =
+            Config::load_from(&config_path).expect("config should stay backward compatible");
+
+        assert_eq!(
+            config.core_runtime_view(),
+            CoreRuntimeConfigView {
+                model_id: "default".to_string(),
+                tool_dispatcher: "auto".to_string(),
+            }
+        );
+        assert_eq!(
+            config.tooling_view(),
+            ToolingConfigView {
+                policy: PolicyConfig::default(),
+                mcp: McpConfig::default(),
+            }
+        );
+        assert_eq!(
+            config.access_view(),
+            AccessConfigView {
+                access: AccessConfig::default(),
+                cron: Vec::new(),
+            }
+        );
     }
 
     #[test]
