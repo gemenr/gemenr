@@ -6,13 +6,18 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
 use crate::config::{Config, ConfigError, ProviderType};
 use crate::error::ModelError;
 use crate::message::{ChatMessage, ChatRole};
-use crate::model::{FinishReason, ModelProvider, ModelRequest, ModelResponse};
+use crate::model::{
+    ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
+    ModelResponse, TokenUsage, ToolCall, ToolsPayload,
+};
+use crate::tool_spec::ToolSpec;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -59,13 +64,13 @@ impl AnthropicProvider {
         })
     }
 
-    async fn complete_with_retry(
-        &self,
-        request: ModelRequest,
-    ) -> Result<ModelResponse, ModelError> {
+    async fn send_request_with_retry<T>(&self, request_body: &T) -> Result<String, ModelError>
+    where
+        T: Serialize + ?Sized,
+    {
         for attempt in 0..=MAX_RETRIES {
-            match self.do_complete(&request).await {
-                Ok(response) => return Ok(response),
+            match self.do_send_request(request_body).await {
+                Ok(response_body) => return Ok(response_body),
                 Err(err) => {
                     let is_retryable = should_retry(&err);
                     let exhausted = attempt == MAX_RETRIES;
@@ -96,21 +101,16 @@ impl AnthropicProvider {
         unreachable!("retry loop should always return a result");
     }
 
-    async fn do_complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
-        let request_body = build_request(request, &self.default_model);
-        debug!(
-            model = %request_body.model,
-            message_count = request_body.messages.len(),
-            has_system = request_body.system.is_some(),
-            "sending anthropic request"
-        );
-
+    async fn do_send_request<T>(&self, request_body: &T) -> Result<String, ModelError>
+    where
+        T: Serialize + ?Sized,
+    {
         let response = self
             .client
             .post(&self.api_endpoint)
             .headers(default_claude_cli_headers())
             .header("x-api-key", &self.api_key)
-            .json(&request_body)
+            .json(request_body)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .send()
             .await
@@ -121,12 +121,7 @@ impl AnthropicProvider {
         let body = response.text().await.map_err(map_request_error)?;
 
         if status.is_success() {
-            return parse_response_body(&body).map_err(|err| ModelError::Api {
-                status: status.as_u16(),
-                message: truncate_error_message(&format!(
-                    "failed to parse Anthropic response: {err}"
-                )),
-            });
+            return Ok(body);
         }
 
         Err(map_error_response(status, retry_after, &body))
@@ -135,8 +130,50 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        ToolsPayload::Anthropic {
+            tools: convert_anthropic_tools(tools),
+        }
+    }
+
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        self.complete_with_retry(request).await
+        let request_body = build_request(&request, &self.default_model);
+        debug!(
+            model = %request_body.model,
+            message_count = request_body.messages.len(),
+            has_system = request_body.system.is_some(),
+            "sending anthropic completion request"
+        );
+
+        let response_body = self.send_request_with_retry(&request_body).await?;
+        parse_response_body(&response_body).map_err(|err| ModelError::Api {
+            status: StatusCode::OK.as_u16(),
+            message: truncate_error_message(&format!("failed to parse Anthropic response: {err}")),
+        })
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        let request_body = build_chat_request(&request, &self.default_model);
+        debug!(
+            model = %request_body.model,
+            message_count = request_body.messages.len(),
+            has_system = request_body.system.is_some(),
+            tool_count = request_body.tools.as_ref().map_or(0, Vec::len),
+            "sending anthropic chat request"
+        );
+
+        let response_body = self.send_request_with_retry(&request_body).await?;
+        parse_chat_response_body(&response_body).map_err(|err| ModelError::Api {
+            status: StatusCode::OK.as_u16(),
+            message: truncate_error_message(&format!("failed to parse Anthropic response: {err}")),
+        })
     }
 }
 
@@ -147,6 +184,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -159,14 +198,29 @@ struct AnthropicMessage {
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    content_type: String,
-    #[serde(default)]
-    text: Option<String>,
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,18 +237,51 @@ struct AnthropicErrorDetail {
 
 fn build_request(request: &ModelRequest, default_model: &str) -> AnthropicRequest {
     let (system, messages) = split_system_messages(&request.messages);
-    let model = if request.model.trim().is_empty() {
-        default_model.to_string()
-    } else {
-        request.model.clone()
-    };
 
     AnthropicRequest {
-        model,
+        model: resolve_model(&request.model, default_model),
         max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         messages,
         system,
+        tools: None,
     }
+}
+
+fn build_chat_request(request: &ChatRequest, default_model: &str) -> AnthropicRequest {
+    let (system, messages) = split_system_messages(&request.messages);
+
+    AnthropicRequest {
+        model: resolve_model(&request.model, default_model),
+        max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        messages,
+        system,
+        tools: request
+            .tools
+            .as_deref()
+            .filter(|tools| !tools.is_empty())
+            .map(convert_anthropic_tools),
+    }
+}
+
+fn resolve_model(model: &str, default_model: &str) -> String {
+    if model.trim().is_empty() {
+        default_model.to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+fn convert_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|spec| {
+            serde_json::json!({
+                "name": spec.name,
+                "description": spec.description,
+                "input_schema": spec.input_schema,
+            })
+        })
+        .collect()
 }
 
 fn default_claude_cli_headers() -> HeaderMap {
@@ -282,19 +369,56 @@ fn anthropic_role(role: ChatRole) -> &'static str {
 }
 
 fn parse_response_body(body: &str) -> Result<ModelResponse, serde_json::Error> {
-    let response: AnthropicResponse = serde_json::from_str(body)?;
-    let content = response
-        .content
-        .into_iter()
-        .filter(|block| block.content_type == "text")
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let response = parse_anthropic_response(body)?;
+    let content = collect_text_content(&response.content);
 
     Ok(ModelResponse {
         content,
         finish_reason: parse_finish_reason(response.stop_reason.as_deref()),
     })
+}
+
+fn parse_chat_response_body(body: &str) -> Result<ChatResponse, serde_json::Error> {
+    let response = parse_anthropic_response(body)?;
+    let text = collect_text_content(&response.content);
+    let tool_calls = response
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+            ContentBlock::Text { .. } | ContentBlock::Unknown => None,
+        })
+        .map(|(id, name, input)| {
+            Ok(ToolCall {
+                id,
+                name,
+                arguments: serde_json::to_string(&input)?,
+            })
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+    Ok(ChatResponse {
+        text: (!text.is_empty()).then_some(text),
+        tool_calls,
+        usage: response.usage.map(|usage| TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        }),
+    })
+}
+
+fn parse_anthropic_response(body: &str) -> Result<AnthropicResponse, serde_json::Error> {
+    serde_json::from_str(body)
+}
+
+fn collect_text_content(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::Unknown => None,
+        })
+        .collect()
 }
 
 fn parse_finish_reason(stop_reason: Option<&str>) -> FinishReason {
@@ -392,13 +516,64 @@ mod tests {
     use super::{
         ANTHROPIC_API_URL, ANTHROPIC_VERSION, AnthropicProvider, AnthropicRequest,
         BASE_RETRY_DELAY_SECS, CLAUDE_CLI_ANTHROPIC_BETA, CLAUDE_CLI_USER_AGENT,
-        DEFAULT_MAX_TOKENS, build_request, default_claude_cli_headers, map_error_response,
-        parse_response_body, parse_retry_after, retry_delay, should_retry, split_system_messages,
+        DEFAULT_MAX_TOKENS, build_chat_request, build_request, default_claude_cli_headers,
+        map_error_response, parse_chat_response_body, parse_response_body, parse_retry_after,
+        retry_delay, should_retry, split_system_messages,
     };
     use crate::config::{Config, ModelConfig, ProviderConfig, ProviderType};
     use crate::error::ModelError;
     use crate::message::ChatMessage;
-    use crate::model::{FinishReason, ModelRequest};
+    use crate::model::{
+        ChatRequest, FinishReason, ModelCapabilities, ModelProvider, ModelRequest, ToolsPayload,
+    };
+    use crate::tool_spec::{RiskLevel, ToolSpec};
+
+    #[test]
+    fn capabilities_enable_native_tool_calling_without_vision() {
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
+
+        assert_eq!(
+            provider.capabilities(),
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        );
+    }
+
+    #[test]
+    fn supports_native_tools_returns_true() {
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
+
+        assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn convert_tools_returns_anthropic_payload_shape() {
+        let provider = AnthropicProvider::new(&test_config(None)).expect("provider should build");
+        let tools = vec![test_tool_spec()];
+
+        let payload = provider.convert_tools(&tools);
+
+        match payload {
+            ToolsPayload::Anthropic { tools } => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0]["name"], json!("shell"));
+                assert_eq!(tools[0]["description"], json!("Execute a shell command"));
+                assert_eq!(
+                    tools[0]["input_schema"],
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    })
+                );
+            }
+            other => panic!("expected Anthropic tools payload, got {other:?}"),
+        }
+    }
 
     #[test]
     fn split_system_messages_joins_system_prompts_and_preserves_conversation_order() {
@@ -440,6 +615,88 @@ mod tests {
         assert_eq!(stop.finish_reason, FinishReason::Stop);
         assert_eq!(max_tokens.content, "Truncated");
         assert_eq!(max_tokens.finish_reason, FinishReason::MaxTokens);
+    }
+
+    #[test]
+    fn parse_chat_response_body_extracts_tool_calls() {
+        let response = r#"{
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01A09q90qw90lq917835lq9",
+                    "name": "shell",
+                    "input": {"command": "ls -la"}
+                }
+            ],
+            "stop_reason": "tool_use"
+        }"#;
+
+        let parsed = parse_chat_response_body(response).expect("response should parse");
+
+        assert_eq!(parsed.text, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "toolu_01A09q90qw90lq917835lq9");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"command":"ls -la"}"#);
+    }
+
+    #[test]
+    fn parse_chat_response_body_handles_mixed_text_and_tool_calls() {
+        let response = r#"{
+            "content": [
+                {"type": "text", "text": "Let me check that..."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_123",
+                    "name": "shell",
+                    "input": {"command": "pwd"}
+                }
+            ],
+            "stop_reason": "tool_use"
+        }"#;
+
+        let parsed = parse_chat_response_body(response).expect("response should parse");
+
+        assert_eq!(parsed.text.as_deref(), Some("Let me check that..."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn parse_chat_response_body_keeps_tool_calls_empty_for_plain_text() {
+        let response = r#"{
+            "content": [
+                {"type": "text", "text": "Hello there"}
+            ],
+            "stop_reason": "end_turn"
+        }"#;
+
+        let parsed = parse_chat_response_body(response).expect("response should parse");
+
+        assert_eq!(parsed.text.as_deref(), Some("Hello there"));
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.usage, None);
+    }
+
+    #[test]
+    fn parse_chat_response_body_maps_usage() {
+        let response = r#"{
+            "content": [
+                {"type": "text", "text": "Done"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 50}
+        }"#;
+
+        let parsed = parse_chat_response_body(response).expect("response should parse");
+
+        assert_eq!(
+            parsed.usage,
+            Some(crate::model::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            })
+        );
     }
 
     #[test]
@@ -503,6 +760,54 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_serialization_includes_tools_when_present() {
+        let request = build_chat_request(
+            &ChatRequest {
+                messages: vec![ChatMessage::user("Use a tool")],
+                model: "claude-haiku-4-5-20251001".to_string(),
+                max_tokens: Some(256),
+                tools: Some(vec![test_tool_spec()]),
+            },
+            "fallback-model",
+        );
+
+        let value = serde_json::to_value(&request).expect("request should serialize");
+
+        assert_eq!(value["tools"][0]["name"], json!("shell"));
+        assert_eq!(
+            value["tools"][0]["description"],
+            json!("Execute a shell command")
+        );
+        assert_eq!(
+            value["tools"][0]["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            })
+        );
+    }
+
+    #[test]
+    fn chat_request_serialization_omits_tools_when_absent() {
+        let request = build_chat_request(
+            &ChatRequest {
+                messages: vec![ChatMessage::user("Hello")],
+                model: "claude-haiku-4-5-20251001".to_string(),
+                max_tokens: None,
+                tools: None,
+            },
+            "fallback-model",
+        );
+
+        let value = serde_json::to_value(&request).expect("request should serialize");
+
+        assert!(value.get("tools").is_none());
+    }
+
+    #[test]
     fn retry_after_header_parses_seconds() {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("2.5"));
@@ -519,6 +824,7 @@ mod tests {
             max_tokens: 128,
             messages: vec![],
             system: None,
+            tools: None,
         };
 
         let serialized = serde_json::to_string(&request).expect("request should serialize");
@@ -630,6 +936,21 @@ mod tests {
             providers,
             models,
             tool_dispatcher: "auto".to_string(),
+        }
+    }
+
+    fn test_tool_spec() -> ToolSpec {
+        ToolSpec {
+            name: "shell".to_string(),
+            description: "Execute a shell command".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+            risk_level: RiskLevel::High,
         }
     }
 }
