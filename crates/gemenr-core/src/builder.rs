@@ -14,6 +14,7 @@ use crate::protocol::SessionId;
 use crate::tool_invoker::ToolInvoker;
 
 /// Assembles [`AgentRuntime`] instances with shared resources.
+#[derive(Clone)]
 pub struct RuntimeBuilder {
     /// Shared model provider.
     model: Arc<dyn ModelProvider>,
@@ -115,6 +116,17 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn build_with_session(&self, system_prompt: String, session_id: SessionId) -> AgentRuntime {
         self.build_with_runtime_session(system_prompt, session_id)
+    }
+
+    /// Build a runtime for an existing session and restore its persisted context.
+    pub async fn build_restored(
+        &self,
+        system_prompt: String,
+        session_id: SessionId,
+    ) -> Result<AgentRuntime, crate::kernel::AgentError> {
+        let mut runtime = self.build_with_session(system_prompt, session_id);
+        runtime.restore_from_tape().await?;
+        Ok(runtime)
     }
 
     fn build_with_runtime_session(

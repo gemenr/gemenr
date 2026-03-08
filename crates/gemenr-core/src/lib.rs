@@ -20,6 +20,8 @@ pub mod message;
 pub mod model;
 /// Runtime protocol types.
 pub mod protocol;
+/// Long-lived conversation runtime management.
+pub mod runtime_manager;
 /// Tool invocation abstraction shared with the runtime.
 pub mod tool_invoker;
 /// Tool specification types shared across providers and tools.
@@ -161,6 +163,10 @@ pub use protocol::SessionHint;
 pub use protocol::SessionId;
 /// Re-export of turn identifiers.
 pub use protocol::TurnId;
+/// Re-export of the runtime manager for long-lived conversations.
+pub use runtime_manager::RuntimeManager;
+/// Re-export of runtime manager errors.
+pub use runtime_manager::RuntimeManagerError;
 /// Re-export of final execution policies.
 pub use tool_invoker::ExecutionPolicy;
 /// Re-export of policy evaluation context.
