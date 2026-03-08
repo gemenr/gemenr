@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AgentError, ApprovalHandler, Config, ConfigError, EventEnvelope, EventKind, EventSink,
-    InMemoryTapeStore, JsonlTapeStore, ModelProvider, RuntimeBuilder, SoulManager,
-    TapeStore, ToolInvoker,
+    InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter, ProviderType, RuntimeBuilder,
+    SessionId, SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -31,6 +31,10 @@ enum Commands {
 
     /// Execute a task autonomously — the agent plans and calls tools to complete it.
     Run {
+        /// Restore and continue a previously persisted session.
+        #[arg(long)]
+        session: Option<String>,
+
         /// The task description for the agent to execute.
         task: String,
     },
@@ -51,7 +55,7 @@ async fn main() {
 
     match cli.command {
         Commands::Chat => run_chat(&config).await,
-        Commands::Run { task } => run_task(&task, &config).await,
+        Commands::Run { session, task } => run_task(&task, session.as_deref(), &config).await,
     }
 }
 
@@ -191,7 +195,7 @@ async fn run_chat(config: &Config) {
     tracing::info!(target: "gemenr::cli", "chat session ended");
 }
 
-async fn run_task(task: &str, config: &Config) {
+async fn run_task(task: &str, session_id: Option<&str>, config: &Config) {
     let builder = match build_runtime_builder(config, Some(4096)) {
         Ok(builder) => builder,
         Err(error) => {
@@ -203,7 +207,20 @@ async fn run_task(task: &str, config: &Config) {
     let system_prompt = format!(
         "You are an autonomous agent. Execute the following task:\n\n{task}\n\nUse the available tools to complete the task. When done, provide a summary of what you accomplished."
     );
-    let mut runtime = builder.build(system_prompt);
+    let mut runtime = match session_id {
+        Some(session_id) => {
+            builder.build_with_session(system_prompt, SessionId(session_id.to_string()))
+        }
+        None => builder.build(system_prompt),
+    };
+
+    if session_id.is_some()
+        && let Err(error) = runtime.restore_from_tape().await
+    {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+
     let cancellation_handle = runtime.cancellation_handle();
     let interrupt_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -269,7 +286,7 @@ fn build_runtime_builder(
     config: &Config,
     default_max_tokens: Option<u32>,
 ) -> Result<RuntimeBuilder, ConfigError> {
-    let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new(config)?);
+    let provider = build_model_provider(config)?;
 
     let workspace = current_workspace();
     let app_dir = workspace.join(".gemenr");
@@ -293,6 +310,18 @@ fn build_runtime_builder(
 
     let builder = RuntimeBuilder::new(provider, tools, soul, tape_store);
     configure_runtime_builder(builder, config, default_max_tokens)
+}
+
+fn build_model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, ConfigError> {
+    let selected_model = config.selected_model()?;
+    let selected_provider = config.selected_provider()?;
+
+    let provider: Arc<dyn ModelProvider> = match selected_provider.provider_type {
+        ProviderType::Anthropic => Arc::new(AnthropicProvider::new(config)?),
+    };
+
+    let router = ModelRouter::new(selected_model.provider.clone(), provider);
+    Ok(router.default_provider())
 }
 
 fn configure_runtime_builder(
@@ -367,7 +396,24 @@ mod tests {
         let cli = Cli::try_parse_from(["gemenr", "run", "list files"]).expect("run should parse");
 
         match cli.command {
-            Commands::Run { task } => assert_eq!(task, "list files"),
+            Commands::Run { session, task } => {
+                assert_eq!(session, None);
+                assert_eq!(task, "list files");
+            }
+            Commands::Chat => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_subcommand_with_session() {
+        let cli = Cli::try_parse_from(["gemenr", "run", "--session", "session-123", "list files"])
+            .expect("run with session should parse");
+
+        match cli.command {
+            Commands::Run { session, task } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+                assert_eq!(task, "list files");
+            }
             Commands::Chat => panic!("expected run command"),
         }
     }
