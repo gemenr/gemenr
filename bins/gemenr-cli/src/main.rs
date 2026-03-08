@@ -9,8 +9,9 @@ use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
     ApprovalHandler, Config, ConfigError, ConversationDriver, ConversationId, EventEnvelope,
-    EventKind, EventSink, InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter,
-    ProviderType, ReplyRoute, RuntimeBuilder, SessionId, SoulManager, TapeStore, ToolInvoker,
+    EventKind, EventSink, FallbackPlan, InMemoryTapeStore, JsonlTapeStore, ModelProvider,
+    ModelRouter, ProviderType, ReplyRoute, RuntimeBuilder, SessionId, SoulManager, TapeStore,
+    ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -446,8 +447,38 @@ fn build_model_provider(config: &Config) -> Result<Arc<dyn ModelProvider>, Confi
         ProviderType::Anthropic => Arc::new(AnthropicProvider::new(config)?),
     };
 
-    let router = ModelRouter::new(selected_model.provider.clone(), provider);
-    Ok(router.default_provider())
+    let mut router = ModelRouter::new(selected_model.provider.clone(), provider);
+
+    if let Some(fallback) = &config.fallback {
+        if fallback.primary != selected_model.provider {
+            return Err(ConfigError::Invalid(format!(
+                "fallback.primary `{}` must match selected model provider `{}`",
+                fallback.primary, selected_model.provider
+            )));
+        }
+
+        for backup in &fallback.backups {
+            let provider_config = config.providers.get(backup).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "fallback.backups references unknown provider `{backup}`"
+                ))
+            })?;
+            let provider: Arc<dyn ModelProvider> = match provider_config.provider_type {
+                ProviderType::Anthropic => Arc::new(AnthropicProvider::from_parts(
+                    selected_model,
+                    provider_config,
+                )?),
+            };
+            router.add_provider(backup.clone(), provider);
+        }
+
+        router.set_fallback_plan(FallbackPlan {
+            primary: fallback.primary.clone(),
+            backups: fallback.backups.clone(),
+        })?;
+    }
+
+    Ok(Arc::new(router))
 }
 
 fn configure_runtime_builder(

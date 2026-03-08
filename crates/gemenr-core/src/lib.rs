@@ -137,6 +137,8 @@ pub use message::ChatRole;
 pub use model::ChatRequest;
 /// Re-export of structured chat responses.
 pub use model::ChatResponse;
+/// Re-export of provider fallback plans.
+pub use model::FallbackPlan;
 /// Re-export of model completion finish reasons.
 pub use model::FinishReason;
 /// Re-export of model provider capability declarations.

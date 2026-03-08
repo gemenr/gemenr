@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
-use crate::config::{Config, ConfigError, ProviderType};
+use crate::config::{Config, ConfigError, ModelConfig, ProviderConfig, ProviderType};
 use crate::error::ModelError;
 use crate::message::{ChatMessage, ChatRole};
 use crate::model::{
@@ -46,21 +46,25 @@ impl AnthropicProvider {
         let selected_model = config.selected_model()?;
         let selected_provider = config.selected_provider()?;
 
-        if selected_provider.provider_type != ProviderType::Anthropic {
-            return Err(ConfigError::Invalid(format!(
-                "selected model `{}` uses unsupported provider type for AnthropicProvider",
-                config.model
-            )));
+        Self::from_parts(selected_model, selected_provider)
+    }
+
+    /// Creates a new Anthropic provider from explicit model and provider definitions.
+    pub fn from_parts(model: &ModelConfig, provider: &ProviderConfig) -> Result<Self, ConfigError> {
+        if provider.provider_type != ProviderType::Anthropic {
+            return Err(ConfigError::Invalid(
+                "provider type is unsupported for AnthropicProvider".to_string(),
+            ));
         }
 
         Ok(Self {
             client: Client::new(),
-            api_key: selected_provider.api_key.clone(),
-            api_endpoint: selected_provider
+            api_key: provider.api_key.clone(),
+            api_endpoint: provider
                 .api_endpoint
                 .clone()
                 .unwrap_or_else(|| ANTHROPIC_API_URL.to_string()),
-            default_model: selected_model.model.clone(),
+            default_model: model.model.clone(),
         })
     }
 

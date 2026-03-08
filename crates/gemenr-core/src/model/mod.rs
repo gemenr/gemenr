@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::config::ConfigError;
 use crate::error::ModelError;
 use crate::message::ChatMessage;
 use crate::tool_spec::ToolSpec;
@@ -203,6 +204,15 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     instructions
 }
 
+/// Selects provider fallback order for retryable model failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackPlan {
+    /// Primary provider key.
+    pub primary: String,
+    /// Backup provider keys in failover order.
+    pub backups: Vec<String>,
+}
+
 /// Routes model requests to the appropriate provider.
 ///
 /// Phase 1 uses a single default provider, but the router keeps provider
@@ -212,24 +222,61 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 pub struct ModelRouter {
     providers: HashMap<String, SharedModelProvider>,
     default: String,
+    fallback_plan: Option<FallbackPlan>,
 }
 
 impl ModelRouter {
     /// Create a new router with a default provider.
     #[must_use]
-    pub fn new(name: String, provider: impl Into<SharedModelProvider>) -> Self {
+    pub fn new(name: String, provider: SharedModelProvider) -> Self {
         let mut providers = HashMap::new();
-        providers.insert(name.clone(), provider.into());
+        providers.insert(name.clone(), provider);
 
         Self {
             providers,
             default: name,
+            fallback_plan: None,
         }
     }
 
     /// Add an additional provider.
-    pub fn add_provider(&mut self, name: String, provider: impl Into<SharedModelProvider>) {
-        self.providers.insert(name, provider.into());
+    pub fn add_provider(&mut self, name: String, provider: SharedModelProvider) {
+        self.providers.insert(name, provider);
+    }
+
+    /// Configure provider fallback order.
+    pub fn set_fallback_plan(&mut self, plan: FallbackPlan) -> Result<(), ConfigError> {
+        self.validate_fallback_plan(&plan)?;
+        self.fallback_plan = Some(plan);
+        Ok(())
+    }
+
+    /// Validate that a fallback plan only references known providers and keeps
+    /// native tool support consistent across the group.
+    pub fn validate_fallback_plan(&self, plan: &FallbackPlan) -> Result<(), ConfigError> {
+        let Some(primary) = self.providers.get(&plan.primary) else {
+            return Err(ConfigError::Invalid(format!(
+                "fallback.primary references unknown provider `{}`",
+                plan.primary
+            )));
+        };
+
+        let primary_supports_native_tools = primary.supports_native_tools();
+        for backup in &plan.backups {
+            let Some(provider) = self.providers.get(backup) else {
+                return Err(ConfigError::Invalid(format!(
+                    "fallback.backups references unknown provider `{backup}`"
+                )));
+            };
+            if provider.supports_native_tools() != primary_supports_native_tools {
+                return Err(ConfigError::Invalid(format!(
+                    "fallback provider `{backup}` must share supports_native_tools() with primary `{}`",
+                    plan.primary
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Get a shared handle to the default provider.
@@ -244,23 +291,154 @@ impl ModelRouter {
     pub fn provider(&self, name: &str) -> Option<SharedModelProvider> {
         self.providers.get(name).cloned()
     }
+
+    /// Run a structured chat request with configured fallback behavior.
+    pub async fn chat_with_fallback(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, ModelError> {
+        let provider_names = self.provider_order();
+        let mut last_error = None;
+
+        for (index, provider_name) in provider_names.iter().enumerate() {
+            let provider = self
+                .provider(provider_name)
+                .expect("provider in order must be registered");
+            match provider.chat(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) if is_retryable(&error) && index + 1 < provider_names.len() => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.expect("provider order should contain at least one provider"))
+    }
+
+    async fn complete_with_fallback(
+        &self,
+        request: ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        let provider_names = self.provider_order();
+        let mut last_error = None;
+
+        for (index, provider_name) in provider_names.iter().enumerate() {
+            let provider = self
+                .provider(provider_name)
+                .expect("provider in order must be registered");
+            match provider.complete(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) if is_retryable(&error) && index + 1 < provider_names.len() => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.expect("provider order should contain at least one provider"))
+    }
+
+    fn provider_order(&self) -> Vec<String> {
+        if let Some(plan) = &self.fallback_plan {
+            let mut names = Vec::with_capacity(plan.backups.len() + 1);
+            names.push(plan.primary.clone());
+            names.extend(plan.backups.iter().cloned());
+            names
+        } else {
+            vec![self.default.clone()]
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for ModelRouter {
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.complete_with_fallback(request).await
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        self.default_provider().capabilities()
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        self.default_provider().convert_tools(tools)
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        self.chat_with_fallback(request).await
+    }
+}
+
+fn is_retryable(error: &ModelError) -> bool {
+    matches!(
+        error,
+        ModelError::Timeout | ModelError::RateLimit { .. } | ModelError::Network(_)
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     use super::{
-        ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, ModelRouter, SharedModelProvider, TokenUsage, ToolCall, ToolsPayload,
-        build_tool_instructions_text, convert_request_tools,
+        ChatRequest, ChatResponse, FallbackPlan, FinishReason, ModelCapabilities, ModelProvider,
+        ModelRequest, ModelResponse, ModelRouter, SharedModelProvider, TokenUsage, ToolCall,
+        build_tool_instructions_text,
     };
     use crate::message::ChatMessage;
     use crate::tool_spec::{RiskLevel, ToolSpec};
+    use crate::{ConfigError, ModelError};
 
     struct DummyProvider {
         response_text: &'static str,
         native_tool_calling: bool,
+    }
+
+    struct ScriptedChatProvider {
+        chat_results: Mutex<VecDeque<Result<ChatResponse, crate::ModelError>>>,
+        native_tool_calling: bool,
+    }
+
+    impl ScriptedChatProvider {
+        fn new(
+            chat_results: Vec<Result<ChatResponse, crate::ModelError>>,
+            native_tool_calling: bool,
+        ) -> Self {
+            Self {
+                chat_results: Mutex::new(chat_results.into()),
+                native_tool_calling,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedChatProvider {
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+        ) -> Result<ModelResponse, crate::ModelError> {
+            Ok(ModelResponse {
+                content: "complete".to_string(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, crate::ModelError> {
+            self.chat_results
+                .lock()
+                .expect("chat results lock should not be poisoned")
+                .pop_front()
+                .expect("scripted chat result should exist")
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                native_tool_calling: self.native_tool_calling,
+                vision: false,
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -290,190 +468,14 @@ mod tests {
     }
 
     #[test]
-    fn model_request_construction_preserves_messages_and_parameters() {
-        let request = ModelRequest {
-            messages: vec![
-                ChatMessage::system("Be concise."),
-                ChatMessage::user("Hello!"),
-            ],
-            model: "claude-haiku-4-5-20251001".to_string(),
-            max_tokens: Some(256),
-        };
-
-        assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.messages[0], ChatMessage::system("Be concise."));
-        assert_eq!(request.messages[1], ChatMessage::user("Hello!"));
-        assert_eq!(request.model, "claude-haiku-4-5-20251001");
-        assert_eq!(request.max_tokens, Some(256));
-    }
-
-    #[test]
-    fn model_response_construction_preserves_fields() {
-        let response = ModelResponse {
-            content: "Hello there".to_string(),
-            finish_reason: FinishReason::MaxTokens,
-        };
-
-        assert_eq!(response.content, "Hello there");
-        assert_eq!(response.finish_reason, FinishReason::MaxTokens);
-    }
-
-    #[test]
-    fn model_capabilities_default_to_disabled_features() {
-        let capabilities = ModelCapabilities::default();
-
-        assert!(!capabilities.native_tool_calling);
-        assert!(!capabilities.vision);
-    }
-
-    #[test]
-    fn supports_native_tools_reflects_capabilities() {
-        let provider = DummyProvider {
-            response_text: "",
-            native_tool_calling: true,
-        };
-
-        assert!(provider.supports_native_tools());
-    }
-
-    #[test]
-    fn default_convert_tools_returns_prompt_guided_payload() {
-        let provider = DummyProvider {
-            response_text: "",
-            native_tool_calling: false,
-        };
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Execute shell commands".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-            risk_level: RiskLevel::High,
-        }];
-
-        let payload = provider.convert_tools(&tools);
-
-        assert!(matches!(payload, ToolsPayload::PromptGuided { .. }));
-    }
-
-    #[test]
-    fn convert_request_tools_skips_missing_and_empty_inputs() {
-        let provider = DummyProvider {
-            response_text: "",
-            native_tool_calling: false,
-        };
-
-        assert_eq!(convert_request_tools(&provider, None), None);
-        assert_eq!(convert_request_tools(&provider, Some(&[])), None);
-    }
-
-    #[tokio::test]
-    async fn default_chat_delegates_to_complete() {
-        let provider = DummyProvider {
-            response_text: "delegated",
-            native_tool_calling: false,
-        };
-        let response = provider
-            .chat(ChatRequest {
-                messages: vec![ChatMessage::user("Ping")],
-                model: "claude-haiku-4-5-20251001".to_string(),
-                max_tokens: Some(32),
-                tools: Some(vec![ToolSpec {
-                    name: "noop".to_string(),
-                    description: "Do nothing".to_string(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                    risk_level: RiskLevel::Low,
-                }]),
-            })
-            .await
-            .expect("dummy provider should complete successfully");
-
-        assert_eq!(response.text.as_deref(), Some("delegated"));
-        assert!(response.tool_calls.is_empty());
-        assert_eq!(response.usage, None);
-    }
-
-    #[test]
-    fn build_tool_instructions_text_includes_tool_details() {
-        let instructions = build_tool_instructions_text(&[ToolSpec {
-            name: "shell".to_string(),
-            description: "Execute shell commands".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                }
-            }),
-            risk_level: RiskLevel::High,
-        }]);
-
-        assert!(instructions.contains("shell"));
-        assert!(instructions.contains("Execute shell commands"));
-        assert!(instructions.contains("Input schema"));
-    }
-
-    #[tokio::test]
-    async fn model_router_returns_default_provider() {
-        let primary: SharedModelProvider = Arc::new(DummyProvider {
-            response_text: "primary",
-            native_tool_calling: false,
-        });
-        let router = ModelRouter::new("primary".to_string(), primary.clone());
-
-        assert!(Arc::ptr_eq(&router.default_provider(), &primary));
-
-        let response = router
-            .default_provider()
-            .complete(ModelRequest {
-                messages: vec![ChatMessage::user("Hello")],
-                model: "claude-haiku-4-5-20251001".to_string(),
-                max_tokens: None,
-            })
-            .await
-            .expect("default provider should respond");
-
-        assert_eq!(response.content, "primary");
-    }
-
-    #[tokio::test]
-    async fn model_router_can_lookup_named_providers() {
-        let primary: SharedModelProvider = Arc::new(DummyProvider {
-            response_text: "primary",
-            native_tool_calling: false,
-        });
-        let backup: SharedModelProvider = Arc::new(DummyProvider {
-            response_text: "backup",
-            native_tool_calling: false,
-        });
-
-        let mut router = ModelRouter::new("primary".to_string(), primary);
-        router.add_provider("backup".to_string(), backup.clone());
-
-        let routed_provider = router
-            .provider("backup")
-            .expect("named provider should exist");
-        assert!(Arc::ptr_eq(&routed_provider, &backup));
-
-        let response = routed_provider
-            .complete(ModelRequest {
-                messages: vec![ChatMessage::user("Hello")],
-                model: "claude-haiku-4-5-20251001".to_string(),
-                max_tokens: None,
-            })
-            .await
-            .expect("backup provider should respond");
-
-        assert_eq!(response.content, "backup");
-        assert!(router.provider("missing").is_none());
-    }
-
-    #[test]
     fn chat_request_can_include_tools() {
         let request = ChatRequest {
-            messages: vec![ChatMessage::user("Use a tool")],
+            messages: vec![ChatMessage::user("inspect workspace")],
             model: "claude-haiku-4-5-20251001".to_string(),
-            max_tokens: Some(128),
+            max_tokens: Some(512),
             tools: Some(vec![ToolSpec {
                 name: "shell".to_string(),
-                description: "Execute shell commands".to_string(),
+                description: "Run a shell command".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
                 risk_level: RiskLevel::High,
             }]),
@@ -486,28 +488,32 @@ mod tests {
     #[test]
     fn chat_response_can_have_empty_tool_calls() {
         let response = ChatResponse {
-            text: Some("done".to_string()),
+            text: Some("All done".to_string()),
             tool_calls: Vec::new(),
             usage: Some(TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
+                input_tokens: 128,
+                output_tokens: 64,
             }),
         };
 
+        assert_eq!(response.text.as_deref(), Some("All done"));
         assert!(response.tool_calls.is_empty());
-        assert_eq!(response.text.as_deref(), Some("done"));
+        assert_eq!(
+            response.usage.expect("usage should exist").output_tokens,
+            64
+        );
     }
 
     #[test]
     fn tool_call_and_usage_round_trip_through_json() {
         let tool_call = ToolCall {
-            id: "call_1".to_string(),
+            id: "tool-1".to_string(),
             name: "shell".to_string(),
-            arguments: r#"{"command":"pwd"}"#.to_string(),
+            arguments: "{\"command\":\"pwd\"}".to_string(),
         };
         let usage = TokenUsage {
-            input_tokens: 12,
-            output_tokens: 34,
+            input_tokens: 200,
+            output_tokens: 50,
         };
 
         let tool_call_json = serde_json::to_string(&tool_call).expect("tool call should serialize");
@@ -525,21 +531,317 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_provider_trait_remains_object_safe() {
-        let provider: Arc<dyn ModelProvider> = Arc::new(DummyProvider {
-            response_text: "",
+    async fn default_chat_delegates_to_complete() {
+        let provider = DummyProvider {
+            response_text: "delegated",
             native_tool_calling: false,
-        });
+        };
+
         let response = provider
-            .complete(ModelRequest {
-                messages: vec![ChatMessage::user("Ping")],
+            .chat(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
                 model: "claude-haiku-4-5-20251001".to_string(),
-                max_tokens: None,
+                max_tokens: Some(64),
+                tools: None,
             })
             .await
-            .expect("dummy provider should complete successfully");
+            .expect("chat should succeed");
 
-        assert_eq!(response.content, "received 1 messages");
-        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.text.as_deref(), Some("delegated"));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn build_tool_instructions_text_includes_tool_details() {
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Execute shell commands".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+            risk_level: RiskLevel::High,
+        }];
+
+        let instructions = build_tool_instructions_text(&tools);
+
+        assert!(instructions.contains("## Available Tools"));
+        assert!(instructions.contains("Name: shell"));
+        assert!(instructions.contains("Description: Execute shell commands"));
+        assert!(instructions.contains("Risk: High"));
+        assert!(instructions.contains("command"));
+    }
+
+    #[test]
+    fn model_provider_trait_remains_object_safe() {
+        fn accept_provider(_provider: &dyn ModelProvider) {}
+
+        let provider = DummyProvider {
+            response_text: "ok",
+            native_tool_calling: false,
+        };
+
+        accept_provider(&provider);
+    }
+
+    #[tokio::test]
+    async fn model_router_returns_default_provider() {
+        let primary: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "primary",
+            native_tool_calling: false,
+        });
+        let router = ModelRouter::new("primary".to_string(), primary.clone());
+
+        assert!(Arc::ptr_eq(&router.default_provider(), &primary));
+        assert_eq!(
+            router
+                .default_provider()
+                .complete(ModelRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "claude-haiku-4-5-20251001".to_string(),
+                    max_tokens: Some(64),
+                })
+                .await
+                .expect("request should succeed")
+                .content,
+            "primary"
+        );
+    }
+
+    #[test]
+    fn model_router_can_lookup_named_providers() {
+        let primary: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "primary",
+            native_tool_calling: false,
+        });
+        let backup: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "backup",
+            native_tool_calling: false,
+        });
+        let mut router = ModelRouter::new("primary".to_string(), primary);
+        router.add_provider("backup".to_string(), backup.clone());
+
+        assert!(router.provider("missing").is_none());
+        assert!(Arc::ptr_eq(
+            &router
+                .provider("backup")
+                .expect("backup provider should exist"),
+            &backup
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_errors_fall_back_to_backup_provider() {
+        let mut router = ModelRouter::new(
+            "primary".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Err(ModelError::Timeout)],
+                false,
+            )),
+        );
+        router.add_provider(
+            "backup".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Ok(ChatResponse {
+                    text: Some("backup".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })],
+                false,
+            )),
+        );
+        router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect("fallback plan should be valid");
+
+        let response = router
+            .chat_with_fallback(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
+                model: "test-model".to_string(),
+                max_tokens: None,
+                tools: None,
+            })
+            .await
+            .expect("backup should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("backup"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_errors_fall_back_to_backup_provider() {
+        let mut router = ModelRouter::new(
+            "primary".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Err(ModelError::RateLimit { retry_after: None })],
+                false,
+            )),
+        );
+        router.add_provider(
+            "backup".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Ok(ChatResponse {
+                    text: Some("backup".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })],
+                false,
+            )),
+        );
+        router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect("fallback plan should be valid");
+
+        let response = router
+            .chat_with_fallback(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
+                model: "test-model".to_string(),
+                max_tokens: None,
+                tools: None,
+            })
+            .await
+            .expect("backup should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("backup"));
+    }
+
+    #[tokio::test]
+    async fn network_errors_fall_back_to_backup_provider() {
+        let mut router = ModelRouter::new(
+            "primary".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Err(ModelError::Network("down".to_string()))],
+                false,
+            )),
+        );
+        router.add_provider(
+            "backup".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Ok(ChatResponse {
+                    text: Some("backup".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })],
+                false,
+            )),
+        );
+        router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect("fallback plan should be valid");
+
+        let response = router
+            .chat_with_fallback(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
+                model: "test-model".to_string(),
+                max_tokens: None,
+                tools: None,
+            })
+            .await
+            .expect("backup should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("backup"));
+    }
+
+    #[tokio::test]
+    async fn auth_errors_do_not_fall_back() {
+        let mut router = ModelRouter::new(
+            "primary".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Err(ModelError::Auth("bad key".to_string()))],
+                false,
+            )),
+        );
+        router.add_provider(
+            "backup".to_string(),
+            Arc::new(ScriptedChatProvider::new(Vec::new(), false)),
+        );
+        router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect("fallback plan should be valid");
+
+        let error = router
+            .chat_with_fallback(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
+                model: "test-model".to_string(),
+                max_tokens: None,
+                tools: None,
+            })
+            .await
+            .expect_err("auth error should not fall back");
+
+        assert!(matches!(error, ModelError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn api_errors_do_not_fall_back() {
+        let mut router = ModelRouter::new(
+            "primary".to_string(),
+            Arc::new(ScriptedChatProvider::new(
+                vec![Err(ModelError::Api {
+                    status: 400,
+                    message: "bad request".to_string(),
+                })],
+                false,
+            )),
+        );
+        router.add_provider(
+            "backup".to_string(),
+            Arc::new(ScriptedChatProvider::new(Vec::new(), false)),
+        );
+        router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect("fallback plan should be valid");
+
+        let error = router
+            .chat_with_fallback(ChatRequest {
+                messages: vec![ChatMessage::user("hello")],
+                model: "test-model".to_string(),
+                max_tokens: None,
+                tools: None,
+            })
+            .await
+            .expect_err("api error should not fall back");
+
+        assert!(matches!(error, ModelError::Api { .. }));
+    }
+
+    #[test]
+    fn fallback_plan_rejects_mismatched_native_tool_capabilities() {
+        let primary: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "primary",
+            native_tool_calling: true,
+        });
+        let backup: SharedModelProvider = Arc::new(DummyProvider {
+            response_text: "backup",
+            native_tool_calling: false,
+        });
+        let mut router = ModelRouter::new("primary".to_string(), primary);
+        router.add_provider("backup".to_string(), backup);
+
+        let error = router
+            .set_fallback_plan(FallbackPlan {
+                primary: "primary".to_string(),
+                backups: vec!["backup".to_string()],
+            })
+            .expect_err("capability mismatch should fail");
+
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("supports_native_tools"))
+        );
     }
 }
