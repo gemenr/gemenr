@@ -221,10 +221,7 @@ mod tests {
             conversation_id: ConversationId("conv".to_string()),
             user_id: "user".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::Lark {
-                chat_id: "chat".to_string(),
-                thread_id: Some("thread".to_string()),
-            },
+            route: ReplyRoute::lark("chat", Some("thread".to_string())),
             metadata: json!({}),
         };
         let driver = EchoDriver;
@@ -232,6 +229,7 @@ mod tests {
         let outbound = runtime
             .block_on(driver.handle(inbound))
             .expect("driver should echo");
-        assert!(matches!(outbound.route, ReplyRoute::Lark { .. }));
+        assert_eq!(outbound.route.scheme, "lark");
+        assert_eq!(outbound.route.target, "chat");
     }
 }

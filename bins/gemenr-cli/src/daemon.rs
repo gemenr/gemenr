@@ -125,12 +125,48 @@ impl AccessAdapter for LarkReportAdapter {
         "lark"
     }
 
-    async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
-        let ReplyRoute::Lark { chat_id, thread_id } = outbound.route else {
-            return Err(AccessError::Delivery(
-                "lark adapter can only deliver ReplyRoute::Lark".to_string(),
-            ));
+    fn scheme(&self) -> &'static str {
+        "lark"
+    }
+
+    fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
+        let Some(target) = raw.strip_prefix("lark:") else {
+            return Ok(None);
         };
+
+        if target.is_empty() {
+            return Err(AccessError::InvalidRoute(raw.to_string()));
+        }
+
+        let (chat_id, thread_id) = match target.split_once('/') {
+            Some((chat_id, thread_id)) if !chat_id.is_empty() && !thread_id.is_empty() => {
+                (chat_id.to_string(), Some(thread_id.to_string()))
+            }
+            Some(_) => return Err(AccessError::InvalidRoute(raw.to_string())),
+            None => (target.to_string(), None),
+        };
+
+        Ok(Some(ReplyRoute::lark(chat_id, thread_id)))
+    }
+
+    async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
+        if !outbound.route.has_scheme(self.scheme()) {
+            return Err(AccessError::Delivery(
+                "lark adapter can only deliver lark routes".to_string(),
+            ));
+        }
+
+        let chat_id = outbound.route.target.clone();
+        if chat_id.is_empty() {
+            return Err(AccessError::Delivery(
+                "lark route is missing chat_id".to_string(),
+            ));
+        }
+        let thread_id = outbound
+            .route
+            .metadata_string("thread_id")
+            .map(str::to_string);
+
         let token = self.refresh_tenant_token().await?;
         let mut body = json!({
             "receive_id": chat_id,
@@ -289,8 +325,8 @@ mod tests {
     };
     use gemenr_core::{
         AccessAdapter, AccessError, AccessOutbound, AccessRouter, CronJobConfig, InMemoryTapeStore,
-        PolicyContext, RuntimeBuilder, SandboxKind, SoulManager, TapeStore, ToolInvokeError,
-        ToolInvokeResult, ToolInvoker, ToolSpec,
+        PolicyContext, ReplyRoute, RuntimeBuilder, SandboxKind, SoulManager, TapeStore,
+        ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
     };
     use serde_json::json;
     use tokio::sync::RwLock;
@@ -298,15 +334,43 @@ mod tests {
 
     use super::{CronDaemon, task_system_prompt};
 
-    #[derive(Default)]
     struct RecordingAdapter {
+        scheme: &'static str,
         messages: Mutex<Vec<AccessOutbound>>,
+    }
+
+    impl RecordingAdapter {
+        fn new(scheme: &'static str) -> Self {
+            Self {
+                scheme,
+                messages: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait]
     impl AccessAdapter for RecordingAdapter {
         fn name(&self) -> &'static str {
-            "recording"
+            self.scheme
+        }
+
+        fn scheme(&self) -> &'static str {
+            self.scheme
+        }
+
+        fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
+            if self.scheme() == "stdio" {
+                return Ok((raw == "stdio:").then(ReplyRoute::stdio));
+            }
+
+            let prefix = format!("{}:", self.scheme());
+            let Some(target) = raw.strip_prefix(&prefix) else {
+                return Ok(None);
+            };
+            if target.is_empty() {
+                return Err(AccessError::InvalidRoute(raw.to_string()));
+            }
+            Ok(Some(ReplyRoute::new(self.scheme(), target, json!({}))))
         }
 
         async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
@@ -530,11 +594,11 @@ mod tests {
 
     #[tokio::test]
     async fn routes_reports_to_stdio_and_lark() {
-        let stdio = Arc::new(RecordingAdapter::default());
-        let lark = Arc::new(RecordingAdapter::default());
+        let stdio = Arc::new(RecordingAdapter::new("stdio"));
+        let lark = Arc::new(RecordingAdapter::new("lark"));
         let router = AccessRouter::new()
-            .with_stdio(stdio.clone())
-            .with_lark(lark.clone());
+            .with_adapter(stdio.clone())
+            .with_adapter(lark.clone());
         let tools: Arc<dyn ToolInvoker> = Arc::new(StaticToolInvoker {
             specs: vec![spec("shell")],
         });
@@ -613,8 +677,8 @@ mod tests {
 
     #[tokio::test]
     async fn failures_emit_alerts_on_same_route() {
-        let stdio = Arc::new(RecordingAdapter::default());
-        let router = AccessRouter::new().with_stdio(stdio.clone());
+        let stdio = Arc::new(RecordingAdapter::new("stdio"));
+        let router = AccessRouter::new().with_adapter(stdio.clone());
         let model = Arc::new(RecordingModelProvider {
             fail: true,
             ..RecordingModelProvider::default()

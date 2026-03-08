@@ -118,7 +118,20 @@ impl AccessAdapter for StdioAdapter {
         "stdio"
     }
 
+    fn scheme(&self) -> &'static str {
+        "stdio"
+    }
+
+    fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
+        Ok((raw == "stdio:").then(ReplyRoute::stdio))
+    }
+
     async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
+        if !outbound.route.has_scheme(self.scheme()) {
+            return Err(AccessError::Delivery(
+                "stdio adapter can only deliver stdio routes".to_string(),
+            ));
+        }
         let use_stderr = outbound
             .metadata
             .get("stream")
@@ -180,7 +193,7 @@ impl ConversationDriver for RuntimeConversationDriver {
 }
 
 fn build_stdio_router() -> AccessRouter {
-    AccessRouter::new().with_stdio(Arc::new(StdioAdapter::default()))
+    AccessRouter::new().with_adapter(Arc::new(StdioAdapter::default()))
 }
 
 fn build_stdio_inbound(conversation_id: ConversationId, text: impl Into<String>) -> AccessInbound {
@@ -188,7 +201,7 @@ fn build_stdio_inbound(conversation_id: ConversationId, text: impl Into<String>)
         conversation_id,
         user_id: "stdio-user".to_string(),
         text: text.into(),
-        route: ReplyRoute::Stdio,
+        route: ReplyRoute::stdio(),
         metadata: serde_json::json!({}),
     }
 }
@@ -414,9 +427,9 @@ async fn run_daemon(config: &Config) {
         }
     };
 
-    let mut router = AccessRouter::new().with_stdio(Arc::new(StdioAdapter::default()));
+    let mut router = AccessRouter::new().with_adapter(Arc::new(StdioAdapter::default()));
     if let Some(lark) = config.access.lark.clone() {
-        router = router.with_lark(Arc::new(daemon::LarkReportAdapter::new(lark)));
+        router = router.with_adapter(Arc::new(daemon::LarkReportAdapter::new(lark)));
     }
 
     let daemon = daemon::CronDaemon::new(
@@ -701,7 +714,7 @@ mod tests {
         let driver = RecordingDriver::default();
         let stdout = SharedBuffer::default();
         let stderr = SharedBuffer::default();
-        let router = AccessRouter::new().with_stdio(Arc::new(StdioAdapter::new(
+        let router = AccessRouter::new().with_adapter(Arc::new(StdioAdapter::new(
             Box::new(stdout.clone()),
             Box::new(stderr),
         )));
@@ -741,7 +754,7 @@ mod tests {
         adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::Stdio,
+                route: ReplyRoute::stdio(),
                 content: "hello".to_string(),
                 metadata: serde_json::json!({}),
             })
@@ -750,7 +763,7 @@ mod tests {
         adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::Stdio,
+                route: ReplyRoute::stdio(),
                 content: "oops".to_string(),
                 metadata: serde_json::json!({"stream": "stderr"}),
             })

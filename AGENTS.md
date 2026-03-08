@@ -48,7 +48,7 @@ Treat `gemenr-core` as the stable center of the system.
 - `model/` — `ModelProvider`, `ModelRouter`, Anthropic-compatible provider implementation
 - `agent/dispatcher.rs` — native-tool vs XML-tool parsing/formatting strategy
 - `tool_invoker.rs` / `tool_spec.rs` — runtime-facing tool contract and risk metadata
-- `access/` — normalized inbound/outbound messages plus route parsing and transport abstraction
+- `access/` — normalized inbound/outbound messages, open route descriptors (`scheme` + target + metadata), and adapter-backed routing
 - `runtime_manager.rs` — multi-conversation lifecycle for long-lived transports like Lark
 - `config.rs` — validated `gemenr.toml` loader for models, fallback, access, cron, policy, MCP
 
@@ -97,6 +97,8 @@ The real runtime path today is:
 12. tool results are appended as events and fed back into the next loop iteration
 
 Do not bypass this pipeline casually. If you need new behavior, prefer extending an existing seam (`ModelProvider`, `ToolInvoker`, `ApprovalHandler`, `EventSink`, `AccessAdapter`, `ConversationDriver`) instead of inserting ad-hoc side paths.
+
+For access-layer work specifically, keep route grammar and route metadata parsing inside the owning `AccessAdapter`. `AccessRouter` should stay a registry that dispatches by route scheme rather than a place that hardcodes transport variants.
 
 ## 5) Architectural Boundaries
 
@@ -193,6 +195,7 @@ cargo run --bin gemenr-im
 - first identify whether the change belongs to `core`, `tools`, or a binary composition root
 - prefer updating `RuntimeBuilder` assembly code rather than duplicating wiring in multiple places
 - if behavior differs between CLI and IM, keep the shared mechanism in `core` and the policy/transport differences in the binaries
+- when adding a new transport, register a new `AccessAdapter` and let it own route parsing/validation; avoid reintroducing transport-specific enums or `with_<transport>` hooks in `AccessRouter`
 - when a feature appears “configured but inactive”, verify whether the entrypoint actually wires it up before assuming it works
 - keep docs and config examples aligned with the real implementation status; this repository has already drifted once
 

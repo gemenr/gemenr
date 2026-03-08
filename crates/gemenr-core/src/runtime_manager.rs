@@ -308,7 +308,7 @@ mod tests {
             conversation_id: ConversationId(conversation_id.to_string()),
             user_id: "user-1".to_string(),
             text: text.to_string(),
-            route: ReplyRoute::Stdio,
+            route: ReplyRoute::stdio(),
             metadata: json!({"source": "test"}),
         }
     }

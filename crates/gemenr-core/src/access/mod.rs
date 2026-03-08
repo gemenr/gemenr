@@ -1,6 +1,7 @@
 //! Shared access-layer message models and adapter contracts.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 pub mod adapter;
@@ -17,7 +18,7 @@ pub enum AccessError {
     InvalidRoute(String),
     /// No adapter is registered for the requested route.
     #[error("no adapter registered for route: {0}")]
-    AdapterUnavailable(&'static str),
+    AdapterUnavailable(String),
     /// Driver execution failed.
     #[error("conversation driver failed: {0}")]
     Driver(String),
@@ -32,16 +33,53 @@ pub struct ConversationId(pub String);
 
 /// Where a reply should be sent back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReplyRoute {
-    /// Standard IO session.
-    Stdio,
-    /// Lark chat or thread target.
-    Lark {
-        /// Lark chat identifier.
-        chat_id: String,
-        /// Optional thread identifier inside the chat.
-        thread_id: Option<String>,
-    },
+pub struct ReplyRoute {
+    /// Transport scheme such as `stdio` or `lark`.
+    pub scheme: String,
+    /// Adapter-defined primary target.
+    pub target: String,
+    /// Adapter-defined route metadata.
+    pub metadata: Value,
+}
+
+impl ReplyRoute {
+    /// Create a route with a scheme, primary target, and adapter-specific metadata.
+    #[must_use]
+    pub fn new(scheme: impl Into<String>, target: impl Into<String>, metadata: Value) -> Self {
+        Self {
+            scheme: scheme.into(),
+            target: target.into(),
+            metadata,
+        }
+    }
+
+    /// Create a stdio route.
+    #[must_use]
+    pub fn stdio() -> Self {
+        Self::new("stdio", "", json!({}))
+    }
+
+    /// Create a Lark route.
+    #[must_use]
+    pub fn lark(chat_id: impl Into<String>, thread_id: Option<String>) -> Self {
+        let metadata = match thread_id {
+            Some(thread_id) => json!({ "thread_id": thread_id }),
+            None => json!({}),
+        };
+        Self::new("lark", chat_id.into(), metadata)
+    }
+
+    /// Return whether the route belongs to the given scheme.
+    #[must_use]
+    pub fn has_scheme(&self, scheme: &str) -> bool {
+        self.scheme == scheme
+    }
+
+    /// Read one string metadata field.
+    #[must_use]
+    pub fn metadata_string(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).and_then(Value::as_str)
+    }
 }
 
 /// A normalized inbound user message.
@@ -84,10 +122,7 @@ mod tests {
             conversation_id: ConversationId("conv-42".to_string()),
             user_id: "user-7".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::Lark {
-                chat_id: "chat-1".to_string(),
-                thread_id: Some("thread-9".to_string()),
-            },
+            route: ReplyRoute::lark("chat-1", Some("thread-9".to_string())),
             metadata: json!({"source": "lark", "mentions": ["bot"]}),
         };
 
@@ -99,15 +134,13 @@ mod tests {
     }
 
     #[test]
-    fn lark_reply_route_serializes_chat_and_thread_ids() {
-        let route = ReplyRoute::Lark {
-            chat_id: "chat-100".to_string(),
-            thread_id: Some("thread-200".to_string()),
-        };
+    fn lark_reply_route_serializes_as_open_structure() {
+        let route = ReplyRoute::lark("chat-100", Some("thread-200".to_string()));
 
         let encoded = serde_json::to_value(&route).expect("route should serialize");
 
-        assert_eq!(encoded["Lark"]["chat_id"], json!("chat-100"));
-        assert_eq!(encoded["Lark"]["thread_id"], json!("thread-200"));
+        assert_eq!(encoded["scheme"], json!("lark"));
+        assert_eq!(encoded["target"], json!("chat-100"));
+        assert_eq!(encoded["metadata"]["thread_id"], json!("thread-200"));
     }
 }

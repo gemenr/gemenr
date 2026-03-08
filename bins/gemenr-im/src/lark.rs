@@ -290,10 +290,7 @@ impl LarkAdapter {
                 .open_id
                 .unwrap_or_else(|| "unknown-user".to_string()),
             text,
-            route: ReplyRoute::Lark {
-                chat_id: event.message.chat_id,
-                thread_id: event.message.thread_id,
-            },
+            route: ReplyRoute::lark(event.message.chat_id, event.message.thread_id),
             metadata: json!({ "message_id": event.message.message_id, "chat_type": event.message.chat_type }),
         }))
     }
@@ -413,12 +410,46 @@ impl AccessAdapter for LarkAdapter {
         "lark"
     }
 
-    async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
-        let ReplyRoute::Lark { chat_id, thread_id } = outbound.route else {
-            return Err(AccessError::Delivery(
-                "lark adapter can only deliver ReplyRoute::Lark".to_string(),
-            ));
+    fn scheme(&self) -> &'static str {
+        "lark"
+    }
+
+    fn parse_route(&self, raw: &str) -> Result<Option<ReplyRoute>, AccessError> {
+        let Some(target) = raw.strip_prefix("lark:") else {
+            return Ok(None);
         };
+
+        if target.is_empty() {
+            return Err(AccessError::InvalidRoute(raw.to_string()));
+        }
+
+        let (chat_id, thread_id) = match target.split_once('/') {
+            Some((chat_id, thread_id)) if !chat_id.is_empty() && !thread_id.is_empty() => {
+                (chat_id.to_string(), Some(thread_id.to_string()))
+            }
+            Some(_) => return Err(AccessError::InvalidRoute(raw.to_string())),
+            None => (target.to_string(), None),
+        };
+
+        Ok(Some(ReplyRoute::lark(chat_id, thread_id)))
+    }
+
+    async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
+        if !outbound.route.has_scheme(self.scheme()) {
+            return Err(AccessError::Delivery(
+                "lark adapter can only deliver lark routes".to_string(),
+            ));
+        }
+        let chat_id = outbound.route.target.clone();
+        if chat_id.is_empty() {
+            return Err(AccessError::Delivery(
+                "lark route is missing chat_id".to_string(),
+            ));
+        }
+        let thread_id = outbound
+            .route
+            .metadata_string("thread_id")
+            .map(str::to_string);
         let token = self
             .refresh_tenant_token()
             .await
@@ -509,7 +540,8 @@ mod tests {
 
         assert_eq!(inbound.conversation_id.0, "oc_chat_1");
         assert_eq!(inbound.text, "hello");
-        assert!(matches!(inbound.route, ReplyRoute::Lark { .. }));
+        assert_eq!(inbound.route.scheme, "lark");
+        assert_eq!(inbound.route.target, "oc_chat_1");
     }
 
     #[test]
@@ -569,14 +601,14 @@ mod tests {
             conversation_id: ConversationId("conv-1".to_string()),
             user_id: "user".to_string(),
             text: "hello".to_string(),
-            route: ReplyRoute::Stdio,
+            route: ReplyRoute::stdio(),
             metadata: json!({}),
         };
         let second = AccessInbound {
             conversation_id: ConversationId("conv-1".to_string()),
             user_id: "user".to_string(),
             text: "world".to_string(),
-            route: ReplyRoute::Stdio,
+            route: ReplyRoute::stdio(),
             metadata: json!({}),
         };
 
@@ -617,7 +649,7 @@ mod tests {
         let error = adapter
             .send(AccessOutbound {
                 conversation_id: ConversationId("conv-1".to_string()),
-                route: ReplyRoute::Stdio,
+                route: ReplyRoute::stdio(),
                 content: "hello".to_string(),
                 metadata: json!({}),
             })
@@ -633,10 +665,7 @@ mod tests {
             conversation_id: ConversationId("conv-2".to_string()),
             user_id: "user".to_string(),
             text: "queued".to_string(),
-            route: ReplyRoute::Lark {
-                chat_id: "chat".to_string(),
-                thread_id: None,
-            },
+            route: ReplyRoute::lark("chat", None),
             metadata: json!({}),
         };
         assert!(adapter.push_debounced(inbound).is_empty());
@@ -652,7 +681,7 @@ mod tests {
                 conversation_id: ConversationId("conv-3".to_string()),
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
-                route: ReplyRoute::Stdio,
+                route: ReplyRoute::stdio(),
                 metadata: json!({}),
             })
             .await
