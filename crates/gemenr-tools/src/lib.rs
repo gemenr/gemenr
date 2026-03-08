@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use gemenr_core::{ToolSpec, tool_invoker};
 use tracing::{debug, warn};
 
+pub mod builtin;
 pub mod handler;
 pub mod policy;
 
