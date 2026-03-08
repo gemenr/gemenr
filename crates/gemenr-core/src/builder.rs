@@ -185,7 +185,9 @@ mod tests {
     };
     use crate::protocol::SessionId;
     use crate::tool_invoker::{
-        ExecutionPolicy, PolicyContext, SandboxKind, ToolInvokeError, ToolInvokeResult, ToolInvoker,
+        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
+        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
+        ToolInvokeResult,
     };
     use crate::tool_spec::{RiskLevel, ToolSpec};
 
@@ -267,8 +269,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ToolInvoker for StaticToolInvoker {
+    impl ToolCatalog for StaticToolInvoker {
         fn lookup(&self, name: &str) -> Option<&ToolSpec> {
             self.specs.get(name)
         }
@@ -276,23 +277,28 @@ mod tests {
         fn list_specs(&self) -> Vec<ToolSpec> {
             self.specs.values().cloned().collect()
         }
+    }
 
-        fn check_policy(
+    impl ToolAuthorizer for StaticToolInvoker {
+        fn authorize(
             &self,
-            _name: &str,
-            _arguments: &serde_json::Value,
+            request: &ToolCallRequest,
             _context: &PolicyContext,
-        ) -> ExecutionPolicy {
-            ExecutionPolicy::Allow {
-                sandbox: SandboxKind::None,
-            }
+        ) -> AuthorizationDecision {
+            AuthorizationDecision::Prepared(PreparedToolCall {
+                request: request.clone(),
+                policy: ExecutionPolicy::Allow {
+                    sandbox: SandboxKind::None,
+                },
+            })
         }
+    }
 
+    #[async_trait]
+    impl ToolExecutor for StaticToolInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            _name: &str,
-            _arguments: serde_json::Value,
+            _prepared: PreparedToolCall,
             _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             Ok(ToolInvokeResult {

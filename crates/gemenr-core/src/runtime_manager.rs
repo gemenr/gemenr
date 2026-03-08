@@ -185,7 +185,9 @@ mod tests {
         ModelResponse,
     };
     use crate::tool_invoker::{
-        ExecutionPolicy, PolicyContext, SandboxKind, ToolInvokeError, ToolInvokeResult, ToolInvoker,
+        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
+        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
+        ToolInvokeResult,
     };
     use crate::tool_spec::ToolSpec;
 
@@ -250,8 +252,7 @@ mod tests {
 
     struct NoopToolInvoker;
 
-    #[async_trait]
-    impl ToolInvoker for NoopToolInvoker {
+    impl ToolCatalog for NoopToolInvoker {
         fn lookup(&self, _name: &str) -> Option<&ToolSpec> {
             None
         }
@@ -259,26 +260,31 @@ mod tests {
         fn list_specs(&self) -> Vec<ToolSpec> {
             Vec::new()
         }
+    }
 
-        fn check_policy(
+    impl ToolAuthorizer for NoopToolInvoker {
+        fn authorize(
             &self,
-            _name: &str,
-            _arguments: &serde_json::Value,
+            request: &ToolCallRequest,
             _context: &PolicyContext,
-        ) -> ExecutionPolicy {
-            ExecutionPolicy::Allow {
-                sandbox: SandboxKind::None,
-            }
+        ) -> AuthorizationDecision {
+            AuthorizationDecision::Prepared(PreparedToolCall {
+                request: request.clone(),
+                policy: ExecutionPolicy::Allow {
+                    sandbox: SandboxKind::None,
+                },
+            })
         }
+    }
 
+    #[async_trait]
+    impl ToolExecutor for NoopToolInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            name: &str,
-            _arguments: serde_json::Value,
+            prepared: PreparedToolCall,
             _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
-            Err(ToolInvokeError::NotFound(name.to_string()))
+            Err(ToolInvokeError::NotFound(prepared.request.name))
         }
     }
 

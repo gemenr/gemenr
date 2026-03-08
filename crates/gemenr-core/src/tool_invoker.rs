@@ -102,41 +102,97 @@ pub enum ExecutionPolicy {
     },
 }
 
-/// Abstract interface for tool lookup, policy checks, and execution.
-///
-/// This trait is defined in `gemenr-core` so the runtime can talk to the tool
-/// system without depending on a concrete tool crate.
-#[async_trait]
-pub trait ToolInvoker: Send + Sync {
+/// Tool call payload used during the authorization phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRequest {
+    /// Unique identifier for this tool call.
+    pub call_id: String,
+    /// Registered tool name.
+    pub name: String,
+    /// Tool arguments serialized as JSON.
+    pub arguments: serde_json::Value,
+}
+
+/// Authorized tool call that carries the resolved execution policy forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedToolCall {
+    /// Original tool call request.
+    pub request: ToolCallRequest,
+    /// Execution policy resolved during authorization.
+    pub policy: ExecutionPolicy,
+}
+
+/// Result of authorizing a tool call request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationDecision {
+    /// The tool call is ready to execute immediately.
+    Prepared(PreparedToolCall),
+    /// The tool call is authorized pending user confirmation.
+    NeedConfirmation {
+        /// Prepared tool call to execute after approval.
+        prepared: PreparedToolCall,
+        /// User-facing confirmation message.
+        message: String,
+    },
+    /// The tool call is denied before execution starts.
+    Denied {
+        /// Human-readable reason for the denial.
+        reason: String,
+    },
+}
+
+/// Abstract interface for registered tool discovery.
+pub trait ToolCatalog: Send + Sync {
     /// Look up a registered tool definition by name.
     fn lookup(&self, name: &str) -> Option<&ToolSpec>;
 
     /// List all registered tool specifications.
     fn list_specs(&self) -> Vec<ToolSpec>;
+}
 
-    /// Evaluate the policy for a tool call.
-    fn check_policy(
+/// Abstract interface for policy authorization.
+pub trait ToolAuthorizer: Send + Sync {
+    /// Resolve whether a tool call may execute in the given context.
+    fn authorize(
         &self,
-        name: &str,
-        arguments: &serde_json::Value,
+        request: &ToolCallRequest,
         context: &PolicyContext,
-    ) -> ExecutionPolicy;
+    ) -> AuthorizationDecision;
+}
 
-    /// Execute a tool call.
+/// Abstract interface for executing already-authorized tool calls.
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    /// Execute a tool call that already passed authorization.
     async fn invoke(
         &self,
-        call_id: &str,
-        name: &str,
-        arguments: serde_json::Value,
+        prepared: PreparedToolCall,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ToolInvokeResult, ToolInvokeError>;
 }
 
+/// Aggregated tool contract used by the runtime.
+///
+/// This trait stays available as a compatibility layer so callers can inject a
+/// single trait object while implementations keep catalog, authorization, and
+/// execution responsibilities separated.
+pub trait ToolInvoker: ToolCatalog + ToolAuthorizer + ToolExecutor {}
+
+impl<T> ToolInvoker for T where T: ToolCatalog + ToolAuthorizer + ToolExecutor + ?Sized {}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use async_trait::async_trait;
     use serde_json::json;
 
-    use super::{ExecutionPolicy, SandboxKind, ToolInvokeError};
+    use super::{
+        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
+        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
+        ToolInvokeResult, ToolInvoker,
+    };
 
     #[test]
     fn execution_policy_variants_are_comparable() {
@@ -234,5 +290,78 @@ mod tests {
             .to_string()
             .contains("process exited with status 1")
         );
+    }
+
+    #[test]
+    fn authorization_decision_preserves_prepared_call() {
+        let request = ToolCallRequest {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "pwd"}),
+        };
+        let prepared = PreparedToolCall {
+            request: request.clone(),
+            policy: ExecutionPolicy::NeedConfirmation {
+                message: "confirm shell".to_string(),
+                sandbox: SandboxKind::Seatbelt,
+            },
+        };
+
+        assert_eq!(
+            AuthorizationDecision::Prepared(prepared.clone()),
+            AuthorizationDecision::Prepared(prepared.clone())
+        );
+        assert_eq!(prepared.request, request);
+        assert_eq!(prepared.request.call_id, "call-1");
+        assert_eq!(prepared.request.name, "shell");
+        assert_eq!(prepared.request.arguments, json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn tool_invoker_blanket_trait_is_object_safe() {
+        struct DummyInvoker;
+
+        impl ToolCatalog for DummyInvoker {
+            fn lookup(&self, _name: &str) -> Option<&crate::tool_spec::ToolSpec> {
+                None
+            }
+
+            fn list_specs(&self) -> Vec<crate::tool_spec::ToolSpec> {
+                Vec::new()
+            }
+        }
+
+        impl ToolAuthorizer for DummyInvoker {
+            fn authorize(
+                &self,
+                request: &ToolCallRequest,
+                _context: &PolicyContext,
+            ) -> AuthorizationDecision {
+                AuthorizationDecision::Prepared(PreparedToolCall {
+                    request: request.clone(),
+                    policy: ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                })
+            }
+        }
+
+        #[async_trait]
+        impl ToolExecutor for DummyInvoker {
+            async fn invoke(
+                &self,
+                _prepared: PreparedToolCall,
+                _cancelled: Arc<AtomicBool>,
+            ) -> Result<ToolInvokeResult, ToolInvokeError> {
+                Ok(ToolInvokeResult {
+                    content: String::new(),
+                    is_error: false,
+                })
+            }
+        }
+
+        let invoker: Arc<dyn ToolInvoker> = Arc::new(DummyInvoker);
+        assert!(invoker.lookup("missing").is_none());
+        assert!(invoker.list_specs().is_empty());
     }
 }

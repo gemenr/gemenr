@@ -108,7 +108,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use gemenr_core::{McpServerConfig, ToolInvoker};
+    use gemenr_core::{McpServerConfig, ToolCatalog};
     use serde_json::json;
     use tokio::sync::Mutex;
 

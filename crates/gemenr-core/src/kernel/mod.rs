@@ -13,7 +13,9 @@ use crate::protocol::{
     AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolCallRecord,
     ToolResultPayload, TurnId,
 };
-use crate::tool_invoker::{ExecutionPolicy, PolicyContext, ToolInvokeError, ToolInvoker};
+use crate::tool_invoker::{
+    AuthorizationDecision, PolicyContext, ToolCallRequest, ToolInvokeError, ToolInvoker,
+};
 
 pub mod prompt;
 pub mod turn;
@@ -260,13 +262,15 @@ impl AgentRuntime {
                     for call in tool_calls {
                         self.check_cancelled()?;
 
+                        let request = ToolCallRequest {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        };
                         let policy_context = PolicyContext::default();
-                        match self
-                            .tools
-                            .check_policy(&call.name, &call.arguments, &policy_context)
-                        {
-                            ExecutionPolicy::Allow { .. } => {}
-                            ExecutionPolicy::NeedConfirmation { message, .. } => {
+                        let prepared = match self.tools.authorize(&request, &policy_context) {
+                            AuthorizationDecision::Prepared(prepared) => prepared,
+                            AuthorizationDecision::NeedConfirmation { prepared, message } => {
                                 if !self.approval_handler.confirm(&message) {
                                     let content = format!("Execution not approved: {message}");
                                     self.emit_tool_event(
@@ -285,8 +289,9 @@ impl AgentRuntime {
                                     });
                                     continue;
                                 }
+                                prepared
                             }
-                            ExecutionPolicy::Deny { reason } => {
+                            AuthorizationDecision::Denied { reason } => {
                                 let content = format!("Denied: {reason}");
                                 self.emit_tool_event(
                                     turn_id,
@@ -304,7 +309,7 @@ impl AgentRuntime {
                                 });
                                 continue;
                             }
-                        }
+                        };
 
                         self.emit_tool_event(
                             turn_id,
@@ -317,12 +322,7 @@ impl AgentRuntime {
 
                         match self
                             .tools
-                            .invoke(
-                                &call.id,
-                                &call.name,
-                                call.arguments.clone(),
-                                Arc::clone(&self.cancelled),
-                            )
+                            .invoke(prepared, Arc::clone(&self.cancelled))
                             .await
                         {
                             Ok(result) => {
@@ -593,6 +593,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use tokio::sync::RwLock;
@@ -604,7 +605,10 @@ mod tests {
     use crate::error::ModelError;
     use crate::message::ChatRole;
     use crate::model::{ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelResponse};
-    use crate::tool_invoker::{ExecutionPolicy, PolicyContext, SandboxKind, ToolInvokeResult};
+    use crate::tool_invoker::{
+        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
+        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeResult,
+    };
     use crate::tool_spec::{RiskLevel, ToolSpec};
     use async_trait::async_trait;
 
@@ -684,6 +688,7 @@ mod tests {
         policies: HashMap<String, ExecutionPolicy>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
         delay: Duration,
+        invocations: AtomicUsize,
     }
 
     impl ScriptedToolInvoker {
@@ -698,6 +703,7 @@ mod tests {
                 policies: HashMap::new(),
                 outputs: Mutex::new(HashMap::new()),
                 delay: Duration::from_millis(0),
+                invocations: AtomicUsize::new(0),
             }
         }
 
@@ -724,10 +730,13 @@ mod tests {
             self.delay = delay;
             self
         }
+
+        fn invocation_count(&self) -> usize {
+            self.invocations.load(Ordering::Relaxed)
+        }
     }
 
-    #[async_trait]
-    impl ToolInvoker for ScriptedToolInvoker {
+    impl ToolCatalog for ScriptedToolInvoker {
         fn lookup(&self, name: &str) -> Option<&ToolSpec> {
             self.specs.get(name)
         }
@@ -735,32 +744,48 @@ mod tests {
         fn list_specs(&self) -> Vec<ToolSpec> {
             self.specs.values().cloned().collect()
         }
+    }
 
-        fn check_policy(
+    impl ToolAuthorizer for ScriptedToolInvoker {
+        fn authorize(
             &self,
-            name: &str,
-            _arguments: &serde_json::Value,
+            request: &ToolCallRequest,
             _context: &PolicyContext,
-        ) -> ExecutionPolicy {
-            self.policies
-                .get(name)
-                .cloned()
-                .unwrap_or(ExecutionPolicy::Allow {
-                    sandbox: SandboxKind::None,
-                })
-        }
+        ) -> AuthorizationDecision {
+            let policy =
+                self.policies
+                    .get(&request.name)
+                    .cloned()
+                    .unwrap_or(ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    });
+            let prepared = PreparedToolCall {
+                request: request.clone(),
+                policy: policy.clone(),
+            };
 
+            match policy {
+                ExecutionPolicy::Allow { .. } => AuthorizationDecision::Prepared(prepared),
+                ExecutionPolicy::NeedConfirmation { message, .. } => {
+                    AuthorizationDecision::NeedConfirmation { prepared, message }
+                }
+                ExecutionPolicy::Deny { reason } => AuthorizationDecision::Denied { reason },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ScriptedToolInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            name: &str,
-            _arguments: serde_json::Value,
+            prepared: PreparedToolCall,
             cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(ToolInvokeError::Cancelled);
             }
 
+            self.invocations.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(self.delay).await;
 
             if cancelled.load(Ordering::Relaxed) {
@@ -771,13 +796,14 @@ mod tests {
                 .outputs
                 .lock()
                 .expect("outputs lock should not be poisoned");
-            let Some(outputs) = outputs_guard.get_mut(name) else {
-                return Err(ToolInvokeError::NotFound(name.to_string()));
+            let tool_name = prepared.request.name.clone();
+            let Some(outputs) = outputs_guard.get_mut(&tool_name) else {
+                return Err(ToolInvokeError::NotFound(tool_name));
             };
 
             outputs
                 .pop_front()
-                .unwrap_or_else(|| Err(ToolInvokeError::NotFound(name.to_string())))
+                .unwrap_or(Err(ToolInvokeError::NotFound(tool_name)))
         }
     }
 
@@ -800,7 +826,30 @@ mod tests {
         tape_store: Arc<dyn TapeStore>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
     ) -> AgentRuntime {
-        runtime_with_session(SessionId::new(), model, tools, tape_store, tool_dispatcher)
+        runtime_with_approval(
+            model,
+            tools,
+            tape_store,
+            tool_dispatcher,
+            Arc::new(DenyAllApprovals),
+        )
+    }
+
+    fn runtime_with_approval(
+        model: Arc<dyn ModelProvider>,
+        tools: Arc<dyn ToolInvoker>,
+        tape_store: Arc<dyn TapeStore>,
+        tool_dispatcher: Box<dyn ToolDispatcher>,
+        approval_handler: Arc<dyn ApprovalHandler>,
+    ) -> AgentRuntime {
+        runtime_with_session(
+            SessionId::new(),
+            model,
+            tools,
+            tape_store,
+            tool_dispatcher,
+            approval_handler,
+        )
     }
 
     fn runtime_with_session(
@@ -809,6 +858,7 @@ mod tests {
         tools: Arc<dyn ToolInvoker>,
         tape_store: Arc<dyn TapeStore>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        approval_handler: Arc<dyn ApprovalHandler>,
     ) -> AgentRuntime {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -835,9 +885,17 @@ mod tests {
             "test-model".to_string(),
             Some(256),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(DenyAllApprovals),
+            approval_handler,
             Arc::new(NoopEventSink),
         )
+    }
+
+    struct ApproveAllApprovals;
+
+    impl ApprovalHandler for ApproveAllApprovals {
+        fn confirm(&self, _message: &str) -> bool {
+            true
+        }
     }
 
     #[tokio::test]
@@ -1207,7 +1265,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_tool_call_emits_tool_denied_instead_of_tool_failed() {
+    async fn runtime_executes_prepared_tool_call_after_confirmation() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("handled confirmation".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()])
+                .with_policy(
+                    "echo",
+                    ExecutionPolicy::NeedConfirmation {
+                        message: "approve echo".to_string(),
+                        sandbox: SandboxKind::Seatbelt,
+                    },
+                )
+                .with_output(
+                    "echo",
+                    Ok(ToolInvokeResult {
+                        content: "hello".to_string(),
+                        is_error: false,
+                    }),
+                ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime_with_approval(
+            model,
+            tools.clone(),
+            tape_store,
+            Box::new(NativeToolDispatcher),
+            Arc::new(ApproveAllApprovals),
+        );
+
+        let response = runtime
+            .run_turn("try confirmed tool")
+            .await
+            .expect("turn should succeed after approval");
+
+        assert_eq!(response, "handled confirmation");
+        assert_eq!(tools.invocation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_invoke_executor_when_authorization_denied() {
         let model = Arc::new(ScriptedModelProvider::new(
             vec![
                 ChatResponse {
@@ -1241,7 +1358,7 @@ mod tests {
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
         let mut runtime = runtime(
             model,
-            tools,
+            tools.clone(),
             tape_store.clone(),
             Box::new(NativeToolDispatcher),
         );
@@ -1266,6 +1383,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::ToolFailed))
         );
+        assert_eq!(tools.invocation_count(), 0);
     }
 
     #[tokio::test]
@@ -1417,6 +1535,7 @@ mod tests {
             tools.clone(),
             tape_store.clone(),
             Box::new(NativeToolDispatcher),
+            Arc::new(DenyAllApprovals),
         );
 
         initial_runtime
@@ -1439,6 +1558,7 @@ mod tests {
             tools,
             tape_store,
             Box::new(NativeToolDispatcher),
+            Arc::new(DenyAllApprovals),
         );
 
         restored_runtime
@@ -1489,6 +1609,7 @@ mod tests {
             tools.clone(),
             tape_store.clone(),
             Box::new(NativeToolDispatcher),
+            Arc::new(DenyAllApprovals),
         );
 
         initial_runtime
@@ -1520,6 +1641,7 @@ mod tests {
             tools,
             tape_store,
             Box::new(NativeToolDispatcher),
+            Arc::new(DenyAllApprovals),
         );
 
         restored_runtime

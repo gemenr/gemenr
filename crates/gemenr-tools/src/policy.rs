@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use gemenr_core::{
-    ExecutionPolicy, PolicyConfig, PolicyContext, PolicyEffect, RiskLevel, SandboxKind, ToolSpec,
+    ExecutionPolicy, PolicyConfig, PolicyContext, PolicyEffect, RiskLevel, SandboxKind,
+    ToolCallRequest, ToolSpec,
 };
-
-use crate::handler::ToolCallSpec;
 
 /// Evaluates the effective execution policy for one tool invocation.
 pub trait PolicyEvaluator: Send + Sync {
@@ -13,7 +12,7 @@ pub trait PolicyEvaluator: Send + Sync {
         &self,
         ctx: &PolicyContext,
         spec: &ToolSpec,
-        call: &ToolCallSpec,
+        call: &ToolCallRequest,
     ) -> ExecutionPolicy;
 }
 
@@ -97,7 +96,7 @@ impl PolicyEvaluator for RuleBasedPolicyEvaluator {
         &self,
         ctx: &PolicyContext,
         spec: &ToolSpec,
-        _call: &ToolCallSpec,
+        _call: &ToolCallRequest,
     ) -> ExecutionPolicy {
         for level in [
             ScopeLevel::Conversation,
@@ -192,15 +191,15 @@ fn phase_one_default(spec: &ToolSpec) -> ExecutionPolicy {
 #[cfg(test)]
 mod tests {
     use gemenr_core::{
-        ExecutionPolicy, PolicyContext, PolicyEffect, RiskLevel, SandboxKind, ToolSpec,
+        ExecutionPolicy, PolicyContext, PolicyEffect, RiskLevel, SandboxKind, ToolCallRequest,
+        ToolSpec,
     };
     use serde_json::json;
 
     use super::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};
-    use crate::handler::ToolCallSpec;
 
-    fn call() -> ToolCallSpec {
-        ToolCallSpec {
+    fn call() -> ToolCallRequest {
+        ToolCallRequest {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             arguments: json!({"command": "pwd"}),

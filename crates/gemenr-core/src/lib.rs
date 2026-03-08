@@ -183,12 +183,24 @@ pub use protocol::TurnId;
 pub use runtime_manager::RuntimeManager;
 /// Re-export of runtime manager errors.
 pub use runtime_manager::RuntimeManagerError;
+/// Re-export of tool authorization decisions.
+pub use tool_invoker::AuthorizationDecision;
 /// Re-export of final execution policies.
 pub use tool_invoker::ExecutionPolicy;
 /// Re-export of policy evaluation context.
 pub use tool_invoker::PolicyContext;
+/// Re-export of prepared tool calls that carry authorization results.
+pub use tool_invoker::PreparedToolCall;
 /// Re-export of sandbox selection kinds.
 pub use tool_invoker::SandboxKind;
+/// Re-export of tool authorization contract.
+pub use tool_invoker::ToolAuthorizer;
+/// Re-export of tool call request payloads.
+pub use tool_invoker::ToolCallRequest;
+/// Re-export of tool discovery contract.
+pub use tool_invoker::ToolCatalog;
+/// Re-export of tool execution contract.
+pub use tool_invoker::ToolExecutor;
 /// Re-export of tool invocation errors.
 pub use tool_invoker::ToolInvokeError;
 /// Re-export of successful tool invocation results.

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gemenr_core::{ExecutionPolicy, PolicyContext};
+use gemenr_core::{ExecutionPolicy, PolicyContext, ToolCallRequest};
 use serde::{Deserialize, Serialize};
 
 /// Handler for executing a registered tool.
@@ -27,16 +27,8 @@ pub struct ToolOutput {
     pub content: String,
 }
 
-/// A request to invoke a specific tool.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCallSpec {
-    /// Unique identifier for this tool call.
-    pub call_id: String,
-    /// Name of the tool to invoke.
-    pub name: String,
-    /// Arguments serialized as JSON.
-    pub arguments: serde_json::Value,
-}
+/// Backward-compatible alias for the shared tool call request type.
+pub type ToolCallSpec = ToolCallRequest;
 
 /// Context for tool execution.
 #[derive(Debug, Clone, PartialEq, Eq)]

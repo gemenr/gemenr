@@ -39,8 +39,7 @@ struct AllowlistedToolInvoker {
     allowed: HashSet<String>,
 }
 
-#[async_trait]
-impl tool_invoker::ToolInvoker for AllowlistedToolInvoker {
+impl tool_invoker::ToolCatalog for AllowlistedToolInvoker {
     fn lookup(&self, name: &str) -> Option<&ToolSpec> {
         if self.allowed.contains(name) {
             self.inner.lookup(name)
@@ -56,33 +55,37 @@ impl tool_invoker::ToolInvoker for AllowlistedToolInvoker {
             .filter(|spec| self.allowed.contains(&spec.name))
             .collect()
     }
+}
 
-    fn check_policy(
+impl tool_invoker::ToolAuthorizer for AllowlistedToolInvoker {
+    fn authorize(
         &self,
-        name: &str,
-        arguments: &serde_json::Value,
+        request: &tool_invoker::ToolCallRequest,
         context: &tool_invoker::PolicyContext,
-    ) -> tool_invoker::ExecutionPolicy {
-        if self.allowed.contains(name) {
-            self.inner.check_policy(name, arguments, context)
+    ) -> tool_invoker::AuthorizationDecision {
+        if self.allowed.contains(&request.name) {
+            self.inner.authorize(request, context)
         } else {
-            tool_invoker::ExecutionPolicy::Deny {
-                reason: format!("tool `{name}` is not available for this job"),
+            tool_invoker::AuthorizationDecision::Denied {
+                reason: format!("tool `{}` is not available for this job", request.name),
             }
         }
     }
+}
 
+#[async_trait]
+impl tool_invoker::ToolExecutor for AllowlistedToolInvoker {
     async fn invoke(
         &self,
-        call_id: &str,
-        name: &str,
-        arguments: serde_json::Value,
+        prepared: tool_invoker::PreparedToolCall,
         cancelled: Arc<AtomicBool>,
     ) -> Result<tool_invoker::ToolInvokeResult, tool_invoker::ToolInvokeError> {
-        if self.allowed.contains(name) {
-            self.inner.invoke(call_id, name, arguments, cancelled).await
+        if self.allowed.contains(&prepared.request.name) {
+            self.inner.invoke(prepared, cancelled).await
         } else {
-            Err(tool_invoker::ToolInvokeError::NotFound(name.to_string()))
+            Err(tool_invoker::ToolInvokeError::NotFound(
+                prepared.request.name.clone(),
+            ))
         }
     }
 }
@@ -154,30 +157,57 @@ impl ToolPlane {
         ToolCatalog { tools }
     }
 
-    /// Invoke a tool by call spec and execution context.
+    /// Authorize a tool call request against the configured policy evaluator.
+    #[must_use]
+    pub fn authorize(
+        &self,
+        request: &tool_invoker::ToolCallRequest,
+        context: &tool_invoker::PolicyContext,
+    ) -> tool_invoker::AuthorizationDecision {
+        let Some(spec) = self.lookup(&request.name) else {
+            return tool_invoker::AuthorizationDecision::Denied {
+                reason: format!("Tool '{}' not found", request.name),
+            };
+        };
+
+        let policy = self.policy_evaluator.evaluate(context, spec, request);
+        let prepared = tool_invoker::PreparedToolCall {
+            request: request.clone(),
+            policy: policy.clone(),
+        };
+
+        match policy {
+            tool_invoker::ExecutionPolicy::Allow { .. } => {
+                tool_invoker::AuthorizationDecision::Prepared(prepared)
+            }
+            tool_invoker::ExecutionPolicy::NeedConfirmation { message, .. } => {
+                tool_invoker::AuthorizationDecision::NeedConfirmation { prepared, message }
+            }
+            tool_invoker::ExecutionPolicy::Deny { reason } => {
+                tool_invoker::AuthorizationDecision::Denied { reason }
+            }
+        }
+    }
+
+    /// Invoke an already-authorized tool call with the provided execution context.
     pub async fn invoke(
         &self,
-        call: &ToolCallSpec,
+        prepared: &tool_invoker::PreparedToolCall,
         ctx: &ExecContext,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ToolOutput, ToolError> {
-        let Some((spec, handler)) = self.tools.get(&call.name) else {
-            return Err(ToolError::NotFound(call.name.clone()));
+        let Some((_, handler)) = self.tools.get(&prepared.request.name) else {
+            return Err(ToolError::NotFound(prepared.request.name.clone()));
         };
 
-        debug!(call_id = %call.call_id, tool = %call.name, "invoking tool");
+        debug!(call_id = %prepared.request.call_id, tool = %prepared.request.name, "invoking tool");
 
         let mut execution_context = ctx.clone();
-        if execution_context.execution_policy.is_none() {
-            execution_context.execution_policy = Some(self.policy_evaluator.evaluate(
-                &execution_context.policy_context,
-                spec,
-                call,
-            ));
-        }
+        execution_context.execution_policy = Some(prepared.policy.clone());
 
         let execution = async {
-            let tool_future = handler.execute(&execution_context, call.arguments.clone());
+            let tool_future =
+                handler.execute(&execution_context, prepared.request.arguments.clone());
             tokio::pin!(tool_future);
 
             loop {
@@ -185,7 +215,7 @@ impl ToolPlane {
                     result = &mut tool_future => return result,
                     _ = tokio::time::sleep(Duration::from_millis(25)) => {
                         if cancelled.load(Ordering::Relaxed) {
-                            warn!(call_id = %call.call_id, tool = %call.name, "tool invocation cancelled");
+                            warn!(call_id = %prepared.request.call_id, tool = %prepared.request.name, "tool invocation cancelled");
                             return Err(ToolError::Cancelled);
                         }
                     }
@@ -196,7 +226,7 @@ impl ToolPlane {
         match tokio::time::timeout(ctx.timeout, execution).await {
             Ok(result) => result,
             Err(_) => {
-                warn!(call_id = %call.call_id, tool = %call.name, timeout = ?ctx.timeout, "tool invocation timed out");
+                warn!(call_id = %prepared.request.call_id, tool = %prepared.request.name, timeout = ?ctx.timeout, "tool invocation timed out");
                 Err(ToolError::Timeout(ctx.timeout))
             }
         }
@@ -209,8 +239,7 @@ impl Default for ToolPlane {
     }
 }
 
-#[async_trait]
-impl tool_invoker::ToolInvoker for ToolPlane {
+impl tool_invoker::ToolCatalog for ToolPlane {
     fn lookup(&self, name: &str) -> Option<&ToolSpec> {
         ToolPlane::lookup(self, name)
     }
@@ -218,50 +247,30 @@ impl tool_invoker::ToolInvoker for ToolPlane {
     fn list_specs(&self) -> Vec<ToolSpec> {
         self.list().tools
     }
+}
 
-    fn check_policy(
+impl tool_invoker::ToolAuthorizer for ToolPlane {
+    fn authorize(
         &self,
-        name: &str,
-        arguments: &serde_json::Value,
+        request: &tool_invoker::ToolCallRequest,
         context: &tool_invoker::PolicyContext,
-    ) -> tool_invoker::ExecutionPolicy {
-        let Some(spec) = self.lookup(name) else {
-            return tool_invoker::ExecutionPolicy::Deny {
-                reason: format!("Tool '{}' not found", name),
-            };
-        };
-
-        let call = ToolCallSpec {
-            call_id: String::new(),
-            name: name.to_string(),
-            arguments: arguments.clone(),
-        };
-
-        self.policy_evaluator.evaluate(context, spec, &call)
+    ) -> tool_invoker::AuthorizationDecision {
+        ToolPlane::authorize(self, request, context)
     }
+}
 
+#[async_trait]
+impl tool_invoker::ToolExecutor for ToolPlane {
     async fn invoke(
         &self,
-        call_id: &str,
-        name: &str,
-        arguments: serde_json::Value,
+        prepared: tool_invoker::PreparedToolCall,
         cancelled: Arc<AtomicBool>,
     ) -> Result<tool_invoker::ToolInvokeResult, tool_invoker::ToolInvokeError> {
-        let call = ToolCallSpec {
-            call_id: call_id.to_string(),
-            name: name.to_string(),
-            arguments,
-        };
         let ctx = ExecContext {
-            execution_policy: Some(self.check_policy(
-                name,
-                &call.arguments,
-                &tool_invoker::PolicyContext::default(),
-            )),
             ..ExecContext::default()
         };
 
-        match ToolPlane::invoke(self, &call, &ctx, cancelled).await {
+        match ToolPlane::invoke(self, &prepared, &ctx, cancelled).await {
             Ok(output) => Ok(tool_invoker::ToolInvokeResult {
                 content: output.content,
                 is_error: false,
@@ -279,11 +288,14 @@ impl tool_invoker::ToolInvoker for ToolPlane {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use gemenr_core::{ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind};
+    use gemenr_core::{
+        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, RiskLevel,
+        SandboxKind,
+    };
     use serde_json::json;
 
     use super::{
@@ -339,6 +351,37 @@ mod tests {
         }
     }
 
+    struct CountingPolicyEvaluator {
+        evaluations: AtomicUsize,
+    }
+
+    impl CountingPolicyEvaluator {
+        fn new() -> Self {
+            Self {
+                evaluations: AtomicUsize::new(0),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.evaluations.load(Ordering::Relaxed)
+        }
+    }
+
+    impl super::PolicyEvaluator for CountingPolicyEvaluator {
+        fn evaluate(
+            &self,
+            _ctx: &PolicyContext,
+            _spec: &gemenr_core::ToolSpec,
+            _call: &gemenr_core::ToolCallRequest,
+        ) -> ExecutionPolicy {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
+            ExecutionPolicy::NeedConfirmation {
+                message: "confirm shell".to_string(),
+                sandbox: SandboxKind::Seatbelt,
+            }
+        }
+    }
+
     fn spec(name: &str) -> gemenr_core::ToolSpec {
         gemenr_core::ToolSpec {
             name: name.to_string(),
@@ -353,6 +396,13 @@ mod tests {
             call_id: "call-1".to_string(),
             name: name.to_string(),
             arguments: json!({}),
+        }
+    }
+
+    fn prepared_call(name: &str, policy: ExecutionPolicy) -> PreparedToolCall {
+        PreparedToolCall {
+            request: call(name),
+            policy,
         }
     }
 
@@ -397,7 +447,12 @@ mod tests {
 
         let output = plane
             .invoke(
-                &call("shell"),
+                &prepared_call(
+                    "shell",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                ),
                 &ExecContext::default(),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -418,7 +473,16 @@ mod tests {
         };
 
         let output = plane
-            .invoke(&call("shell"), &context, Arc::new(AtomicBool::new(false)))
+            .invoke(
+                &prepared_call(
+                    "shell",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                ),
+                &context,
+                Arc::new(AtomicBool::new(false)),
+            )
             .await
             .expect("tool should receive context");
 
@@ -431,7 +495,12 @@ mod tests {
 
         let error = plane
             .invoke(
-                &call("missing"),
+                &prepared_call(
+                    "missing",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                ),
                 &ExecContext::default(),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -452,7 +521,16 @@ mod tests {
         };
 
         let error = plane
-            .invoke(&call("shell"), &context, Arc::new(AtomicBool::new(false)))
+            .invoke(
+                &prepared_call(
+                    "shell",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                ),
+                &context,
+                Arc::new(AtomicBool::new(false)),
+            )
             .await
             .expect_err("slow tool should time out");
 
@@ -466,7 +544,16 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(true));
 
         let error = plane
-            .invoke(&call("shell"), &ExecContext::default(), cancelled)
+            .invoke(
+                &prepared_call(
+                    "shell",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::None,
+                    },
+                ),
+                &ExecContext::default(),
+                cancelled,
+            )
             .await
             .expect_err("cancelled tool should fail");
 
@@ -474,7 +561,75 @@ mod tests {
     }
 
     #[test]
-    fn check_policy_returns_execution_plan_from_evaluator() {
+    fn authorize_returns_prepared_call_with_policy() {
+        let mut plane = ToolPlane::with_policy_evaluator(Arc::new(RuleBasedPolicyEvaluator {
+            rules: vec![PolicyRule {
+                scope: PolicyScope::Conversation("conv-1".to_string()),
+                tool_name: "shell".to_string(),
+                effect: gemenr_core::PolicyEffect::Allow,
+                sandbox: SandboxKind::Seatbelt,
+            }],
+        }));
+        plane.register(spec("shell"), Box::new(StaticHandler { content: "ok" }));
+
+        let decision = plane.authorize(
+            &ToolCallSpec {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({"command": "pwd"}),
+            },
+            &PolicyContext {
+                organization_id: None,
+                workspace_id: None,
+                conversation_id: Some("conv-1".to_string()),
+            },
+        );
+
+        assert_eq!(
+            decision,
+            AuthorizationDecision::Prepared(PreparedToolCall {
+                request: ToolCallSpec {
+                    call_id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({"command": "pwd"}),
+                },
+                policy: ExecutionPolicy::Allow {
+                    sandbox: SandboxKind::Seatbelt,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_need_confirmation_without_recomputing_invoke_policy() {
+        let evaluator = Arc::new(CountingPolicyEvaluator::new());
+        let mut plane = ToolPlane::with_policy_evaluator(evaluator.clone());
+        plane.register(spec("shell"), Box::new(StaticHandler { content: "ok" }));
+
+        let decision = plane.authorize(&call("shell"), &PolicyContext::default());
+        let prepared = match decision {
+            AuthorizationDecision::NeedConfirmation { prepared, message } => {
+                assert_eq!(message, "confirm shell");
+                prepared
+            }
+            other => panic!("expected confirmation, got {other:?}"),
+        };
+
+        let output = plane
+            .invoke(
+                &prepared,
+                &ExecContext::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("prepared call should execute");
+
+        assert_eq!(output.content, "ok");
+        assert_eq!(evaluator.count(), 1);
+    }
+
+    #[test]
+    fn authorize_returns_need_confirmation_from_evaluator() {
         let mut plane = ToolPlane::with_policy_evaluator(Arc::new(RuleBasedPolicyEvaluator {
             rules: vec![PolicyRule {
                 scope: PolicyScope::Conversation("conv-1".to_string()),
@@ -485,10 +640,12 @@ mod tests {
         }));
         plane.register(spec("shell"), Box::new(StaticHandler { content: "ok" }));
 
-        let plan = <ToolPlane as gemenr_core::ToolInvoker>::check_policy(
-            &plane,
-            "shell",
-            &json!({"command": "pwd"}),
+        let decision = plane.authorize(
+            &ToolCallSpec {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({"command": "pwd"}),
+            },
             &PolicyContext {
                 organization_id: None,
                 workspace_id: None,
@@ -497,10 +654,20 @@ mod tests {
         );
 
         assert_eq!(
-            plan,
-            ExecutionPolicy::NeedConfirmation {
+            decision,
+            AuthorizationDecision::NeedConfirmation {
+                prepared: PreparedToolCall {
+                    request: ToolCallSpec {
+                        call_id: "call-1".to_string(),
+                        name: "shell".to_string(),
+                        arguments: json!({"command": "pwd"}),
+                    },
+                    policy: ExecutionPolicy::NeedConfirmation {
+                        message: "Tool 'shell' requires confirmation".to_string(),
+                        sandbox: SandboxKind::Seatbelt,
+                    },
+                },
                 message: "Tool 'shell' requires confirmation".to_string(),
-                sandbox: SandboxKind::Seatbelt,
             }
         );
     }
@@ -512,15 +679,17 @@ mod allowlist_tests {
     use std::sync::atomic::AtomicBool;
 
     use async_trait::async_trait;
-    use gemenr_core::{RiskLevel, ToolInvokeError, ToolInvokeResult, ToolInvoker};
+    use gemenr_core::{
+        AuthorizationDecision, ExecutionPolicy, PreparedToolCall, RiskLevel, ToolAuthorizer,
+        ToolCatalog, ToolExecutor, ToolInvokeError, ToolInvokeResult,
+    };
     use serde_json::json;
 
     use super::allowlist_tool_invoker;
 
     struct StaticInvoker;
 
-    #[async_trait]
-    impl ToolInvoker for StaticInvoker {
+    impl ToolCatalog for StaticInvoker {
         fn lookup(&self, name: &str) -> Option<&gemenr_core::ToolSpec> {
             match name {
                 "shell" => Some(Box::leak(Box::new(gemenr_core::ToolSpec {
@@ -550,40 +719,57 @@ mod allowlist_tests {
                 })
                 .collect()
         }
+    }
 
-        fn check_policy(
+    impl ToolAuthorizer for StaticInvoker {
+        fn authorize(
             &self,
-            _name: &str,
-            _arguments: &serde_json::Value,
+            request: &gemenr_core::ToolCallRequest,
             _context: &gemenr_core::PolicyContext,
-        ) -> gemenr_core::ExecutionPolicy {
-            gemenr_core::ExecutionPolicy::Allow {
-                sandbox: gemenr_core::SandboxKind::None,
-            }
+        ) -> AuthorizationDecision {
+            AuthorizationDecision::Prepared(PreparedToolCall {
+                request: request.clone(),
+                policy: ExecutionPolicy::Allow {
+                    sandbox: gemenr_core::SandboxKind::None,
+                },
+            })
         }
+    }
 
+    #[async_trait]
+    impl ToolExecutor for StaticInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            name: &str,
-            _arguments: serde_json::Value,
+            prepared: PreparedToolCall,
             _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             Ok(ToolInvokeResult {
-                content: name.to_string(),
+                content: prepared.request.name,
                 is_error: false,
             })
         }
     }
 
-    #[tokio::test]
-    async fn allowlist_view_filters_catalog_and_invocation() {
+    #[test]
+    fn allowlist_wrapper_denies_before_execution() {
         let view = allowlist_tool_invoker(Arc::new(StaticInvoker), &["shell".to_string()]);
         let specs = view.list_specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "shell");
-        assert!(
-            matches!(view.invoke("1", "fs.read", json!({}), Arc::new(AtomicBool::new(false))).await, Err(ToolInvokeError::NotFound(name)) if name == "fs.read")
+
+        let decision = view.authorize(
+            &gemenr_core::ToolCallRequest {
+                call_id: "1".to_string(),
+                name: "fs.read".to_string(),
+                arguments: json!({}),
+            },
+            &gemenr_core::PolicyContext::default(),
         );
+
+        assert!(matches!(
+            decision,
+            AuthorizationDecision::Denied { reason }
+                if reason == "tool `fs.read` is not available for this job"
+        ));
     }
 }

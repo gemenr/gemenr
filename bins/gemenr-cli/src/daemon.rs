@@ -435,8 +435,7 @@ mod tests {
         specs: Vec<ToolSpec>,
     }
 
-    #[async_trait]
-    impl ToolInvoker for StaticToolInvoker {
+    impl gemenr_core::ToolCatalog for StaticToolInvoker {
         fn lookup(&self, name: &str) -> Option<&ToolSpec> {
             self.specs.iter().find(|spec| spec.name == name)
         }
@@ -444,27 +443,32 @@ mod tests {
         fn list_specs(&self) -> Vec<ToolSpec> {
             self.specs.clone()
         }
+    }
 
-        fn check_policy(
+    impl gemenr_core::ToolAuthorizer for StaticToolInvoker {
+        fn authorize(
             &self,
-            _name: &str,
-            _arguments: &serde_json::Value,
+            request: &gemenr_core::ToolCallRequest,
             _context: &PolicyContext,
-        ) -> gemenr_core::ExecutionPolicy {
-            gemenr_core::ExecutionPolicy::Allow {
-                sandbox: SandboxKind::None,
-            }
+        ) -> gemenr_core::AuthorizationDecision {
+            gemenr_core::AuthorizationDecision::Prepared(gemenr_core::PreparedToolCall {
+                request: request.clone(),
+                policy: gemenr_core::ExecutionPolicy::Allow {
+                    sandbox: SandboxKind::None,
+                },
+            })
         }
+    }
 
+    #[async_trait]
+    impl gemenr_core::ToolExecutor for StaticToolInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            name: &str,
-            _arguments: serde_json::Value,
+            prepared: gemenr_core::PreparedToolCall,
             _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             Ok(ToolInvokeResult {
-                content: name.to_string(),
+                content: prepared.request.name,
                 is_error: false,
             })
         }

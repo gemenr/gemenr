@@ -669,7 +669,7 @@ mod tests {
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
         ChatRequest, ChatResponse, Config, ConversationDriver, ConversationId, InMemoryTapeStore,
         ModelCapabilities, ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType,
-        SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
+        SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolSpec,
     };
 
     #[test]
@@ -1071,8 +1071,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct StaticToolInvoker;
 
-    #[async_trait]
-    impl ToolInvoker for StaticToolInvoker {
+    impl gemenr_core::ToolCatalog for StaticToolInvoker {
         fn lookup(&self, _name: &str) -> Option<&ToolSpec> {
             None
         }
@@ -1080,23 +1079,28 @@ mod tests {
         fn list_specs(&self) -> Vec<ToolSpec> {
             Vec::new()
         }
+    }
 
-        fn check_policy(
+    impl gemenr_core::ToolAuthorizer for StaticToolInvoker {
+        fn authorize(
             &self,
-            _name: &str,
-            _arguments: &serde_json::Value,
+            request: &gemenr_core::ToolCallRequest,
             _context: &gemenr_core::PolicyContext,
-        ) -> gemenr_core::ExecutionPolicy {
-            gemenr_core::ExecutionPolicy::Allow {
-                sandbox: gemenr_core::SandboxKind::None,
-            }
+        ) -> gemenr_core::AuthorizationDecision {
+            gemenr_core::AuthorizationDecision::Prepared(gemenr_core::PreparedToolCall {
+                request: request.clone(),
+                policy: gemenr_core::ExecutionPolicy::Allow {
+                    sandbox: gemenr_core::SandboxKind::None,
+                },
+            })
         }
+    }
 
+    #[async_trait]
+    impl gemenr_core::ToolExecutor for StaticToolInvoker {
         async fn invoke(
             &self,
-            _call_id: &str,
-            _name: &str,
-            _arguments: serde_json::Value,
+            _prepared: gemenr_core::PreparedToolCall,
             _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             Ok(ToolInvokeResult {
