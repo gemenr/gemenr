@@ -175,7 +175,9 @@ fn events_to_messages(events: &[EventEnvelope]) -> Vec<ChatMessage> {
                 .and_then(serde_json::Value::as_str)
                 .map(ChatMessage::assistant),
             EventKind::ToolCompleted => tool_event_message(event, "result"),
-            EventKind::ToolFailed => tool_event_message(event, "error"),
+            EventKind::ToolFailed | EventKind::ToolDenied | EventKind::ToolTimedOut => {
+                tool_event_message(event, "error")
+            }
             _ => None,
         })
         .collect()

@@ -15,20 +15,35 @@ pub struct ToolInvokeResult {
 }
 
 /// Errors that can occur while invoking a tool.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolInvokeError {
     /// The requested tool was not found.
     #[error("tool not found: {0}")]
     NotFound(String),
-    /// The tool execution failed.
-    #[error("execution error: {0}")]
-    Execution(String),
+    /// The tool execution was blocked by policy.
+    #[error("tool execution denied: {reason}")]
+    Denied {
+        /// Human-readable reason explaining why the tool was denied.
+        reason: String,
+    },
+    /// The tool execution was not approved by the user.
+    #[error("tool execution not approved: {message}")]
+    ApprovalDenied {
+        /// Human-readable approval message shown to the user.
+        message: String,
+    },
     /// The tool execution timed out.
     #[error("tool execution timed out")]
     Timeout,
     /// The tool execution was cancelled.
     #[error("tool execution cancelled")]
     Cancelled,
+    /// The tool execution failed after it started running.
+    #[error("tool execution failed: {message}")]
+    Execution {
+        /// Human-readable execution failure message.
+        message: String,
+    },
 }
 
 /// Backward-compatible Phase 1 policy decision.
@@ -121,7 +136,7 @@ pub trait ToolInvoker: Send + Sync {
 mod tests {
     use serde_json::json;
 
-    use super::{ExecutionPolicy, SandboxKind};
+    use super::{ExecutionPolicy, SandboxKind, ToolInvokeError};
 
     #[test]
     fn execution_policy_variants_are_comparable() {
@@ -166,6 +181,58 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SandboxKind::Landlock).expect("serialize"),
             json!("landlock")
+        );
+    }
+
+    #[test]
+    fn tool_invoke_error_variants_are_distinguishable() {
+        assert!(matches!(
+            ToolInvokeError::Denied {
+                reason: "policy blocked".to_string(),
+            },
+            ToolInvokeError::Denied { .. }
+        ));
+        assert!(matches!(
+            ToolInvokeError::ApprovalDenied {
+                message: "approval required".to_string(),
+            },
+            ToolInvokeError::ApprovalDenied { .. }
+        ));
+        assert!(matches!(ToolInvokeError::Timeout, ToolInvokeError::Timeout));
+        assert!(matches!(
+            ToolInvokeError::Execution {
+                message: "handler crashed".to_string(),
+            },
+            ToolInvokeError::Execution { .. }
+        ));
+    }
+
+    #[test]
+    fn tool_invoke_error_display_is_actionable() {
+        assert!(
+            ToolInvokeError::Denied {
+                reason: "policy blocked shell access".to_string(),
+            }
+            .to_string()
+            .contains("policy blocked shell access")
+        );
+        assert!(
+            ToolInvokeError::ApprovalDenied {
+                message: "user rejected confirmation".to_string(),
+            }
+            .to_string()
+            .contains("user rejected confirmation")
+        );
+        assert_eq!(
+            ToolInvokeError::Timeout.to_string(),
+            "tool execution timed out"
+        );
+        assert!(
+            ToolInvokeError::Execution {
+                message: "process exited with status 1".to_string(),
+            }
+            .to_string()
+            .contains("process exited with status 1")
         );
     }
 }

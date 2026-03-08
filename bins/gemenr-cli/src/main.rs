@@ -271,12 +271,46 @@ impl EventSink for StdioEventSink {
                 let result = event
                     .payload
                     .get("result")
+                    .or_else(|| event.payload.get("error"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
                 eprintln!("[tool_failed] {name}: {result}");
             }
+            EventKind::ToolDenied => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool");
+                let reason = event
+                    .payload
+                    .get("error")
+                    .or_else(|| event.payload.get("reason"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                eprintln!("[tool_denied] {name}: {reason}");
+            }
+            EventKind::ToolTimedOut => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool");
+                eprintln!("[tool_timed_out] {name}");
+            }
             EventKind::ContextSummarized => {
                 eprintln!("[context_summarized]");
+            }
+            EventKind::TurnCompleted => {
+                eprintln!("[turn_completed]");
+            }
+            EventKind::TurnFailed => {
+                let error = event
+                    .payload
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                eprintln!("[turn_failed] {error}");
             }
             EventKind::AnchorCreated | EventKind::Custom(_) => {}
         }
@@ -583,7 +617,6 @@ fn configure_runtime_builder(
     })
 }
 
-#[cfg(test)]
 fn display_model_error(error: &gemenr_core::ModelError) -> String {
     match error {
         gemenr_core::ModelError::Auth(message) => format!("authentication failed: {message}"),
@@ -599,7 +632,7 @@ fn display_model_error(error: &gemenr_core::ModelError) -> String {
 
 fn display_agent_error(error: &AgentError) -> String {
     match error {
-        AgentError::Model(message) => message.clone(),
+        AgentError::Model(model_error) => display_model_error(model_error),
         _ => error.to_string(),
     }
 }
@@ -899,9 +932,12 @@ mod tests {
 
     #[test]
     fn display_agent_error_uses_model_message_verbatim() {
-        let error = AgentError::Model("provider exploded".to_string());
+        let error = AgentError::Model(ModelError::Network("provider exploded".to_string()));
 
-        assert_eq!(display_agent_error(&error), "provider exploded");
+        assert_eq!(
+            display_agent_error(&error),
+            "network error: provider exploded"
+        );
     }
 
     #[test]
@@ -956,8 +992,14 @@ mod tests {
     }
 
     fn test_soul() -> Arc<RwLock<SoulManager>> {
-        let workspace =
-            std::env::temp_dir().join(format!("gemenr-cli-test-soul-{}", std::process::id()));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "gemenr-cli-test-soul-{}-{timestamp}",
+            std::process::id()
+        ));
 
         std::fs::create_dir_all(&workspace).expect("test soul workspace should exist");
 

@@ -25,20 +25,24 @@ const MAX_TURN_STEPS: usize = 50;
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     /// Model call failed.
-    #[error("model error: {0}")]
-    Model(String),
+    #[error(transparent)]
+    Model(#[from] crate::error::ModelError),
 
     /// Context management error.
-    #[error("context error: {0}")]
-    Context(String),
+    #[error(transparent)]
+    Context(#[from] crate::context::TapeError),
 
     /// Tool execution error.
-    #[error("tool error: {0}")]
-    Tool(String),
+    #[error(transparent)]
+    Tool(#[from] crate::tool_invoker::ToolInvokeError),
 
     /// Turn was cancelled.
     #[error("turn cancelled")]
     Cancelled,
+
+    /// Turn exceeded the maximum number of tool-calling steps.
+    #[error("turn exceeded maximum tool-calling steps")]
+    TurnLimitExceeded,
 }
 
 /// Handles user confirmations required before tool execution.
@@ -140,18 +144,30 @@ impl AgentRuntime {
 
     /// Restore the latest persisted anchor and post-anchor events for this session.
     pub async fn restore_from_tape(&mut self) -> Result<(), AgentError> {
-        self.context
-            .restore_from_tape()
-            .await
-            .map_err(|error| AgentError::Context(error.to_string()))
+        self.context.restore_from_tape().await?;
+        Ok(())
     }
 
     /// Execute a complete agent turn.
     pub async fn run_turn(&mut self, user_input: &str) -> Result<String, AgentError> {
-        self.check_cancelled()?;
-
         let turn_id = TurnId::new();
-        self.append_user_input(&turn_id, user_input).await?;
+        let result = self.run_turn_inner(&turn_id, user_input).await;
+
+        match &result {
+            Ok(response) => self.append_turn_completed(&turn_id, response).await?,
+            Err(error) => self.append_turn_failed(&turn_id, error).await?,
+        }
+
+        result
+    }
+
+    async fn run_turn_inner(
+        &mut self,
+        turn_id: &TurnId,
+        user_input: &str,
+    ) -> Result<String, AgentError> {
+        self.check_cancelled()?;
+        self.append_user_input(turn_id, user_input).await?;
 
         let mut history = Vec::new();
 
@@ -162,10 +178,7 @@ impl AgentRuntime {
                 ContextBuildResult::Ready(messages) => messages,
                 ContextBuildResult::NeedsSummary { messages } => {
                     let summary = self.summarize(&messages).await?;
-                    self.context
-                        .apply_summary(summary.clone())
-                        .await
-                        .map_err(|error| AgentError::Context(error.to_string()))?;
+                    self.context.apply_summary(summary.clone()).await?;
                     self.append_event(EventEnvelope::new(
                         self.context.session_id().clone(),
                         Some(turn_id.clone()),
@@ -177,8 +190,8 @@ impl AgentRuntime {
                     match self.context.build_context(&self.budget) {
                         ContextBuildResult::Ready(messages) => messages,
                         ContextBuildResult::NeedsSummary { .. } => {
-                            return Err(AgentError::Context(
-                                "context still exceeds token budget after summary".to_string(),
+                            return Err(context_invariant_error(
+                                "context still exceeds token budget after summary",
                             ));
                         }
                     }
@@ -196,22 +209,18 @@ impl AgentRuntime {
                 &self.model_name,
                 self.max_tokens,
             );
-            let response = self
-                .model
-                .chat(request)
-                .await
-                .map_err(|error| AgentError::Model(error.to_string()))?;
+            let response = self.model.chat(request).await?;
             let (text, tool_calls) = self.tool_dispatcher.parse_response(&response);
 
             match self.controller.next_action(text.clone(), tool_calls) {
                 ActionDecision::Respond(response_text) => {
-                    self.append_model_response(&turn_id, &response_text).await?;
+                    self.append_model_response(turn_id, &response_text).await?;
                     return Ok(response_text);
                 }
                 ActionDecision::CompleteTurn => {
                     let final_text = text.unwrap_or_default();
                     if !final_text.is_empty() {
-                        self.append_model_response(&turn_id, &final_text).await?;
+                        self.append_model_response(turn_id, &final_text).await?;
                     }
                     return Ok(final_text);
                 }
@@ -241,10 +250,10 @@ impl AgentRuntime {
                             ExecutionPolicy::Allow { .. } => {}
                             ExecutionPolicy::NeedConfirmation { message, .. } => {
                                 if !self.approval_handler.confirm(&message) {
-                                    let content = "User denied execution".to_string();
+                                    let content = format!("Execution not approved: {message}");
                                     self.emit_tool_event(
-                                        &turn_id,
-                                        EventKind::ToolFailed,
+                                        turn_id,
+                                        EventKind::ToolDenied,
                                         &call.name,
                                         &content,
                                     )
@@ -261,8 +270,8 @@ impl AgentRuntime {
                             ExecutionPolicy::Deny { reason } => {
                                 let content = format!("Denied: {reason}");
                                 self.emit_tool_event(
-                                    &turn_id,
-                                    EventKind::ToolFailed,
+                                    turn_id,
+                                    EventKind::ToolDenied,
                                     &call.name,
                                     &content,
                                 )
@@ -277,7 +286,7 @@ impl AgentRuntime {
                             }
                         }
 
-                        self.emit_tool_event(&turn_id, EventKind::ToolStarted, &call.name, "")
+                        self.emit_tool_event(turn_id, EventKind::ToolStarted, &call.name, "")
                             .await?;
 
                         match self
@@ -296,7 +305,7 @@ impl AgentRuntime {
                                 } else {
                                     EventKind::ToolCompleted
                                 };
-                                self.emit_tool_event(&turn_id, kind, &call.name, &result.content)
+                                self.emit_tool_event(turn_id, kind, &call.name, &result.content)
                                     .await?;
                                 results.push(ToolExecutionResult {
                                     call_id: call.id,
@@ -308,7 +317,7 @@ impl AgentRuntime {
                             Err(error) => {
                                 if matches!(error, ToolInvokeError::Cancelled) {
                                     self.emit_tool_event(
-                                        &turn_id,
+                                        turn_id,
                                         EventKind::ToolFailed,
                                         &call.name,
                                         "Tool execution cancelled",
@@ -318,13 +327,9 @@ impl AgentRuntime {
                                 }
 
                                 let content = tool_error_message(&error, &call.name);
-                                self.emit_tool_event(
-                                    &turn_id,
-                                    EventKind::ToolFailed,
-                                    &call.name,
-                                    &content,
-                                )
-                                .await?;
+                                let kind = tool_error_event_kind(&error);
+                                self.emit_tool_event(turn_id, kind, &call.name, &content)
+                                    .await?;
                                 results.push(ToolExecutionResult {
                                     call_id: call.id,
                                     name: call.name,
@@ -340,9 +345,7 @@ impl AgentRuntime {
             }
         }
 
-        Err(AgentError::Tool(
-            "turn exceeded maximum tool-calling steps".to_string(),
-        ))
+        Err(AgentError::TurnLimitExceeded)
     }
 
     /// Abort the currently executing turn.
@@ -393,23 +396,57 @@ impl AgentRuntime {
         tool_name: &str,
         content: &str,
     ) -> Result<(), AgentError> {
+        let payload = match kind {
+            EventKind::ToolStarted => json!({"name": tool_name}),
+            EventKind::ToolCompleted => json!({"name": tool_name, "result": content}),
+            EventKind::ToolFailed | EventKind::ToolDenied | EventKind::ToolTimedOut => {
+                json!({"name": tool_name, "error": content})
+            }
+            _ => json!({"name": tool_name, "content": content}),
+        };
+
         self.append_event(EventEnvelope::new(
             self.context.session_id().clone(),
             Some(turn_id.clone()),
             kind,
+            payload,
+        ))
+        .await
+    }
+
+    async fn append_turn_completed(
+        &mut self,
+        turn_id: &TurnId,
+        response: &str,
+    ) -> Result<(), AgentError> {
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            EventKind::TurnCompleted,
+            json!({"response": response}),
+        ))
+        .await
+    }
+
+    async fn append_turn_failed(
+        &mut self,
+        turn_id: &TurnId,
+        error: &AgentError,
+    ) -> Result<(), AgentError> {
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            EventKind::TurnFailed,
             json!({
-                "name": tool_name,
-                "result": content,
+                "error": error.to_string(),
+                "category": turn_failure_category(error),
             }),
         ))
         .await
     }
 
     async fn append_event(&mut self, event: EventEnvelope) -> Result<(), AgentError> {
-        self.context
-            .append(event.clone())
-            .await
-            .map_err(|error| AgentError::Context(error.to_string()))?;
+        self.context.append(event.clone()).await?;
         self.event_sink.publish(&event);
         Ok(())
     }
@@ -426,8 +463,7 @@ impl AgentRuntime {
                 model: self.model_name.clone(),
                 max_tokens: self.max_tokens,
             })
-            .await
-            .map_err(|error| AgentError::Model(error.to_string()))?;
+            .await?;
 
         Ok(response.content)
     }
@@ -441,12 +477,42 @@ impl AgentRuntime {
     }
 }
 
+fn context_invariant_error(message: &str) -> AgentError {
+    crate::context::TapeError::Io(std::io::Error::other(message.to_string())).into()
+}
+
 fn tool_error_message(error: &ToolInvokeError, tool_name: &str) -> String {
     match error {
         ToolInvokeError::NotFound(_) => format!("Tool '{tool_name}' not found"),
-        ToolInvokeError::Execution(message) => message.clone(),
+        ToolInvokeError::Denied { reason } => format!("Denied: {reason}"),
+        ToolInvokeError::ApprovalDenied { message } => {
+            format!("Execution not approved: {message}")
+        }
+        ToolInvokeError::Execution { message } => message.clone(),
         ToolInvokeError::Timeout => "Tool execution timed out".to_string(),
         ToolInvokeError::Cancelled => format!("Tool '{tool_name}' execution cancelled"),
+    }
+}
+
+fn tool_error_event_kind(error: &ToolInvokeError) -> EventKind {
+    match error {
+        ToolInvokeError::Denied { .. } | ToolInvokeError::ApprovalDenied { .. } => {
+            EventKind::ToolDenied
+        }
+        ToolInvokeError::Timeout => EventKind::ToolTimedOut,
+        ToolInvokeError::NotFound(_)
+        | ToolInvokeError::Cancelled
+        | ToolInvokeError::Execution { .. } => EventKind::ToolFailed,
+    }
+}
+
+fn turn_failure_category(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Model(_) => "model",
+        AgentError::Context(_) => "context",
+        AgentError::Tool(_) => "tool",
+        AgentError::Cancelled => "cancelled",
+        AgentError::TurnLimitExceeded => "turn_limit_exceeded",
     }
 }
 
@@ -577,6 +643,11 @@ mod tests {
             self
         }
 
+        fn with_policy(mut self, name: &str, policy: ExecutionPolicy) -> Self {
+            self.policies.insert(name.to_string(), policy);
+            self
+        }
+
         fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = delay;
             self
@@ -667,7 +738,14 @@ mod tests {
         tape_store: Arc<dyn TapeStore>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
     ) -> AgentRuntime {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-runtime");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/test-runtime-{}-{timestamp}",
+            session_id.0
+        ));
         std::fs::create_dir_all(&workspace).expect("test workspace should be created");
         let soul = Arc::new(RwLock::new(
             SoulManager::load(&workspace).expect("SOUL.md should load"),
@@ -729,6 +807,50 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::ModelResponse))
         );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::TurnCompleted))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_persists_turn_completed_event_on_success() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            }],
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(ScriptedToolInvoker::new(Vec::new()));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools,
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        let response = runtime
+            .run_turn("hello")
+            .await
+            .expect("turn should succeed");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+
+        assert_eq!(response, "done");
+        assert!(events.iter().any(|event| {
+            matches!(event.kind, EventKind::TurnCompleted)
+                && event
+                    .payload
+                    .get("response")
+                    .and_then(|value| value.as_str())
+                    == Some("done")
+        }));
     }
 
     #[tokio::test]
@@ -931,7 +1053,9 @@ mod tests {
                 .with_delay(Duration::from_millis(50)),
         );
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let tape_store_for_assertions = tape_store.clone();
         let mut runtime = runtime(model, tools, tape_store, Box::new(NativeToolDispatcher));
+        let session_id = runtime.session_id().clone();
         let cancelled = runtime.cancelled.clone();
 
         let handle = tokio::spawn(async move { runtime.run_turn("cancel me").await });
@@ -940,6 +1064,136 @@ mod tests {
 
         let result = handle.await.expect("task should join");
         assert!(matches!(result, Err(AgentError::Cancelled)));
+        let events = tape_store_for_assertions
+            .load_all(&session_id)
+            .await
+            .expect("events should load");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::TurnFailed))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_persists_turn_failed_event_on_step_limit() {
+        let responses = (0..MAX_TURN_STEPS)
+            .map(|index| ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("call-{index}"),
+                    name: "echo".to_string(),
+                    arguments: json!({"value": index}).to_string(),
+                }],
+                usage: None,
+            })
+            .collect();
+        let model = Arc::new(ScriptedModelProvider::new(
+            responses,
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let mut scripted_tools = ScriptedToolInvoker::new(vec![sample_tool_spec()]);
+        for index in 0..MAX_TURN_STEPS {
+            scripted_tools = scripted_tools.with_output(
+                "echo",
+                Ok(ToolInvokeResult {
+                    content: index.to_string(),
+                    is_error: false,
+                }),
+            );
+        }
+        let tools = Arc::new(scripted_tools);
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools,
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        let error = runtime
+            .run_turn("loop forever")
+            .await
+            .expect_err("turn should hit step limit");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+
+        assert!(matches!(error, AgentError::TurnLimitExceeded));
+        assert!(events.iter().any(|event| {
+            matches!(event.kind, EventKind::TurnFailed)
+                && event
+                    .payload
+                    .get("category")
+                    .and_then(|value| value.as_str())
+                    == Some("turn_limit_exceeded")
+        }));
+    }
+
+    #[tokio::test]
+    async fn denied_tool_call_emits_tool_denied_instead_of_tool_failed() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("handled denial".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_policy(
+                "echo",
+                ExecutionPolicy::Deny {
+                    reason: "policy blocked tool".to_string(),
+                },
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools,
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        let response = runtime
+            .run_turn("try denied tool")
+            .await
+            .expect("turn should succeed after denial");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+
+        assert_eq!(response, "handled denial");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ToolDenied))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ToolFailed))
+        );
     }
 
     #[tokio::test]

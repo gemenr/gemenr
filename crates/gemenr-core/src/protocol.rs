@@ -71,10 +71,18 @@ pub enum EventKind {
     ToolCompleted,
     /// Tool execution failed.
     ToolFailed,
+    /// Tool execution was denied before it started.
+    ToolDenied,
+    /// Tool execution timed out.
+    ToolTimedOut,
     /// Anchor (stage boundary) created.
     AnchorCreated,
     /// Context was summarized due to token budget.
     ContextSummarized,
+    /// Turn completed successfully.
+    TurnCompleted,
+    /// Turn terminated with an error.
+    TurnFailed,
     /// Custom event kind for extensibility.
     Custom(String),
 }
@@ -292,5 +300,30 @@ mod tests {
             serde_json::to_string(&EventKind::ToolStarted).expect("event kind should serialize");
 
         assert_eq!(json, r#""tool_started""#);
+    }
+
+    #[test]
+    fn event_kind_includes_turn_terminal_states() {
+        assert_eq!(
+            serde_json::to_value(EventKind::TurnCompleted)
+                .expect("turn completed should serialize"),
+            json!("turn_completed")
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::TurnFailed).expect("turn failed should serialize"),
+            json!("turn_failed")
+        );
+    }
+
+    #[test]
+    fn event_kind_includes_tool_governance_states() {
+        assert_eq!(
+            serde_json::to_value(EventKind::ToolDenied).expect("tool denied should serialize"),
+            json!("tool_denied")
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::ToolTimedOut).expect("tool timed out should serialize"),
+            json!("tool_timed_out")
+        );
     }
 }

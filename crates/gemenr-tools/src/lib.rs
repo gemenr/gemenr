@@ -269,7 +269,9 @@ impl tool_invoker::ToolInvoker for ToolPlane {
             Err(ToolError::NotFound(name)) => Err(tool_invoker::ToolInvokeError::NotFound(name)),
             Err(ToolError::Timeout(_)) => Err(tool_invoker::ToolInvokeError::Timeout),
             Err(ToolError::Cancelled) => Err(tool_invoker::ToolInvokeError::Cancelled),
-            Err(error) => Err(tool_invoker::ToolInvokeError::Execution(error.to_string())),
+            Err(error) => Err(tool_invoker::ToolInvokeError::Execution {
+                message: error.to_string(),
+            }),
         }
     }
 }
