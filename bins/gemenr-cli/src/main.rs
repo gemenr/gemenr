@@ -1,13 +1,16 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
-    AgentError, ApprovalHandler, Config, ConfigError, EventEnvelope, EventKind, EventSink,
-    InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter, ProviderType, RuntimeBuilder,
-    SessionId, SoulManager, TapeStore, ToolInvoker,
+    AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
+    ApprovalHandler, Config, ConfigError, ConversationDriver, ConversationId, EventEnvelope,
+    EventKind, EventSink, InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter,
+    ProviderType, ReplyRoute, RuntimeBuilder, SessionId, SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -82,6 +85,123 @@ impl ApprovalHandler for StdinApprovalHandler {
     }
 }
 
+struct StdioAdapter {
+    stdout: Mutex<Box<dyn Write + Send>>,
+    stderr: Mutex<Box<dyn Write + Send>>,
+}
+
+impl StdioAdapter {
+    fn new(stdout: Box<dyn Write + Send>, stderr: Box<dyn Write + Send>) -> Self {
+        Self {
+            stdout: Mutex::new(stdout),
+            stderr: Mutex::new(stderr),
+        }
+    }
+}
+
+impl Default for StdioAdapter {
+    fn default() -> Self {
+        Self::new(Box::new(io::stdout()), Box::new(io::stderr()))
+    }
+}
+
+#[async_trait]
+impl AccessAdapter for StdioAdapter {
+    fn name(&self) -> &'static str {
+        "stdio"
+    }
+
+    async fn send(&self, outbound: AccessOutbound) -> Result<(), AccessError> {
+        let use_stderr = outbound
+            .metadata
+            .get("stream")
+            .and_then(serde_json::Value::as_str)
+            == Some("stderr");
+        let mutex = if use_stderr {
+            &self.stderr
+        } else {
+            &self.stdout
+        };
+        let mut writer = mutex
+            .lock()
+            .map_err(|_| AccessError::Delivery("stdio writer lock poisoned".to_string()))?;
+        writeln!(writer, "{}", outbound.content)
+            .map_err(|error| AccessError::Delivery(error.to_string()))?;
+        writer
+            .flush()
+            .map_err(|error| AccessError::Delivery(error.to_string()))
+    }
+}
+
+struct RuntimeConversationDriver {
+    runtime: tokio::sync::Mutex<gemenr_core::AgentRuntime>,
+    restore_on_first_turn: AtomicBool,
+}
+
+impl RuntimeConversationDriver {
+    fn new(runtime: gemenr_core::AgentRuntime, restore_on_first_turn: bool) -> Self {
+        Self {
+            runtime: tokio::sync::Mutex::new(runtime),
+            restore_on_first_turn: AtomicBool::new(restore_on_first_turn),
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationDriver for RuntimeConversationDriver {
+    async fn handle(&self, inbound: AccessInbound) -> Result<AccessOutbound, AccessError> {
+        let mut runtime = self.runtime.lock().await;
+        if self.restore_on_first_turn.swap(false, Ordering::Relaxed) {
+            runtime
+                .restore_from_tape()
+                .await
+                .map_err(|error| AccessError::Driver(display_agent_error(&error)))?;
+        }
+
+        let content = runtime
+            .run_turn(&inbound.text)
+            .await
+            .map_err(|error| AccessError::Driver(display_agent_error(&error)))?;
+
+        Ok(AccessOutbound {
+            conversation_id: inbound.conversation_id,
+            route: inbound.route,
+            content,
+            metadata: serde_json::json!({}),
+        })
+    }
+}
+
+fn build_stdio_router() -> AccessRouter {
+    AccessRouter::new().with_stdio(Arc::new(StdioAdapter::default()))
+}
+
+fn build_stdio_inbound(conversation_id: ConversationId, text: impl Into<String>) -> AccessInbound {
+    AccessInbound {
+        conversation_id,
+        user_id: "stdio-user".to_string(),
+        text: text.into(),
+        route: ReplyRoute::Stdio,
+        metadata: serde_json::json!({}),
+    }
+}
+
+fn task_conversation_id(session: Option<&str>) -> ConversationId {
+    match session {
+        Some(session) => ConversationId(session.to_string()),
+        None => ConversationId(SessionId::new().0),
+    }
+}
+
+async fn handle_stdio_message(
+    driver: &dyn ConversationDriver,
+    router: &AccessRouter,
+    inbound: AccessInbound,
+) -> Result<(), AccessError> {
+    let outbound = driver.handle(inbound).await?;
+    router.deliver(outbound).await
+}
+
 struct StdioEventSink;
 
 impl EventSink for StdioEventSink {
@@ -151,7 +271,10 @@ async fn run_chat(config: &Config) {
             std::process::exit(1);
         }
     };
-    let mut runtime = builder.build(DEFAULT_SYSTEM_PROMPT.to_string());
+    let runtime = builder.build(DEFAULT_SYSTEM_PROMPT.to_string());
+    let conversation_id = ConversationId(runtime.session_id().0.clone());
+    let driver = RuntimeConversationDriver::new(runtime, false);
+    let router = build_stdio_router();
 
     loop {
         eprint!("> ");
@@ -175,20 +298,12 @@ async fn run_chat(config: &Config) {
             continue;
         }
 
-        tracing::debug!(target: "gemenr::cli", "running chat turn through agent runtime");
+        tracing::debug!(target: "gemenr::cli", "running chat turn through stdio access adapter");
 
-        match runtime.run_turn(trimmed).await {
-            Ok(response) => {
-                println!("{response}");
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "gemenr::cli",
-                    error = %error,
-                    "chat turn failed"
-                );
-                eprintln!("Error: {}", display_agent_error(&error));
-            }
+        let inbound = build_stdio_inbound(conversation_id.clone(), trimmed.to_string());
+        if let Err(error) = handle_stdio_message(&driver, &router, inbound).await {
+            tracing::warn!(target: "gemenr::cli", error = %error, "chat turn failed");
+            eprintln!("Error: {error}");
         }
     }
 
@@ -205,36 +320,47 @@ async fn run_task(task: &str, session_id: Option<&str>, config: &Config) {
     };
 
     let system_prompt = format!(
-        "You are an autonomous agent. Execute the following task:\n\n{task}\n\nUse the available tools to complete the task. When done, provide a summary of what you accomplished."
+        "You are an autonomous agent. Execute the following task:
+
+{task}
+
+Use the available tools to complete the task. When done, provide a summary of what you accomplished."
     );
-    let mut runtime = match session_id {
+    let conversation_id = task_conversation_id(session_id);
+    let runtime = match session_id {
         Some(session_id) => {
             builder.build_with_session(system_prompt, SessionId(session_id.to_string()))
         }
         None => builder.build(system_prompt),
     };
 
-    if session_id.is_some()
-        && let Err(error) = runtime.restore_from_tape().await
-    {
-        eprintln!("Error: {error}");
-        std::process::exit(1);
-    }
-
     let cancellation_handle = runtime.cancellation_handle();
+    let driver = RuntimeConversationDriver::new(runtime, session_id.is_some());
+    let router = build_stdio_router();
     let interrupt_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            cancellation_handle.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancellation_handle.store(true, Ordering::Relaxed);
         }
     });
 
     tracing::info!(target: "gemenr::cli", task = task, "starting task execution");
 
-    let result = runtime.run_turn(task).await;
+    let inbound = build_stdio_inbound(conversation_id, task.to_string());
+    let result = driver.handle(inbound).await;
     interrupt_task.abort();
 
     match result {
-        Ok(result) => println!("\n{result}"),
+        Ok(mut outbound) => {
+            outbound.content = format!(
+                "
+{}",
+                outbound.content
+            );
+            if let Err(error) = router.deliver(outbound).await {
+                eprintln!("Task failed: {error}");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("Task failed: {error}");
             std::process::exit(1);
@@ -375,13 +501,16 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::{
-        Cli, Commands, DEFAULT_SYSTEM_PROMPT, configure_runtime_builder, display_agent_error,
-        display_model_error,
+        Cli, Commands, DEFAULT_SYSTEM_PROMPT, StdioAdapter, build_stdio_inbound,
+        configure_runtime_builder, display_agent_error, display_model_error, handle_stdio_message,
+        task_conversation_id,
     };
     use gemenr_core::{
-        AgentError, ChatRequest, ChatResponse, Config, InMemoryTapeStore, ModelCapabilities,
-        ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType, SoulManager,
-        TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
+        AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
+        ChatRequest, ChatResponse, Config, ConversationDriver, ConversationId, InMemoryTapeStore,
+        ModelCapabilities, ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType,
+        ReplyRoute, SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker,
+        ToolSpec,
     };
 
     #[test]
@@ -416,6 +545,131 @@ mod tests {
             }
             Commands::Chat => panic!("expected run command"),
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer {
+        inner: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl SharedBuffer {
+        fn as_string(&self) -> String {
+            String::from_utf8(
+                self.inner
+                    .lock()
+                    .expect("buffer lock should not be poisoned")
+                    .clone(),
+            )
+            .expect("buffer should contain utf-8")
+        }
+    }
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner
+                .lock()
+                .expect("buffer lock should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDriver {
+        seen: std::sync::Mutex<Vec<AccessInbound>>,
+    }
+
+    #[async_trait]
+    impl ConversationDriver for RecordingDriver {
+        async fn handle(&self, inbound: AccessInbound) -> Result<AccessOutbound, AccessError> {
+            self.seen
+                .lock()
+                .expect("seen lock should not be poisoned")
+                .push(inbound.clone());
+            Ok(AccessOutbound {
+                conversation_id: inbound.conversation_id,
+                route: inbound.route,
+                content: format!("driver:{}", inbound.text),
+                metadata: serde_json::json!({}),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_uses_stdio_access_contract() {
+        let driver = RecordingDriver::default();
+        let stdout = SharedBuffer::default();
+        let stderr = SharedBuffer::default();
+        let router = AccessRouter::new().with_stdio(Arc::new(StdioAdapter::new(
+            Box::new(stdout.clone()),
+            Box::new(stderr),
+        )));
+        let inbound = build_stdio_inbound(ConversationId("chat-1".to_string()), "hello");
+
+        handle_stdio_message(&driver, &router, inbound.clone())
+            .await
+            .expect("stdio access flow should succeed");
+
+        let seen = driver
+            .seen
+            .lock()
+            .expect("seen lock should not be poisoned")
+            .clone();
+        assert_eq!(seen, vec![inbound]);
+        assert_eq!(
+            stdout.as_string(),
+            "driver:hello
+"
+        );
+    }
+
+    #[test]
+    fn run_session_keeps_stable_conversation_id() {
+        assert_eq!(
+            task_conversation_id(Some("session-123")),
+            ConversationId("session-123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_adapter_writes_stdout_and_stderr() {
+        let stdout = SharedBuffer::default();
+        let stderr = SharedBuffer::default();
+        let adapter = StdioAdapter::new(Box::new(stdout.clone()), Box::new(stderr.clone()));
+
+        adapter
+            .send(AccessOutbound {
+                conversation_id: ConversationId("conv-1".to_string()),
+                route: ReplyRoute::Stdio,
+                content: "hello".to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("stdout delivery should succeed");
+        adapter
+            .send(AccessOutbound {
+                conversation_id: ConversationId("conv-1".to_string()),
+                route: ReplyRoute::Stdio,
+                content: "oops".to_string(),
+                metadata: serde_json::json!({"stream": "stderr"}),
+            })
+            .await
+            .expect("stderr delivery should succeed");
+
+        assert_eq!(
+            stdout.as_string(),
+            "hello
+"
+        );
+        assert_eq!(
+            stderr.as_string(),
+            "oops
+"
+        );
     }
 
     #[test]

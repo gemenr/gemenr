@@ -27,10 +27,18 @@ pub mod tool_invoker;
 /// Tool specification types shared across providers and tools.
 pub mod tool_spec;
 
+/// Re-export of access adapter traits.
+pub use access::AccessAdapter;
+/// Re-export of access-layer errors.
+pub use access::AccessError;
 /// Re-export of normalized inbound access messages.
 pub use access::AccessInbound;
 /// Re-export of normalized outbound access messages.
 pub use access::AccessOutbound;
+/// Re-export of access router.
+pub use access::AccessRouter;
+/// Re-export of conversation driver trait.
+pub use access::ConversationDriver;
 /// Re-export of access-layer conversation identifiers.
 pub use access::ConversationId;
 /// Re-export of access-layer reply routes.

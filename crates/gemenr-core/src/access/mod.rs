@@ -1,6 +1,30 @@
-//! Shared access-layer message models.
+//! Shared access-layer message models and adapter contracts.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub mod adapter;
+pub mod router;
+
+pub use adapter::{AccessAdapter, ConversationDriver};
+pub use router::AccessRouter;
+
+/// Errors that can occur while routing or delivering access-layer messages.
+#[derive(Debug, Error)]
+pub enum AccessError {
+    /// The provided textual route string is invalid.
+    #[error("invalid access route: {0}")]
+    InvalidRoute(String),
+    /// No adapter is registered for the requested route.
+    #[error("no adapter registered for route: {0}")]
+    AdapterUnavailable(&'static str),
+    /// Driver execution failed.
+    #[error("conversation driver failed: {0}")]
+    Driver(String),
+    /// Adapter delivery failed.
+    #[error("access delivery failed: {0}")]
+    Delivery(String),
+}
 
 /// Stable identifier for one long-lived conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
