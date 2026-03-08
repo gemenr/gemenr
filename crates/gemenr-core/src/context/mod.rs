@@ -7,7 +7,10 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::message::ChatMessage;
-use crate::protocol::{EventEnvelope, EventKind, SessionId};
+use crate::model::ToolCall;
+use crate::protocol::{
+    AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolResultPayload,
+};
 
 pub mod soul;
 pub mod tape;
@@ -174,16 +177,53 @@ fn events_to_messages(events: &[EventEnvelope]) -> Vec<ChatMessage> {
                 .get("text")
                 .and_then(serde_json::Value::as_str)
                 .map(ChatMessage::assistant),
-            EventKind::ToolCompleted => tool_event_message(event, "result"),
+            EventKind::AssistantToolCalls => assistant_tool_calls_message(event),
+            EventKind::ToolCompleted => tool_event_message(event, false),
             EventKind::ToolFailed | EventKind::ToolDenied | EventKind::ToolTimedOut => {
-                tool_event_message(event, "error")
+                tool_event_message(event, true)
             }
             _ => None,
         })
         .collect()
 }
 
-fn tool_event_message(event: &EventEnvelope, status: &str) -> Option<ChatMessage> {
+fn assistant_tool_calls_message(event: &EventEnvelope) -> Option<ChatMessage> {
+    let payload =
+        serde_json::from_value::<AssistantToolCallsPayload>(event.payload.clone()).ok()?;
+    let tool_calls = payload
+        .tool_calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.call_id,
+            name: call.name,
+            arguments: serde_json::to_string(&call.arguments)
+                .expect("tool arguments should serialize"),
+        })
+        .collect::<Vec<_>>();
+
+    Some(
+        ChatMessage::assistant(payload.text.unwrap_or_default()).with_metadata(
+            "tool_calls",
+            serde_json::to_string(&tool_calls).expect("tool calls should serialize"),
+        ),
+    )
+}
+
+fn tool_event_message(event: &EventEnvelope, is_error: bool) -> Option<ChatMessage> {
+    let payload = serde_json::from_value::<ToolResultPayload>(event.payload.clone()).ok();
+    if let Some(payload) = payload {
+        let status = if payload.is_error { "error" } else { "ok" };
+        return Some(
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"{}\" status=\"{}\">{}</tool_result>",
+                payload.name, status, payload.content
+            ))
+            .with_metadata("tool_result_for", payload.call_id)
+            .with_metadata("tool_result_content", payload.content)
+            .with_metadata("is_error", payload.is_error.to_string()),
+        );
+    }
+
     let name = event
         .payload
         .get("name")
@@ -196,6 +236,7 @@ fn tool_event_message(event: &EventEnvelope, status: &str) -> Option<ChatMessage
         .or_else(|| event.payload.get("content"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
+    let status = if is_error { "error" } else { "result" };
 
     Some(ChatMessage::user(format!(
         "[Tool {status} from {name}]: {content}"
@@ -224,7 +265,10 @@ mod tests {
         estimated_tokens, events_to_messages,
     };
     use crate::message::ChatMessage;
-    use crate::protocol::{EventEnvelope, EventKind, SessionId};
+    use crate::protocol::{
+        AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolCallRecord,
+        ToolResultPayload,
+    };
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let timestamp = SystemTime::now()
@@ -609,6 +653,217 @@ mod tests {
         assert!(content.contains("# Preferences"));
 
         fs::remove_dir_all(workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_rebuilds_native_tool_metadata() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut first_manager, first_workspace) =
+            manager(session_id.clone(), Arc::clone(&tape_store));
+
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::AssistantToolCalls,
+                serde_json::to_value(AssistantToolCallsPayload {
+                    text: Some("working".to_string()),
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "call-1".to_string(),
+                        name: "shell".to_string(),
+                        arguments: json!({"command": "pwd"}),
+                    }],
+                })
+                .expect("assistant tool calls payload should serialize"),
+            ))
+            .await
+            .expect("append should succeed");
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ToolCompleted,
+                serde_json::to_value(ToolResultPayload {
+                    call_id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    content: "pwd output".to_string(),
+                    is_error: false,
+                })
+                .expect("tool result payload should serialize"),
+            ))
+            .await
+            .expect("append should succeed");
+
+        let (mut restored_manager, restored_workspace) = manager(session_id, tape_store);
+        restored_manager
+            .restore_from_tape()
+            .await
+            .expect("restore should succeed");
+
+        let ContextBuildResult::Ready(messages) =
+            restored_manager.build_context(&TokenBudget::default())
+        else {
+            panic!("expected ready context after restore");
+        };
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, crate::message::ChatRole::Assistant);
+        assert_eq!(messages[0].content, "working");
+        let tool_calls = serde_json::from_str::<Vec<crate::model::ToolCall>>(
+            messages[0]
+                .metadata
+                .get("tool_calls")
+                .expect("tool metadata should exist"),
+        )
+        .expect("tool metadata should deserialize");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call-1");
+        assert_eq!(tool_calls[0].name, "shell");
+
+        assert_eq!(messages[1].role, crate::message::ChatRole::User);
+        assert_eq!(
+            messages[1]
+                .metadata
+                .get("tool_result_for")
+                .map(String::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            messages[1].metadata.get("is_error").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            messages[1]
+                .metadata
+                .get("tool_result_content")
+                .map(String::as_str),
+            Some("pwd output")
+        );
+
+        fs::remove_dir_all(first_workspace).expect("temp directory should be removed");
+        fs::remove_dir_all(restored_workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_keeps_xml_tool_result_projection() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut first_manager, first_workspace) =
+            manager(session_id.clone(), Arc::clone(&tape_store));
+
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ToolCompleted,
+                serde_json::to_value(ToolResultPayload {
+                    call_id: "call-9".to_string(),
+                    name: "shell".to_string(),
+                    content: "done".to_string(),
+                    is_error: false,
+                })
+                .expect("tool result payload should serialize"),
+            ))
+            .await
+            .expect("append should succeed");
+
+        let (mut restored_manager, restored_workspace) = manager(session_id, tape_store);
+        restored_manager
+            .restore_from_tape()
+            .await
+            .expect("restore should succeed");
+
+        let ContextBuildResult::Ready(messages) =
+            restored_manager.build_context(&TokenBudget::default())
+        else {
+            panic!("expected ready context after restore");
+        };
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .contains(r#"<tool_result name="shell" status="ok">done</tool_result>"#)
+        );
+
+        fs::remove_dir_all(first_workspace).expect("temp directory should be removed");
+        fs::remove_dir_all(restored_workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn restore_from_tape_still_respects_last_anchor_boundary() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (mut first_manager, first_workspace) =
+            manager(session_id.clone(), Arc::clone(&tape_store));
+
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::AssistantToolCalls,
+                serde_json::to_value(AssistantToolCallsPayload {
+                    text: Some("before anchor".to_string()),
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "call-before".to_string(),
+                        name: "shell".to_string(),
+                        arguments: json!({"command": "ls"}),
+                    }],
+                })
+                .expect("assistant tool calls payload should serialize"),
+            ))
+            .await
+            .expect("append should succeed");
+        first_manager
+            .create_anchor("phase summary".to_string())
+            .await
+            .expect("anchor creation should succeed");
+        first_manager
+            .append(event(
+                &session_id,
+                EventKind::ToolCompleted,
+                serde_json::to_value(ToolResultPayload {
+                    call_id: "call-after".to_string(),
+                    name: "shell".to_string(),
+                    content: "post-anchor".to_string(),
+                    is_error: false,
+                })
+                .expect("tool result payload should serialize"),
+            ))
+            .await
+            .expect("append should succeed");
+
+        let (mut restored_manager, restored_workspace) = manager(session_id, tape_store);
+        restored_manager
+            .restore_from_tape()
+            .await
+            .expect("restore should succeed");
+
+        let ContextBuildResult::Ready(messages) =
+            restored_manager.build_context(&TokenBudget::default())
+        else {
+            panic!("expected ready context after restore");
+        };
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0],
+            ChatMessage::system(
+                "Summary of earlier context:
+phase summary"
+            )
+        );
+        assert!(
+            messages[1]
+                .metadata
+                .get("tool_result_for")
+                .is_some_and(|value| value == "call-after")
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("call-before"))
+        );
+
+        fs::remove_dir_all(first_workspace).expect("temp directory should be removed");
+        fs::remove_dir_all(restored_workspace).expect("temp directory should be removed");
     }
 
     #[test]

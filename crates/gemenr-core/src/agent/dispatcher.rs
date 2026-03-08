@@ -524,6 +524,61 @@ mod tests {
     }
 
     #[test]
+    fn native_round_trip_survives_tape_restore() {
+        let restored_messages = [
+            ChatMessage::assistant("working").with_metadata(
+                "tool_calls",
+                r#"[{"id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}]"#,
+            ),
+            ChatMessage::user(
+                r#"[Tool results]\n<tool_result name="shell" status="ok">done</tool_result>"#,
+            )
+            .with_metadata("tool_result_for", "call-1")
+            .with_metadata("tool_result_content", "done")
+            .with_metadata("is_error", "false"),
+        ];
+
+        assert_eq!(
+            restored_messages[0]
+                .metadata
+                .get("tool_calls")
+                .map(String::as_str),
+            Some(r#"[{"id":"call-1","name":"shell","arguments":"{\"command\":\"ls\"}"}]"#)
+        );
+        assert_eq!(
+            restored_messages[1]
+                .metadata
+                .get("tool_result_for")
+                .map(String::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            restored_messages[1]
+                .metadata
+                .get("tool_result_content")
+                .map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn xml_round_trip_survives_tape_restore() {
+        let restored_messages = [
+            ChatMessage::assistant("Need output"),
+            ChatMessage::user(
+                r#"[Tool results]\n<tool_result name="shell" status="ok">done</tool_result>"#,
+            ),
+        ];
+
+        assert_eq!(restored_messages[0], ChatMessage::assistant("Need output"));
+        assert!(
+            restored_messages[1]
+                .content
+                .contains(r#"<tool_result name="shell" status="ok">done</tool_result>"#)
+        );
+    }
+
+    #[test]
     fn native_round_trip_preserves_tool_chain() {
         let dispatcher = NativeToolDispatcher;
         let response = ChatResponse {

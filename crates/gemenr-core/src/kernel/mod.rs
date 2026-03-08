@@ -9,7 +9,10 @@ use crate::agent::dispatcher::{ConversationMessage, ToolDispatcher, ToolExecutio
 use crate::context::{ContextBuildResult, ContextManager, TokenBudget};
 use crate::message::ChatMessage;
 use crate::model::{ModelProvider, ModelRequest, ToolCall};
-use crate::protocol::{EventEnvelope, EventKind, SessionId, TurnId};
+use crate::protocol::{
+    AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolCallRecord,
+    ToolResultPayload, TurnId,
+};
 use crate::tool_invoker::{ExecutionPolicy, PolicyContext, ToolInvokeError, ToolInvoker};
 
 pub mod prompt;
@@ -225,12 +228,27 @@ impl AgentRuntime {
                     return Ok(final_text);
                 }
                 ActionDecision::InvokeTools(tool_calls) => {
-                    history.push(ConversationMessage::AssistantToolCalls {
-                        text,
+                    let assistant_tool_calls = AssistantToolCallsPayload {
+                        text: text.clone(),
                         tool_calls: tool_calls
                             .iter()
+                            .map(|call| ToolCallRecord {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            })
+                            .collect(),
+                    };
+                    self.append_assistant_tool_calls(turn_id, &assistant_tool_calls)
+                        .await?;
+
+                    history.push(ConversationMessage::AssistantToolCalls {
+                        text: assistant_tool_calls.text.clone(),
+                        tool_calls: assistant_tool_calls
+                            .tool_calls
+                            .iter()
                             .map(|call| ToolCall {
-                                id: call.id.clone(),
+                                id: call.call_id.clone(),
                                 name: call.name.clone(),
                                 arguments: serde_json::to_string(&call.arguments)
                                     .expect("tool arguments should serialize"),
@@ -254,6 +272,7 @@ impl AgentRuntime {
                                     self.emit_tool_event(
                                         turn_id,
                                         EventKind::ToolDenied,
+                                        &call.id,
                                         &call.name,
                                         &content,
                                     )
@@ -272,6 +291,7 @@ impl AgentRuntime {
                                 self.emit_tool_event(
                                     turn_id,
                                     EventKind::ToolDenied,
+                                    &call.id,
                                     &call.name,
                                     &content,
                                 )
@@ -286,8 +306,14 @@ impl AgentRuntime {
                             }
                         }
 
-                        self.emit_tool_event(turn_id, EventKind::ToolStarted, &call.name, "")
-                            .await?;
+                        self.emit_tool_event(
+                            turn_id,
+                            EventKind::ToolStarted,
+                            &call.id,
+                            &call.name,
+                            "",
+                        )
+                        .await?;
 
                         match self
                             .tools
@@ -305,8 +331,14 @@ impl AgentRuntime {
                                 } else {
                                     EventKind::ToolCompleted
                                 };
-                                self.emit_tool_event(turn_id, kind, &call.name, &result.content)
-                                    .await?;
+                                self.emit_tool_event(
+                                    turn_id,
+                                    kind,
+                                    &call.id,
+                                    &call.name,
+                                    &result.content,
+                                )
+                                .await?;
                                 results.push(ToolExecutionResult {
                                     call_id: call.id,
                                     name: call.name,
@@ -319,6 +351,7 @@ impl AgentRuntime {
                                     self.emit_tool_event(
                                         turn_id,
                                         EventKind::ToolFailed,
+                                        &call.id,
                                         &call.name,
                                         "Tool execution cancelled",
                                     )
@@ -328,7 +361,7 @@ impl AgentRuntime {
 
                                 let content = tool_error_message(&error, &call.name);
                                 let kind = tool_error_event_kind(&error);
-                                self.emit_tool_event(turn_id, kind, &call.name, &content)
+                                self.emit_tool_event(turn_id, kind, &call.id, &call.name, &content)
                                     .await?;
                                 results.push(ToolExecutionResult {
                                     call_id: call.id,
@@ -389,20 +422,59 @@ impl AgentRuntime {
         .await
     }
 
+    async fn append_assistant_tool_calls(
+        &mut self,
+        turn_id: &TurnId,
+        payload: &AssistantToolCallsPayload,
+    ) -> Result<(), AgentError> {
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            EventKind::AssistantToolCalls,
+            serde_json::to_value(payload).expect("assistant tool calls payload should serialize"),
+        ))
+        .await
+    }
+
     async fn emit_tool_event(
         &mut self,
         turn_id: &TurnId,
         kind: EventKind,
+        call_id: &str,
         tool_name: &str,
         content: &str,
     ) -> Result<(), AgentError> {
         let payload = match kind {
-            EventKind::ToolStarted => json!({"name": tool_name}),
-            EventKind::ToolCompleted => json!({"name": tool_name, "result": content}),
+            EventKind::ToolStarted => json!({"call_id": call_id, "name": tool_name}),
             EventKind::ToolFailed | EventKind::ToolDenied | EventKind::ToolTimedOut => {
-                json!({"name": tool_name, "error": content})
+                let mut payload = serde_json::to_value(ToolResultPayload {
+                    call_id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    content: content.to_string(),
+                    is_error: true,
+                })
+                .expect("tool result payload should serialize");
+                payload
+                    .as_object_mut()
+                    .expect("tool result payload should be an object")
+                    .insert("error".to_string(), json!(content));
+                payload
             }
-            _ => json!({"name": tool_name, "content": content}),
+            EventKind::ToolCompleted => {
+                let mut payload = serde_json::to_value(ToolResultPayload {
+                    call_id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    content: content.to_string(),
+                    is_error: false,
+                })
+                .expect("tool result payload should serialize");
+                payload
+                    .as_object_mut()
+                    .expect("tool result payload should be an object")
+                    .insert("result".to_string(), json!(content));
+                payload
+            }
+            _ => json!({"call_id": call_id, "name": tool_name, "content": content}),
         };
 
         self.append_event(EventEnvelope::new(
@@ -1194,6 +1266,135 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::ToolFailed))
         );
+    }
+
+    #[tokio::test]
+    async fn run_turn_persists_assistant_tool_calls_to_tape() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: Some("working".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_output(
+                "echo",
+                Ok(ToolInvokeResult {
+                    content: "hello".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools,
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        runtime
+            .run_turn("say hello")
+            .await
+            .expect("turn should succeed");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+        let assistant_event = events
+            .iter()
+            .find(|event| matches!(event.kind, EventKind::AssistantToolCalls))
+            .expect("assistant tool calls event should exist");
+        let payload = serde_json::from_value::<crate::protocol::AssistantToolCallsPayload>(
+            assistant_event.payload.clone(),
+        )
+        .expect("assistant tool calls payload should deserialize");
+
+        assert_eq!(payload.text.as_deref(), Some("working"));
+        assert_eq!(payload.tool_calls.len(), 1);
+        assert_eq!(payload.tool_calls[0].call_id, "call-1");
+        assert_eq!(payload.tool_calls[0].name, "echo");
+        assert_eq!(payload.tool_calls[0].arguments, json!({"value": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn tool_result_events_include_call_id_for_round_trip() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_output(
+                "echo",
+                Ok(ToolInvokeResult {
+                    content: "hello".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(
+            model,
+            tools,
+            tape_store.clone(),
+            Box::new(NativeToolDispatcher),
+        );
+
+        runtime
+            .run_turn("say hello")
+            .await
+            .expect("turn should succeed");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+        let tool_event = events
+            .iter()
+            .find(|event| matches!(event.kind, EventKind::ToolCompleted))
+            .expect("tool completed event should exist");
+        let payload = serde_json::from_value::<crate::protocol::ToolResultPayload>(
+            tool_event.payload.clone(),
+        )
+        .expect("tool result payload should deserialize");
+
+        assert_eq!(payload.call_id, "call-1");
+        assert_eq!(payload.name, "echo");
+        assert_eq!(payload.content, "hello");
+        assert!(!payload.is_error);
     }
 
     #[tokio::test]

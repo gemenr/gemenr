@@ -65,6 +65,8 @@ pub enum EventKind {
     UserInput,
     /// Model response received.
     ModelResponse,
+    /// Assistant response containing structured tool calls.
+    AssistantToolCalls,
     /// Tool execution started.
     ToolStarted,
     /// Tool execution completed successfully.
@@ -124,6 +126,39 @@ impl EventEnvelope {
             payload,
         }
     }
+}
+
+/// Persisted representation of a single structured tool call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// Stable provider-issued tool call identifier.
+    pub call_id: String,
+    /// Tool name requested by the assistant.
+    pub name: String,
+    /// Parsed JSON arguments passed to the tool.
+    pub arguments: Value,
+}
+
+/// Persisted assistant response containing text and structured tool calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantToolCallsPayload {
+    /// Optional assistant text emitted before or alongside tool calls.
+    pub text: Option<String>,
+    /// Structured tool calls emitted in the response.
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+/// Persisted tool execution result correlated to a tool call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResultPayload {
+    /// Identifier of the originating tool call.
+    pub call_id: String,
+    /// Tool name that produced the result.
+    pub name: String,
+    /// Tool output content returned to the model.
+    pub content: String,
+    /// Whether the result represents a failure.
+    pub is_error: bool,
 }
 
 /// Hint for session routing — used by the runtime to find or create the right session.
@@ -189,7 +224,8 @@ pub enum Op {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventEnvelope, EventId, EventKind, MessagePart, Op, SessionHint, SessionId, TurnId,
+        AssistantToolCallsPayload, EventEnvelope, EventId, EventKind, MessagePart, Op, SessionHint,
+        SessionId, ToolCallRecord, ToolResultPayload, TurnId,
     };
     use serde_json::json;
 
@@ -325,5 +361,48 @@ mod tests {
             serde_json::to_value(EventKind::ToolTimedOut).expect("tool timed out should serialize"),
             json!("tool_timed_out")
         );
+    }
+
+    #[test]
+    fn event_kind_includes_assistant_tool_calls() {
+        assert_eq!(
+            serde_json::to_value(EventKind::AssistantToolCalls)
+                .expect("assistant tool calls should serialize"),
+            json!("assistant_tool_calls")
+        );
+    }
+
+    #[test]
+    fn assistant_tool_calls_payload_round_trips() {
+        let payload = AssistantToolCallsPayload {
+            text: Some("working".to_string()),
+            tool_calls: vec![ToolCallRecord {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({"command": "pwd"}),
+            }],
+        };
+
+        let value = serde_json::to_value(&payload).expect("payload should serialize");
+        let decoded: AssistantToolCallsPayload =
+            serde_json::from_value(value).expect("payload should deserialize");
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn tool_result_payload_round_trips() {
+        let payload = ToolResultPayload {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            content: "done".to_string(),
+            is_error: false,
+        };
+
+        let value = serde_json::to_value(&payload).expect("payload should serialize");
+        let decoded: ToolResultPayload =
+            serde_json::from_value(value).expect("payload should deserialize");
+
+        assert_eq!(decoded, payload);
     }
 }

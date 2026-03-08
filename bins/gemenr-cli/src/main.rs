@@ -241,6 +241,19 @@ impl EventSink for StdioEventSink {
                     eprintln!("[model_response] {text}");
                 }
             }
+            EventKind::AssistantToolCalls => {
+                let text = event
+                    .payload
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let tool_count = event
+                    .payload
+                    .get("tool_calls")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, Vec::len);
+                eprintln!("[assistant_tool_calls] {tool_count} tool(s): {text}");
+            }
             EventKind::ToolStarted => {
                 let name = event
                     .payload

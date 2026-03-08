@@ -457,7 +457,11 @@ fn anthropic_blocks_from_metadata(message: &ChatMessage) -> Option<Vec<RequestCo
 
     Some(vec![RequestContentBlock::ToolResult {
         tool_use_id: tool_use_id.clone(),
-        content: message.content.clone(),
+        content: message
+            .metadata
+            .get("tool_result_content")
+            .cloned()
+            .unwrap_or_else(|| message.content.clone()),
         is_error: message
             .metadata
             .get("is_error")
