@@ -8,6 +8,8 @@ pub mod error;
 pub mod message;
 /// Model provider abstractions and request/response types.
 pub mod model;
+/// Runtime protocol types.
+pub mod protocol;
 
 /// Re-export of the application configuration type.
 pub use config::Config;
@@ -33,3 +35,19 @@ pub use model::ModelProvider;
 pub use model::ModelRequest;
 /// Re-export of model completion responses.
 pub use model::ModelResponse;
+/// Re-export of unified event envelopes.
+pub use protocol::EventEnvelope;
+/// Re-export of event identifiers.
+pub use protocol::EventId;
+/// Re-export of event kind categories.
+pub use protocol::EventKind;
+/// Re-export of structured message parts.
+pub use protocol::MessagePart;
+/// Re-export of runtime input operations.
+pub use protocol::Op;
+/// Re-export of session routing hints.
+pub use protocol::SessionHint;
+/// Re-export of session identifiers.
+pub use protocol::SessionId;
+/// Re-export of turn identifiers.
+pub use protocol::TurnId;
