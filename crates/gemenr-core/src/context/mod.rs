@@ -156,6 +156,13 @@ impl ContextManager {
         self.soul.read().await.content().to_string()
     }
 
+    /// Return the latest SOUL.md content, reloading it from disk when needed.
+    pub async fn latest_soul_content(&self) -> Result<String, SoulError> {
+        let mut soul = self.soul.write().await;
+        soul.reload_if_changed()?;
+        Ok(soul.content().to_string())
+    }
+
     /// Return the session identifier.
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
@@ -652,6 +659,26 @@ mod tests {
         assert!(content.contains("# Identity"));
         assert!(content.contains("# Preferences"));
 
+        fs::remove_dir_all(workspace).expect("temp directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn latest_soul_content_observes_external_edit() {
+        let session_id = SessionId::new();
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let (manager, workspace) = manager(session_id, tape_store);
+        let soul_path = workspace.join("SOUL.md");
+        let updated_content = "# Identity\nexternal update\n\n# Preferences\nprefs\n\n# Experiences\nexp\n\n# Notes\nnotes\n";
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&soul_path, updated_content).expect("SOUL.md should be rewritten");
+
+        let content = manager
+            .latest_soul_content()
+            .await
+            .expect("latest soul content should reload");
+
+        assert_eq!(content, updated_content);
         fs::remove_dir_all(workspace).expect("temp directory should be removed");
     }
 

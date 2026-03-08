@@ -42,6 +42,10 @@ pub enum AgentError {
     #[error(transparent)]
     Context(#[from] crate::context::TapeError),
 
+    /// SOUL.md loading error.
+    #[error(transparent)]
+    Soul(#[from] crate::context::SoulError),
+
     /// Tool execution error.
     #[error(transparent)]
     Tool(#[from] crate::tool_invoker::ToolInvokeError),
@@ -235,8 +239,10 @@ impl AgentRuntime {
 
             provider_messages.extend(self.tool_dispatcher.to_provider_messages(&history));
 
+            let soul_content = self.context.latest_soul_content().await?;
+
             let request = self.composer.build_prompt(
-                &self.context.soul_content().await,
+                &soul_content,
                 &self.system_prompt,
                 provider_messages,
                 &self.tools.list_specs(),
@@ -709,6 +715,7 @@ fn turn_failure_category(error: &AgentError) -> &'static str {
     match error {
         AgentError::Model(_) => "model",
         AgentError::Context(_) => "context",
+        AgentError::Soul(_) => "soul",
         AgentError::Tool(_) => "tool",
         AgentError::Cancelled => "cancelled",
         AgentError::TurnLimitExceeded => "turn_limit_exceeded",

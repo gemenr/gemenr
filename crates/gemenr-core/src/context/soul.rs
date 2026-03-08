@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use tracing::debug;
 
@@ -15,6 +16,8 @@ pub struct SoulManager {
     path: PathBuf,
     /// Current content of `SOUL.md` cached in memory.
     content: String,
+    /// Last observed file state for change detection.
+    file_state: SoulFileState,
 }
 
 impl SoulManager {
@@ -25,21 +28,44 @@ impl SoulManager {
         fs::create_dir_all(workspace)?;
 
         let path = workspace.join("SOUL.md");
-        let content = if path.exists() {
-            fs::read_to_string(&path)?
-        } else {
-            fs::write(&path, DEFAULT_SOUL_TEMPLATE)?;
-            DEFAULT_SOUL_TEMPLATE.to_string()
-        };
+        let content = read_or_create_default(&path)?;
+        let file_state = SoulFileState::read(&path)?;
 
         debug!(path = %path.display(), "loaded SOUL.md");
-        Ok(Self { path, content })
+        Ok(Self {
+            path,
+            content,
+            file_state,
+        })
     }
 
     /// Return the current `SOUL.md` content.
     #[must_use]
     pub fn content(&self) -> &str {
         &self.content
+    }
+
+    /// Reload `SOUL.md` from disk when the file changed.
+    ///
+    /// Returns `true` when the cached content was refreshed.
+    pub fn reload_if_changed(&mut self) -> Result<bool, SoulError> {
+        match SoulFileState::read_if_exists(&self.path)? {
+            Some(file_state) if file_state == self.file_state => Ok(false),
+            _ => {
+                self.load_latest()?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Load the latest `SOUL.md` content from disk into memory.
+    ///
+    /// If the file was removed externally, the default template is recreated.
+    pub fn load_latest(&mut self) -> Result<(), SoulError> {
+        self.content = read_or_create_default(&self.path)?;
+        self.file_state = SoulFileState::read(&self.path)?;
+        debug!(path = %self.path.display(), "reloaded SOUL.md");
+        Ok(())
     }
 
     /// Replace the content of a section.
@@ -84,9 +110,35 @@ impl SoulManager {
     }
 
     /// Flush the current content to disk.
-    fn flush(&self) -> Result<(), SoulError> {
+    fn flush(&mut self) -> Result<(), SoulError> {
         fs::write(&self.path, &self.content)?;
+        self.file_state = SoulFileState::read(&self.path)?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SoulFileState {
+    modified_at: SystemTime,
+    size_bytes: u64,
+}
+
+impl SoulFileState {
+    fn read(path: &Path) -> Result<Self, SoulError> {
+        let metadata = fs::metadata(path)?;
+
+        Ok(Self {
+            modified_at: metadata.modified()?,
+            size_bytes: metadata.len(),
+        })
+    }
+
+    fn read_if_exists(path: &Path) -> Result<Option<Self>, SoulError> {
+        if path.exists() {
+            Self::read(path).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -135,10 +187,21 @@ fn format_section_body(body: &str, has_next_section: bool) -> String {
     }
 }
 
+fn read_or_create_default(path: &Path) -> Result<String, SoulError> {
+    if path.exists() {
+        Ok(fs::read_to_string(path)?)
+    } else {
+        fs::write(path, DEFAULT_SOUL_TEMPLATE)?;
+        Ok(DEFAULT_SOUL_TEMPLATE.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
     use std::fs;
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{DEFAULT_SOUL_TEMPLATE, SoulError, SoulManager};
@@ -239,6 +302,40 @@ mod tests {
         let on_disk = fs::read_to_string(&soul_path).expect("SOUL.md should be readable");
         assert_eq!(on_disk, manager.content());
 
+        fs::remove_dir_all(directory).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn reload_if_changed_observes_external_file_edit() {
+        let directory = temp_dir("reload-external-edit");
+        let soul_path = directory.join("SOUL.md");
+        let mut manager = SoulManager::load(&directory).expect("SOUL.md should load");
+        let updated_content = "# Identity\nupdated identity details\n\n# Preferences\nprefs\n\n# Experiences\nexp\n\n# Notes\nnotes\n";
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&soul_path, updated_content).expect("SOUL.md should be rewritten");
+
+        let reloaded = manager
+            .reload_if_changed()
+            .expect("reload should observe updated content");
+
+        assert!(reloaded);
+        assert_eq!(manager.content(), updated_content);
+        fs::remove_dir_all(directory).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn reload_if_changed_is_noop_when_file_unchanged() {
+        let directory = temp_dir("reload-noop");
+        let mut manager = SoulManager::load(&directory).expect("SOUL.md should load");
+        let original = manager.content().to_string();
+
+        let reloaded = manager
+            .reload_if_changed()
+            .expect("reload should succeed without refreshing");
+
+        assert!(!reloaded);
+        assert_eq!(manager.content(), original);
         fs::remove_dir_all(directory).expect("temp directory should be removed");
     }
 }
