@@ -283,8 +283,9 @@ mod tests {
             .expect("system time should be after unix epoch")
             .as_nanos();
         let directory = env::temp_dir().join(format!(
-            "gemenr-context-{prefix}-{}-{timestamp}",
-            std::process::id()
+            "gemenr-context-{prefix}-{}-{timestamp}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
         ));
 
         fs::create_dir_all(&directory).expect("temp directory should be created");

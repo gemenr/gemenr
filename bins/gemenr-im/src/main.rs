@@ -10,7 +10,7 @@ use gemenr_core::{
     RuntimeBuilder, RuntimeManager, SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{RuleBasedPolicyEvaluator, ToolPlane, builtin};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 mod lark;
@@ -48,10 +48,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let manager = Arc::new(Mutex::new(RuntimeManager::new(
+    let manager = Arc::new(RuntimeManager::new(
         builder,
         DEFAULT_SYSTEM_PROMPT.to_string(),
-    )));
+    ));
     let driver = Arc::new(RuntimeManagerDriver::new(manager));
     let adapter = Arc::new(LarkAdapter::new(lark_config));
     let service = LarkService::new(adapter, driver.clone(), driver)
@@ -73,11 +73,11 @@ fn init_tracing() {
 }
 
 struct RuntimeManagerDriver {
-    manager: Arc<Mutex<RuntimeManager>>,
+    manager: Arc<RuntimeManager>,
 }
 
 impl RuntimeManagerDriver {
-    fn new(manager: Arc<Mutex<RuntimeManager>>) -> Self {
+    fn new(manager: Arc<RuntimeManager>) -> Self {
         Self { manager }
     }
 }
@@ -86,8 +86,6 @@ impl RuntimeManagerDriver {
 impl ConversationDriver for RuntimeManagerDriver {
     async fn handle(&self, inbound: AccessInbound) -> Result<AccessOutbound, AccessError> {
         self.manager
-            .lock()
-            .await
             .dispatch(inbound)
             .await
             .map_err(|error| AccessError::Driver(error.to_string()))
@@ -98,9 +96,8 @@ impl ConversationDriver for RuntimeManagerDriver {
 impl IdleCollector for RuntimeManagerDriver {
     async fn hibernate_idle(&self, max_idle: Duration) -> usize {
         self.manager
-            .lock()
-            .await
             .hibernate_idle(max_idle)
+            .await
             .map(|ids| ids.len())
             .unwrap_or(0)
     }

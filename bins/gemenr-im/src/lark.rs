@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -34,12 +34,13 @@ pub struct CachedTenantToken {
 }
 
 /// Long-connection adapter for Lark / Feishu conversations.
+#[derive(Clone)]
 pub struct LarkAdapter {
     http: Client,
     config: LarkConfig,
-    tenant_token: RwLock<Option<CachedTenantToken>>,
-    seen_message_ids: Mutex<HashSet<String>>,
-    debounce: Mutex<HashMap<String, PendingConversation>>,
+    tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
+    seen_message_ids: Arc<Mutex<HashSet<String>>>,
+    debounce: Arc<Mutex<HashMap<String, PendingConversation>>>,
 }
 
 /// Errors produced by the Lark transport.
@@ -157,9 +158,9 @@ impl LarkAdapter {
         Self {
             http: Client::new(),
             config,
-            tenant_token: RwLock::new(None),
-            seen_message_ids: Mutex::new(HashSet::new()),
-            debounce: Mutex::new(HashMap::new()),
+            tenant_token: Arc::new(RwLock::new(None)),
+            seen_message_ids: Arc::new(Mutex::new(HashSet::new())),
+            debounce: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -172,30 +173,28 @@ impl LarkAdapter {
     }
 
     /// Run one long-connection session until the connection closes.
-    pub async fn run(
-        &self,
-        driver: std::sync::Arc<dyn ConversationDriver>,
-    ) -> Result<(), LarkError> {
+    pub async fn run(&self, driver: Arc<dyn ConversationDriver>) -> Result<(), LarkError> {
         let mut stream = self.connect_event_stream().await?;
+        let mut dispatches = tokio::task::JoinSet::new();
 
         while let Some(frame) = stream.next().await {
-            match frame.map_err(|error| LarkError::WebSocket(Box::new(error)))? {
-                Message::Text(text) => {
-                    self.handle_event_text(text.as_ref(), driver.clone())
-                        .await?;
-                }
+            let ready = match frame.map_err(|error| LarkError::WebSocket(Box::new(error)))? {
+                Message::Text(text) => self.handle_event_text(text.as_ref())?,
                 Message::Binary(bytes) => {
                     let text = String::from_utf8(bytes.to_vec())
                         .map_err(|error| LarkError::Protocol(error.to_string()))?;
-                    self.handle_event_text(&text, driver.clone()).await?;
+                    self.handle_event_text(&text)?
                 }
                 Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-            }
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Vec::new(),
+            };
+            self.spawn_dispatches(&mut dispatches, driver.clone(), ready);
+            self.propagate_completed_dispatches(&mut dispatches)?;
         }
 
-        for inbound in self.flush_all_debounced() {
-            self.dispatch_inbound(driver.clone(), inbound).await?;
+        self.spawn_dispatches(&mut dispatches, driver, self.flush_all_debounced());
+        while let Some(result) = dispatches.join_next().await {
+            Self::propagate_dispatch_result(result)?;
         }
 
         Ok(())
@@ -247,22 +246,14 @@ impl LarkAdapter {
         Ok(stream)
     }
 
-    async fn handle_event_text(
-        &self,
-        text: &str,
-        driver: std::sync::Arc<dyn ConversationDriver>,
-    ) -> Result<(), LarkError> {
+    fn handle_event_text(&self, text: &str) -> Result<Vec<AccessInbound>, LarkError> {
         let envelope: LarkEnvelope =
             serde_json::from_str(text).map_err(|error| LarkError::Protocol(error.to_string()))?;
         let Some(inbound) = self.normalize_inbound(envelope)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
-        for ready in self.push_debounced(inbound) {
-            self.dispatch_inbound(driver.clone(), ready).await?;
-        }
-
-        Ok(())
+        Ok(self.push_debounced(inbound))
     }
 
     #[allow(clippy::result_large_err)]
@@ -376,7 +367,7 @@ impl LarkAdapter {
 
     async fn dispatch_inbound(
         &self,
-        driver: std::sync::Arc<dyn ConversationDriver>,
+        driver: Arc<dyn ConversationDriver>,
         inbound: AccessInbound,
     ) -> Result<(), LarkError> {
         let outbound = driver
@@ -386,6 +377,38 @@ impl LarkAdapter {
         self.send(outbound)
             .await
             .map_err(|error| LarkError::Driver(error.to_string()))
+    }
+
+    fn spawn_dispatches(
+        &self,
+        dispatches: &mut tokio::task::JoinSet<Result<(), LarkError>>,
+        driver: Arc<dyn ConversationDriver>,
+        ready: Vec<AccessInbound>,
+    ) {
+        for inbound in ready {
+            let adapter = self.clone();
+            let driver = driver.clone();
+            dispatches.spawn(async move { adapter.dispatch_inbound(driver, inbound).await });
+        }
+    }
+
+    fn propagate_completed_dispatches(
+        &self,
+        dispatches: &mut tokio::task::JoinSet<Result<(), LarkError>>,
+    ) -> Result<(), LarkError> {
+        while let Some(result) = dispatches.try_join_next() {
+            Self::propagate_dispatch_result(result)?;
+        }
+        Ok(())
+    }
+
+    fn propagate_dispatch_result(
+        result: Result<Result<(), LarkError>, tokio::task::JoinError>,
+    ) -> Result<(), LarkError> {
+        match result {
+            Ok(inner) => inner,
+            Err(error) => Err(LarkError::Driver(format!("dispatch task failed: {error}"))),
+        }
     }
 }
 
@@ -502,7 +525,8 @@ impl crate::service::LarkRunLoop for LarkAdapter {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
     use gemenr_core::{
@@ -510,6 +534,8 @@ mod tests {
         ConversationId, ReplyRoute,
     };
     use serde_json::json;
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     use super::{CachedTenantToken, LarkAdapter, LarkConfig};
 
@@ -603,21 +629,22 @@ mod tests {
     }
 
     #[test]
-    fn debounce_merges_messages_in_same_conversation() {
+    fn debounced_messages_preserve_route_and_conversation_identity() {
         let adapter = adapter();
+        let route = LarkAdapter::route("chat-1", Some("thread-1".to_string()));
         let first = AccessInbound {
-            conversation_id: ConversationId("conv-1".to_string()),
+            conversation_id: ConversationId("thread-1".to_string()),
             user_id: "user".to_string(),
             text: "hello".to_string(),
-            route: stdio_route(),
-            metadata: json!({}),
+            route: route.clone(),
+            metadata: json!({"message_id": "om-1"}),
         };
         let second = AccessInbound {
-            conversation_id: ConversationId("conv-1".to_string()),
+            conversation_id: ConversationId("thread-1".to_string()),
             user_id: "user".to_string(),
             text: "world".to_string(),
-            route: stdio_route(),
-            metadata: json!({}),
+            route: route.clone(),
+            metadata: json!({"message_id": "om-2"}),
         };
 
         assert!(adapter.push_debounced(first).is_empty());
@@ -625,7 +652,130 @@ mod tests {
         let flushed = adapter.flush_all_debounced();
 
         assert_eq!(flushed.len(), 1);
+        assert_eq!(
+            flushed[0].conversation_id,
+            ConversationId("thread-1".to_string())
+        );
+        assert_eq!(flushed[0].route, route);
         assert_eq!(flushed[0].text, "hello\nworld");
+    }
+
+    struct StepSignal {
+        started: AtomicBool,
+        notify: Notify,
+    }
+
+    impl StepSignal {
+        fn new() -> Self {
+            Self {
+                started: AtomicBool::new(false),
+                notify: Notify::new(),
+            }
+        }
+
+        fn mark_started(&self) {
+            self.started.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        async fn wait_started(&self) {
+            if self.started.load(Ordering::SeqCst) {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    struct SlowDriver {
+        call_count: AtomicUsize,
+        first_started: StepSignal,
+        second_started: StepSignal,
+        first_gate: Notify,
+    }
+
+    impl SlowDriver {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                first_started: StepSignal::new(),
+                second_started: StepSignal::new(),
+                first_gate: Notify::new(),
+            }
+        }
+
+        async fn wait_first_started(&self) {
+            self.first_started.wait_started().await;
+        }
+
+        async fn wait_second_started(&self) {
+            self.second_started.wait_started().await;
+        }
+
+        fn release_first(&self) {
+            self.first_gate.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl ConversationDriver for SlowDriver {
+        async fn handle(&self, inbound: AccessInbound) -> Result<AccessOutbound, AccessError> {
+            match self.call_count.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.first_started.mark_started();
+                    self.first_gate.notified().await;
+                }
+                _ => self.second_started.mark_started(),
+            }
+
+            Ok(AccessOutbound {
+                conversation_id: inbound.conversation_id,
+                route: inbound.route,
+                content: inbound.text,
+                metadata: json!({}),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn lark_intake_does_not_block_on_slow_turn() {
+        let adapter = adapter();
+        let driver = Arc::new(SlowDriver::new());
+        let mut dispatches = tokio::task::JoinSet::new();
+
+        adapter.spawn_dispatches(
+            &mut dispatches,
+            driver.clone(),
+            vec![AccessInbound {
+                conversation_id: ConversationId("conv-1".to_string()),
+                user_id: "user".to_string(),
+                text: "first".to_string(),
+                route: stdio_route(),
+                metadata: json!({}),
+            }],
+        );
+        timeout(Duration::from_secs(1), driver.wait_first_started())
+            .await
+            .expect("first turn should start");
+
+        adapter.spawn_dispatches(
+            &mut dispatches,
+            driver.clone(),
+            vec![AccessInbound {
+                conversation_id: ConversationId("conv-2".to_string()),
+                user_id: "user".to_string(),
+                text: "second".to_string(),
+                route: stdio_route(),
+                metadata: json!({}),
+            }],
+        );
+        timeout(Duration::from_secs(1), driver.wait_second_started())
+            .await
+            .expect("second turn should start without waiting for the first");
+
+        driver.release_first();
+        while let Some(result) = dispatches.join_next().await {
+            let _ = result;
+        }
     }
 
     fn adapter() -> LarkAdapter {

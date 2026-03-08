@@ -38,6 +38,21 @@ pub struct LarkService<A, C> {
     idle_timeout: Duration,
     reconnect_base_delay: Duration,
     reconnect_max_delay: Duration,
+    clock: Arc<dyn ServiceClock>,
+}
+
+#[async_trait]
+trait ServiceClock: Send + Sync {
+    async fn sleep(&self, duration: Duration);
+}
+
+struct SystemClock;
+
+#[async_trait]
+impl ServiceClock for SystemClock {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 impl<A, C> LarkService<A, C>
@@ -55,6 +70,7 @@ where
             idle_timeout: Duration::from_secs(600),
             reconnect_base_delay: Duration::from_secs(1),
             reconnect_max_delay: Duration::from_secs(30),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -95,11 +111,17 @@ where
                     if max_attempts.is_some_and(|limit| attempt >= limit) {
                         return Err(ServiceError::Adapter(error.to_string()));
                     }
-                    tokio::time::sleep(backoff).await;
+                    self.clock.sleep(backoff).await;
                     backoff = next_backoff(backoff, self.reconnect_max_delay);
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Arc<dyn ServiceClock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -109,8 +131,8 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -119,7 +141,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{IdleCollector, LarkRunLoop, LarkService, ServiceError};
+    use super::{IdleCollector, LarkRunLoop, LarkService, ServiceClock, ServiceError};
     use crate::lark::LarkError;
 
     struct MockAdapter {
@@ -164,8 +186,59 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingClock {
+        sleeps: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl ServiceClock for RecordingClock {
+        async fn sleep(&self, duration: Duration) {
+            self.sleeps
+                .lock()
+                .expect("sleep log should not be poisoned")
+                .push(duration);
+        }
+    }
+
+    impl RecordingClock {
+        fn slept(&self) -> Vec<Duration> {
+            self.sleeps
+                .lock()
+                .expect("sleep log should not be poisoned")
+                .clone()
+        }
+    }
+
     #[tokio::test]
-    async fn reconnects_with_backoff_instead_of_busy_loop() {
+    async fn reconnect_backoff_uses_clock_seam() {
+        let adapter = Arc::new(MockAdapter {
+            failures_before_success: AtomicUsize::new(3),
+            attempts: AtomicUsize::new(0),
+        });
+        let collector = Arc::new(MockCollector {
+            calls: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(RecordingClock::default());
+        let service = LarkService::new(adapter.clone(), Arc::new(EchoDriver), collector)
+            .reconnect_backoff(Duration::from_millis(1), Duration::from_millis(4))
+            .with_clock(clock.clone());
+
+        let error = service
+            .run_attempts(Some(3))
+            .await
+            .expect_err("service should stop after configured attempts");
+
+        assert!(matches!(error, ServiceError::Adapter(_)));
+        assert_eq!(adapter.attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            clock.slept(),
+            vec![Duration::from_millis(1), Duration::from_millis(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_collection_uses_clock_seam() {
         let adapter = Arc::new(MockAdapter {
             failures_before_success: AtomicUsize::new(2),
             attempts: AtomicUsize::new(0),
@@ -173,34 +246,16 @@ mod tests {
         let collector = Arc::new(MockCollector {
             calls: AtomicUsize::new(0),
         });
-        let service = LarkService::new(adapter.clone(), Arc::new(EchoDriver), collector)
-            .reconnect_backoff(Duration::from_millis(1), Duration::from_millis(4));
-
-        let error = service
-            .run_attempts(Some(2))
-            .await
-            .expect_err("service should stop after configured attempts");
-
-        assert!(matches!(error, ServiceError::Adapter(_)));
-        assert_eq!(adapter.attempts.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn triggers_idle_collection_on_each_loop() {
-        let adapter = Arc::new(MockAdapter {
-            failures_before_success: AtomicUsize::new(1),
-            attempts: AtomicUsize::new(0),
-        });
-        let collector = Arc::new(MockCollector {
-            calls: AtomicUsize::new(0),
-        });
+        let clock = Arc::new(RecordingClock::default());
         let service = LarkService::new(adapter, Arc::new(EchoDriver), collector.clone())
             .idle_timeout(Duration::from_secs(30))
-            .reconnect_backoff(Duration::from_millis(1), Duration::from_millis(2));
+            .reconnect_backoff(Duration::from_millis(1), Duration::from_millis(2))
+            .with_clock(clock.clone());
 
-        let _ = service.run_attempts(Some(1)).await;
+        let _ = service.run_attempts(Some(2)).await;
 
-        assert_eq!(collector.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(collector.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(clock.slept(), vec![Duration::from_millis(1)]);
     }
 
     #[test]
