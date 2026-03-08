@@ -43,6 +43,12 @@ pub use config::ProviderConfig;
 pub use config::ProviderType;
 /// Re-export of anchor checkpoint entries.
 pub use context::AnchorEntry;
+/// Re-export of anchor identifiers.
+pub use context::AnchorId;
+/// Re-export of context build outcomes.
+pub use context::ContextBuildResult;
+/// Re-export of the session context manager.
+pub use context::ContextManager;
 /// Re-export of the in-memory tape store implementation.
 pub use context::InMemoryTapeStore;
 /// Re-export of the JSONL tape store implementation.
@@ -55,6 +61,8 @@ pub use context::SoulManager;
 pub use context::TapeError;
 /// Re-export of the tape store abstraction.
 pub use context::TapeStore;
+/// Re-export of token budget configuration.
+pub use context::TokenBudget;
 /// Re-export of model interaction errors.
 pub use error::ModelError;
 /// Re-export of the core chat message type.
