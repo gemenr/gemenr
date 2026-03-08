@@ -1,120 +1,208 @@
-# AGENTS.md — Gemenr Engineering Protocol
+# AGENTS.md — Gemenr Engineering Guide
 
 This file defines the working protocol for coding agents in this repository.
 Scope: entire repository.
 
-## 1) Project Overview
+## 1) Project Snapshot
 
-Gemenr is a tool-calling agent runtime built in Rust. It enables an LLM-based agent
-to autonomously plan, select tools, and execute multi-step tasks.
+Gemenr is now a **multi-entry Rust workspace** for running an LLM agent in three modes:
 
-Key characteristics:
+- **interactive CLI** (`gemenr-cli chat` / `gemenr-cli run`)
+- **scheduled automation** (`gemenr-cli daemon`)
+- **IM / Lark bot service** (`gemenr-im`)
 
-- **Minimal kernel** — agent loop, context management, and event protocol live in `gemenr-core`; tools, policies, and platform integrations are external
-- **Non-streaming model interface** — `ModelProvider::complete()` returns a full response; providers may use streaming APIs internally but accumulate before returning
-- **Per-task isolation** — each task/conversation gets an independent `AgentRuntime` with its own context; shared resources (`ModelProvider`, `ToolPlane`) are injected via `Arc`
-- **Tape + anchor context** — append-only event log with anchor checkpoints for stage boundaries and automatic summarization
-- **SOUL.md continuous learning** — agent-editable markdown file for identity, preferences, and accumulated experience
+The core architecture is already beyond the earlier “minimal kernel only” phase:
 
-## 2) Crate Structure
+- `gemenr-core` contains the runtime kernel, context/tape persistence, model abstractions, access-layer types, and runtime/session management
+- `gemenr-tools` contains the actual tool registry, built-in tools, policy evaluation, sandbox adapters, and MCP client code
+- `gemenr-cli` and `gemenr-im` are thin composition layers that assemble providers, tools, persistence, and transport adapters
 
-```
+## 2) Current Workspace Layout
+
+```text
 gemenr/
-├── Cargo.toml              # workspace root
-├── crates/
-│   └── gemenr-core/        # message types, ModelProvider trait, provider impls, config
+├── Cargo.toml
+├── gemenr.toml(.example)       # runtime config
 ├── bins/
-│   └── gemenr-cli/         # CLI entry point (chat mode, task mode)
+│   ├── gemenr-cli/             # chat, run, daemon
+│   └── gemenr-im/              # Lark / Feishu long-connection service
+└── crates/
+    ├── gemenr-core/            # runtime, context, config, provider/router, access layer
+    └── gemenr-tools/           # tool plane, builtins, policy, sandbox, MCP
 ```
 
-Phase 1 will add `crates/gemenr-tools/` for the tool system (registration, execution, built-in tools).
+Runtime state is typically stored under a workspace-local `.gemenr/` directory:
 
-Key extension points (Phase 1+):
+- `.gemenr/SOUL.md` — long-lived agent memory/preferences
+- `.gemenr/tapes/` — persisted JSONL session tapes when disk persistence is available
 
-- `gemenr-core` — `ModelProvider` trait (model interaction), `TapeStore` trait (event persistence)
-- `gemenr-tools` — `ToolHandler` trait (tool execution), `ToolSpec` (tool definition)
+## 3) Architecture Map
 
-## 3) Build & Test
+### 3.1 `gemenr-core`
+
+Treat `gemenr-core` as the stable center of the system.
+
+- `builder.rs` — assembles `AgentRuntime` from shared `Arc` dependencies
+- `kernel/` — prompt composition, turn loop, cancellation, approvals, event emission
+- `context/` — tape-backed event history, anchors, summarization thresholds, `SOUL.md`
+- `model/` — `ModelProvider`, `ModelRouter`, Anthropic-compatible provider implementation
+- `agent/dispatcher.rs` — native-tool vs XML-tool parsing/formatting strategy
+- `tool_invoker.rs` / `tool_spec.rs` — runtime-facing tool contract and risk metadata
+- `access/` — normalized inbound/outbound messages plus route parsing and transport abstraction
+- `runtime_manager.rs` — multi-conversation lifecycle for long-lived transports like Lark
+- `config.rs` — validated `gemenr.toml` loader for models, fallback, access, cron, policy, MCP
+
+### 3.2 `gemenr-tools`
+
+Treat `gemenr-tools` as the execution plane.
+
+- `ToolPlane` is the concrete `ToolInvoker` implementation used by binaries
+- built-ins currently registered by binaries:
+  - `shell`
+  - `fs.read`
+  - `fs.write`
+  - `update_soul`
+- `policy.rs` converts scoped config into `ExecutionPolicy`
+- `sandbox/` selects `Seatbelt` on macOS or `Landlock` on Linux when policy requires it
+- `mcp/` implements stdio MCP client + remote tool adapter
+
+Important: MCP support exists in the library layer, but the current binary builders only register built-in tools. Do not assume configured MCP servers are live unless you wire them into the entrypoint explicitly.
+
+### 3.3 Binaries
+
+- `bins/gemenr-cli`
+  - `chat` uses stdio transport for interactive conversation
+  - `run` executes one task, optionally restoring a prior session
+  - `daemon` schedules cron jobs and can report back to `stdio:` or `lark:...`
+- `bins/gemenr-im`
+  - runs the Lark adapter/service loop
+  - uses `RuntimeManager` to multiplex many conversations onto shared runtime resources
+  - hibernates idle conversations and restores them from tape on demand
+
+## 4) Runtime Flow You Should Preserve
+
+The real runtime path today is:
+
+1. load validated config from `gemenr.toml`
+2. build model provider (usually `AnthropicProvider` wrapped by `ModelRouter`)
+3. build `SoulManager`, `TapeStore`, and `ToolPlane`
+4. create `RuntimeBuilder`
+5. select tool dispatcher mode: `native`, `xml`, or `auto`
+6. `AgentRuntime::run_turn()` appends user input to tape
+7. context is rebuilt from anchor + post-anchor events
+8. if budget threshold is exceeded, summarize and create a new anchor
+9. prompt is composed from `SOUL.md` + system prompt + context + tool instructions/specs
+10. model response is parsed into text and/or tool calls
+11. policy + approval gates are checked before tool execution
+12. tool results are appended as events and fed back into the next loop iteration
+
+Do not bypass this pipeline casually. If you need new behavior, prefer extending an existing seam (`ModelProvider`, `ToolInvoker`, `ApprovalHandler`, `EventSink`, `AccessAdapter`, `ConversationDriver`) instead of inserting ad-hoc side paths.
+
+## 5) Architectural Boundaries
+
+- `gemenr-core` must not depend on `gemenr-tools`, `gemenr-cli`, or `gemenr-im`
+- `gemenr-tools` may depend on `gemenr-core`, but not on binaries
+- binaries are composition roots; keep integration glue there
+- transport-specific logic belongs in `bins/` or `access/`, not in the kernel
+- tool execution policy belongs in `gemenr-tools`, not in model/provider code
+- config parsing/validation belongs in `config.rs`; avoid duplicating config rules elsewhere
+
+If you find yourself adding cross-crate helpers, first ask whether the change is actually an entrypoint concern that should stay in a binary.
+
+## 6) Current Design Facts That Matter
+
+- the runtime is **per session / per conversation**, not global
+- shared heavy resources are injected via `Arc`
+- the context model is **event tape + optional anchor summary**, not a mutable transcript object
+- summarization is budget-driven and uses the model itself
+- tool calling supports two provider styles:
+  - native structured tool calls
+  - XML-tagged tool calls embedded in plain text
+- provider fallback is already supported via `ModelRouter`
+- cron jobs may apply a per-job tool allowlist via `allowlist_tool_invoker(...)`
+- `gemenr-im` is intentionally long-lived and reconnecting; avoid request/response assumptions that only make sense for CLI mode
+
+## 7) Configuration Rules
+
+`gemenr.toml` is part of the public operator surface.
+
+- prefer extending the typed config model in `crates/gemenr-core/src/config.rs`
+- keep `serde(deny_unknown_fields)` discipline for new config sections unless there is a strong compatibility reason not to
+- validate eagerly and return explicit `ConfigError::Invalid(...)`
+- preserve env var override behavior where it already exists
+- do not log, print, or commit secrets from config or environment
+
+Be careful with examples and tests: use placeholder credentials only.
+
+## 8) Code Style and Conventions
+
+- use standard Rust naming and module layout
+- all public items should have doc comments, matching existing crate style
+- use `thiserror` for library-facing error types
+- prefer `tracing` over `println!` / `eprintln!` outside CLI-facing UX paths
+- keep async boundaries explicit; favor small focused async functions over deeply nested control flow
+- prefer straightforward structs/enums over speculative abstractions
+- preserve the project’s habit of colocated unit tests in the same file as the implementation
+
+## 9) Change Guidelines
+
+### 9.1 When modifying the runtime
+
+- preserve event emission and tape persistence semantics
+- keep cancellation checks in long-running loops / tool execution paths
+- preserve the max-step protection in the turn loop unless changing it intentionally
+- if you add new event kinds or payload shapes, update both producers and any context reconstruction logic that depends on them
+
+### 9.2 When adding tools
+
+- register them through `ToolPlane`
+- provide a stable `ToolSpec` with accurate `risk_level`
+- ensure policy behavior is sensible for low/medium/high-risk tools
+- if the tool shells out or touches the filesystem, think through sandbox behavior and failure surfacing
+- prefer small JSON schemas with explicit required fields
+
+### 9.3 When adding transports or long-lived services
+
+- normalize inbound traffic into `AccessInbound`
+- return outbound traffic as `AccessOutbound`
+- use `RuntimeManager` when one service must host many conversations over time
+- keep reconnection/backoff and idle reclamation outside the kernel
+
+## 10) Build, Test, and Validate
+
+Run these from `gemenr/` when relevant:
 
 ```bash
-# Check compilation
-cargo check --workspace
-
-# Format code
 cargo fmt --all
-
-# Lint — fix ALL warnings before committing
+cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-
-# Run all tests
 cargo test --workspace
-
-# Run a specific test
-cargo test --workspace test_name
-
-# Run with logging
-RUST_LOG=gemenr=debug cargo run --bin gemenr-cli
 ```
 
-## 4) Engineering Principles
+Useful entrypoints:
 
-### 4.1 KISS — Keep It Simple
+```bash
+cargo run --bin gemenr-cli -- chat
+cargo run --bin gemenr-cli -- run "your task"
+cargo run --bin gemenr-cli -- daemon
+cargo run --bin gemenr-im
+```
 
-- Prefer straightforward control flow over clever abstractions.
-- Prefer explicit `match` branches and typed structs over dynamic dispatch when possible.
-- Keep error paths obvious and localized.
+## 11) Practical Advice for Agents
 
-### 4.2 YAGNI — You Aren't Gonna Need It
+- first identify whether the change belongs to `core`, `tools`, or a binary composition root
+- prefer updating `RuntimeBuilder` assembly code rather than duplicating wiring in multiple places
+- if behavior differs between CLI and IM, keep the shared mechanism in `core` and the policy/transport differences in the binaries
+- when a feature appears “configured but inactive”, verify whether the entrypoint actually wires it up before assuming it works
+- keep docs and config examples aligned with the real implementation status; this repository has already drifted once
 
-- Do not add config keys, trait methods, or feature flags without a concrete current use case.
-- Do not introduce speculative abstractions without at least one real caller.
-- Unsupported paths should error out explicitly, not silently degrade.
+## 12) References
 
-### 4.3 DRY + Rule of Three
-
-- Duplicate small, local logic when it preserves clarity.
-- Extract shared utilities only after repeated, stable patterns (three or more occurrences).
-- When extracting, preserve module boundaries and avoid hidden coupling.
-
-### 4.4 Single Responsibility
-
-- Each module focuses on one concern.
-- Extend behavior by implementing existing narrow traits.
-- Avoid god-modules that mix policy, transport, and storage.
-
-### 4.5 Fail Fast + Explicit Errors
-
-- Use typed errors (`thiserror`); avoid opaque `anyhow` in library code.
-- Never silently swallow errors or broaden behavior on failure.
-- Document intentional fallback behavior when it exists.
-
-## 5) Code Style
-
-- Follow standard Rust naming: `snake_case` for modules/functions/variables, `PascalCase` for types/traits/enums, `SCREAMING_SNAKE_CASE` for constants.
-- All public items must have doc comments.
-- Keep `unsafe` usage to zero unless absolutely justified with a `// SAFETY:` comment.
-- Prefer `#[must_use]` on functions that return values callers should not ignore.
-- Use `tracing` for structured logging. Avoid `println!`/`eprintln!` in library code.
-
-## 6) Architecture Boundaries
-
-- Concrete integrations depend on trait/config layers, not on each other.
-- `gemenr-core` must not depend on `gemenr-tools` or `gemenr-cli`.
-- `gemenr-tools` depends on `gemenr-core` for types; `gemenr-cli` depends on both.
-- New shared abstractions require rule-of-three justification.
-- Config keys and CLI flags are public API — treat additions and removals as breaking changes.
-
-## 7) Commit & PR Discipline
-
-- Use conventional commit messages: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`.
-- Keep commits small and focused — one concern per commit.
-- Run `cargo fmt`, `cargo clippy`, and `cargo test` before committing.
-- Do not mix formatting-only changes with functional changes.
-- Do not modify unrelated modules in the same commit.
-
-## 8) Design References
-
-Architecture and requirements are documented in `../design-docs/`:
-
-- `requirement.md` — phased requirements (MVP → Phase 1 → Phase 2 → Phase 3)
-- `agent-design.md` — architecture design, module layouts, type definitions, state machines
+- `crates/gemenr-core/src/kernel/mod.rs` — runtime turn loop and event flow
+- `crates/gemenr-core/src/context/mod.rs` — tape/anchor context model
+- `crates/gemenr-core/src/config.rs` — config schema and validation
+- `crates/gemenr-tools/src/lib.rs` — tool plane and allowlist wrapper
+- `bins/gemenr-cli/src/main.rs` — CLI composition root
+- `bins/gemenr-cli/src/daemon.rs` — cron execution flow
+- `bins/gemenr-im/src/main.rs` — IM composition root
+- `bins/gemenr-im/src/service.rs` — reconnect/hibernate loop
