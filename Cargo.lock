@@ -352,9 +352,11 @@ dependencies = [
 name = "gemenr-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "gemenr-core",
  "gemenr-tools",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

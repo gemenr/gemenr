@@ -5,9 +5,9 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
-    ApprovalHandler, ChatMessage, Config, ConfigError, EventEnvelope, EventKind, EventSink,
-    InMemoryTapeStore, JsonlTapeStore, ModelError, ModelProvider, ModelRequest, RuntimeBuilder,
-    SoulManager, TapeStore, ToolInvoker,
+    AgentError, ApprovalHandler, Config, ConfigError, EventEnvelope, EventKind, EventSink,
+    InMemoryTapeStore, JsonlTapeStore, ModelProvider, RuntimeBuilder, SoulManager,
+    TapeStore, ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -50,16 +50,7 @@ async fn main() {
     };
 
     match cli.command {
-        Commands::Chat => {
-            let provider = match AnthropicProvider::new(&config) {
-                Ok(provider) => provider,
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            run_chat(&provider, &config).await;
-        }
+        Commands::Chat => run_chat(&config).await,
         Commands::Run { task } => run_task(&task, &config).await,
     }
 }
@@ -144,12 +135,19 @@ impl EventSink for StdioEventSink {
     }
 }
 
-async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
+async fn run_chat(config: &Config) {
     tracing::info!(target: "gemenr::cli", "starting chat session");
 
     let stdin = io::stdin();
-    let mut history = initial_history();
     let mut input = String::new();
+    let builder = match build_runtime_builder(config, None) {
+        Ok(builder) => builder,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let mut runtime = builder.build(DEFAULT_SYSTEM_PROMPT.to_string());
 
     loop {
         eprint!("> ");
@@ -173,41 +171,19 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
             continue;
         }
 
-        history.push(ChatMessage::user(trimmed));
-        let request = match build_model_request(&history, config) {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                history.pop();
-                break;
-            }
-        };
-        tracing::debug!(
-            target: "gemenr::cli",
-            selected_model = %config.model,
-            remote_model = %request.model,
-            message_count = history.len(),
-            "sending request to model"
-        );
+        tracing::debug!(target: "gemenr::cli", "running chat turn through agent runtime");
 
-        match provider.complete(request).await {
+        match runtime.run_turn(trimmed).await {
             Ok(response) => {
-                println!("{}", response.content);
-                tracing::debug!(
-                    target: "gemenr::cli",
-                    content_length = response.content.len(),
-                    "received model response"
-                );
-                history.push(ChatMessage::assistant(response.content));
+                println!("{response}");
             }
             Err(error) => {
                 tracing::warn!(
                     target: "gemenr::cli",
                     error = %error,
-                    "model request failed"
+                    "chat turn failed"
                 );
-                eprintln!("Error: {}", display_model_error(&error));
-                history.pop();
+                eprintln!("Error: {}", display_agent_error(&error));
             }
         }
     }
@@ -216,48 +192,13 @@ async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
 }
 
 async fn run_task(task: &str, config: &Config) {
-    let provider: Arc<dyn ModelProvider> = match AnthropicProvider::new(config) {
-        Ok(provider) => Arc::new(provider),
-        Err(error) => {
-            eprintln!("Error creating provider: {error}");
-            std::process::exit(1);
-        }
-    };
-
-    let workspace = current_workspace();
-    let app_dir = workspace.join(".gemenr");
-    let soul = load_soul_manager(&app_dir);
-
-    let mut tool_plane = ToolPlane::new();
-    builtin::register_builtin_tools(&mut tool_plane, Arc::clone(&soul));
-    let tools: Arc<dyn ToolInvoker> = Arc::new(tool_plane);
-
-    let tape_store: Arc<dyn TapeStore> = match JsonlTapeStore::new(app_dir.join("tapes")) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            tracing::warn!(
-                target: "gemenr::cli",
-                error = %error,
-                "failed to create tape store; using in-memory fallback"
-            );
-            Arc::new(InMemoryTapeStore::new())
-        }
-    };
-
-    let selected_model = match config.selected_model() {
-        Ok(model) => model,
+    let builder = match build_runtime_builder(config, Some(4096)) {
+        Ok(builder) => builder,
         Err(error) => {
             eprintln!("Error: {error}");
             std::process::exit(1);
         }
     };
-
-    let builder = RuntimeBuilder::new(provider, tools, soul, tape_store)
-        .model_name(selected_model.model.clone())
-        .max_tokens(selected_model.max_tokens.unwrap_or(4096))
-        .tool_dispatcher(config.tool_dispatcher.clone())
-        .approval_handler(Arc::new(StdinApprovalHandler))
-        .event_sink(Arc::new(StdioEventSink));
 
     let system_prompt = format!(
         "You are an autonomous agent. Execute the following task:\n\n{task}\n\nUse the available tools to complete the task. When done, provide a summary of what you accomplished."
@@ -324,27 +265,60 @@ fn load_soul_manager(app_dir: &Path) -> Arc<RwLock<SoulManager>> {
     }
 }
 
-fn build_model_request(
-    history: &[ChatMessage],
+fn build_runtime_builder(
     config: &Config,
-) -> Result<ModelRequest, ConfigError> {
+    default_max_tokens: Option<u32>,
+) -> Result<RuntimeBuilder, ConfigError> {
+    let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new(config)?);
+
+    let workspace = current_workspace();
+    let app_dir = workspace.join(".gemenr");
+    let soul = load_soul_manager(&app_dir);
+
+    let mut tool_plane = ToolPlane::new();
+    builtin::register_builtin_tools(&mut tool_plane, Arc::clone(&soul));
+    let tools: Arc<dyn ToolInvoker> = Arc::new(tool_plane);
+
+    let tape_store: Arc<dyn TapeStore> = match JsonlTapeStore::new(app_dir.join("tapes")) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::warn!(
+                target: "gemenr::cli",
+                error = %error,
+                "failed to create tape store; using in-memory fallback"
+            );
+            Arc::new(InMemoryTapeStore::new())
+        }
+    };
+
+    let builder = RuntimeBuilder::new(provider, tools, soul, tape_store);
+    configure_runtime_builder(builder, config, default_max_tokens)
+}
+
+fn configure_runtime_builder(
+    builder: RuntimeBuilder,
+    config: &Config,
+    default_max_tokens: Option<u32>,
+) -> Result<RuntimeBuilder, ConfigError> {
     let selected_model = config.selected_model()?;
 
-    Ok(ModelRequest {
-        messages: history.to_vec(),
-        model: selected_model.model.clone(),
-        max_tokens: selected_model.max_tokens,
+    let builder = builder
+        .model_name(selected_model.model.clone())
+        .tool_dispatcher(config.tool_dispatcher.clone())
+        .approval_handler(Arc::new(StdinApprovalHandler))
+        .event_sink(Arc::new(StdioEventSink));
+
+    Ok(match selected_model.max_tokens.or(default_max_tokens) {
+        Some(max_tokens) => builder.max_tokens(max_tokens),
+        None => builder,
     })
 }
 
-fn initial_history() -> Vec<ChatMessage> {
-    vec![ChatMessage::system(DEFAULT_SYSTEM_PROMPT)]
-}
-
-fn display_model_error(error: &ModelError) -> String {
+#[cfg(test)]
+fn display_model_error(error: &gemenr_core::ModelError) -> String {
     match error {
-        ModelError::Auth(message) => format!("authentication failed: {message}"),
-        ModelError::Api {
+        gemenr_core::ModelError::Auth(message) => format!("authentication failed: {message}"),
+        gemenr_core::ModelError::Api {
             status: 401 | 403,
             message,
         } => {
@@ -354,17 +328,32 @@ fn display_model_error(error: &ModelError) -> String {
     }
 }
 
+fn display_agent_error(error: &AgentError) -> String {
+    match error {
+        AgentError::Model(message) => message.clone(),
+        _ => error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
+    use async_trait::async_trait;
     use clap::{Parser, error::ErrorKind};
+    use tokio::sync::RwLock;
 
     use super::{
-        Cli, Commands, DEFAULT_SYSTEM_PROMPT, build_model_request, display_model_error,
-        initial_history,
+        Cli, Commands, DEFAULT_SYSTEM_PROMPT, configure_runtime_builder, display_agent_error,
+        display_model_error,
     };
-    use gemenr_core::{ChatMessage, Config, ModelConfig, ModelError, ProviderConfig, ProviderType};
+    use gemenr_core::{
+        AgentError, ChatRequest, ChatResponse, Config, InMemoryTapeStore, ModelCapabilities,
+        ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType, SoulManager,
+        TapeStore, ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
+    };
 
     #[test]
     fn cli_parses_chat_subcommand() {
@@ -390,27 +379,81 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
-    #[test]
-    fn build_model_request_uses_selected_model_config() {
-        let history = vec![
-            ChatMessage::system("Be concise."),
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi"),
-        ];
+    #[tokio::test]
+    async fn configure_runtime_builder_uses_selected_model_config_for_chat() {
         let config = test_config();
+        let model = Arc::new(RecordingModelProvider::new());
+        let model_for_assertions = Arc::clone(&model);
+        let tools = Arc::new(StaticToolInvoker);
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let soul = test_soul();
+        let builder = gemenr_core::RuntimeBuilder::new(model, tools, soul, tape_store);
 
-        let request = build_model_request(&history, &config).expect("request should build");
+        let builder = configure_runtime_builder(builder, &config, None)
+            .expect("runtime builder should configure");
+        let mut runtime = builder.build(DEFAULT_SYSTEM_PROMPT.to_string());
 
-        assert_eq!(request.messages, history);
-        assert_eq!(request.model, "claude-haiku-4-5-20251001");
-        assert_eq!(request.max_tokens, Some(256));
+        runtime
+            .run_turn("Hello")
+            .await
+            .expect("turn should succeed");
+
+        let requests = model_for_assertions.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(requests[0].max_tokens, Some(256));
     }
 
-    #[test]
-    fn initial_history_contains_default_system_prompt() {
-        let history = initial_history();
+    #[tokio::test]
+    async fn configure_runtime_builder_uses_fallback_max_tokens_for_run() {
+        let config = test_config_without_max_tokens();
+        let model = Arc::new(RecordingModelProvider::new());
+        let model_for_assertions = Arc::clone(&model);
+        let tools = Arc::new(StaticToolInvoker);
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let soul = test_soul();
+        let builder = gemenr_core::RuntimeBuilder::new(model, tools, soul, tape_store);
 
-        assert_eq!(history, vec![ChatMessage::system(DEFAULT_SYSTEM_PROMPT)]);
+        let builder = configure_runtime_builder(builder, &config, Some(4096))
+            .expect("runtime builder should configure");
+        let mut runtime = builder.build("system".to_string());
+
+        runtime
+            .run_turn("Hello")
+            .await
+            .expect("turn should succeed");
+
+        let requests = model_for_assertions.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn configure_runtime_builder_uses_default_system_prompt_for_chat_runtime() {
+        let config = test_config();
+        let model = Arc::new(RecordingModelProvider::new());
+        let model_for_assertions = Arc::clone(&model);
+        let tools = Arc::new(StaticToolInvoker);
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let soul = test_soul();
+        let builder = gemenr_core::RuntimeBuilder::new(model, tools, soul, tape_store);
+
+        let builder = configure_runtime_builder(builder, &config, None)
+            .expect("runtime builder should configure");
+        let mut runtime = builder.build(DEFAULT_SYSTEM_PROMPT.to_string());
+
+        runtime
+            .run_turn("Hello")
+            .await
+            .expect("turn should succeed");
+
+        let requests = model_for_assertions.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].messages[0]
+                .content
+                .contains(DEFAULT_SYSTEM_PROMPT)
+        );
     }
 
     #[test]
@@ -441,6 +484,20 @@ mod tests {
         assert_eq!(display_model_error(&timeout), "request timed out");
     }
 
+    #[test]
+    fn display_agent_error_uses_model_message_verbatim() {
+        let error = AgentError::Model("provider exploded".to_string());
+
+        assert_eq!(display_agent_error(&error), "provider exploded");
+    }
+
+    #[test]
+    fn display_agent_error_leaves_non_model_errors_unchanged() {
+        let error = AgentError::Cancelled;
+
+        assert_eq!(display_agent_error(&error), "turn cancelled");
+    }
+
     fn test_config() -> Config {
         let mut providers = HashMap::new();
         providers.insert(
@@ -467,6 +524,109 @@ mod tests {
             providers,
             models,
             tool_dispatcher: "auto".to_string(),
+        }
+    }
+
+    fn test_config_without_max_tokens() -> Config {
+        let mut config = test_config();
+        config
+            .models
+            .get_mut("default")
+            .expect("default model should exist")
+            .max_tokens = None;
+        config
+    }
+
+    fn test_soul() -> Arc<RwLock<SoulManager>> {
+        let workspace =
+            std::env::temp_dir().join(format!("gemenr-cli-test-soul-{}", std::process::id()));
+
+        std::fs::create_dir_all(&workspace).expect("test soul workspace should exist");
+
+        Arc::new(RwLock::new(
+            SoulManager::load(&workspace).expect("test SOUL.md should load"),
+        ))
+    }
+
+    #[derive(Debug)]
+    struct RecordingModelProvider {
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
+    impl RecordingModelProvider {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests
+                .lock()
+                .expect("requests lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RecordingModelProvider {
+        async fn complete(
+            &self,
+            _request: gemenr_core::ModelRequest,
+        ) -> Result<gemenr_core::ModelResponse, ModelError> {
+            unreachable!("runtime builder tests should use chat(), not complete()")
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+
+        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+            self.requests
+                .lock()
+                .expect("requests lock should not be poisoned")
+                .push(request);
+
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StaticToolInvoker;
+
+    #[async_trait]
+    impl ToolInvoker for StaticToolInvoker {
+        fn lookup(&self, _name: &str) -> Option<&ToolSpec> {
+            None
+        }
+
+        fn list_specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn check_policy(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> gemenr_core::PolicyDecision {
+            gemenr_core::PolicyDecision::Allow
+        }
+
+        async fn invoke(
+            &self,
+            _call_id: &str,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _cancelled: Arc<AtomicBool>,
+        ) -> Result<ToolInvokeResult, ToolInvokeError> {
+            Ok(ToolInvokeResult {
+                content: String::new(),
+                is_error: false,
+            })
         }
     }
 }
