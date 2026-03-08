@@ -123,8 +123,12 @@ pub use kernel::ActionDecision;
 pub use kernel::AgentError;
 /// Re-export of agent runtime.
 pub use kernel::AgentRuntime;
+/// Re-export of typed approval decisions.
+pub use kernel::ApprovalDecision;
 /// Re-export of approval handling for risky tool execution.
 pub use kernel::ApprovalHandler;
+/// Re-export of typed approval requests.
+pub use kernel::ApprovalRequest;
 /// Re-export of the default deny-all approval handler.
 pub use kernel::DenyAllApprovals;
 /// Re-export of runtime event delivery interface.
@@ -157,6 +161,8 @@ pub use model::ModelRequest;
 pub use model::ModelResponse;
 /// Re-export of model router abstraction.
 pub use model::ModelRouter;
+/// Re-export of shared request context used by model and tool execution.
+pub use model::RequestContext;
 /// Re-export of model token usage statistics.
 pub use model::TokenUsage;
 /// Re-export of structured model tool calls.

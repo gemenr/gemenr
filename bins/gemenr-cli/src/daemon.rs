@@ -398,6 +398,7 @@ mod tests {
         async fn complete(
             &self,
             request: ModelRequest,
+            _context: gemenr_core::RequestContext,
         ) -> Result<ModelResponse, gemenr_core::ModelError> {
             Ok(ModelResponse {
                 content: format!("{} messages", request.messages.len()),
@@ -408,6 +409,7 @@ mod tests {
         async fn chat(
             &self,
             request: ChatRequest,
+            _context: gemenr_core::RequestContext,
         ) -> Result<ChatResponse, gemenr_core::ModelError> {
             self.requests
                 .lock()

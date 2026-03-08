@@ -20,6 +20,10 @@ pub enum ModelError {
     #[error("request timed out")]
     Timeout,
 
+    /// Request was cancelled before completion.
+    #[error("request cancelled")]
+    Cancelled,
+
     /// Network-level error (DNS, connection refused, etc.).
     #[error("network error: {0}")]
     Network(String),
@@ -43,6 +47,7 @@ mod tests {
     fn display_formats_all_error_variants() {
         let auth = ModelError::Auth("bad key".to_string());
         let timeout = ModelError::Timeout;
+        let cancelled = ModelError::Cancelled;
         let network = ModelError::Network("connection refused".to_string());
         let api = ModelError::Api {
             status: 429,
@@ -51,6 +56,7 @@ mod tests {
 
         assert_eq!(auth.to_string(), "authentication failed: bad key");
         assert_eq!(timeout.to_string(), "request timed out");
+        assert_eq!(cancelled.to_string(), "request cancelled");
         assert_eq!(network.to_string(), "network error: connection refused");
         assert_eq!(api.to_string(), "API error (status 429): too many requests");
     }

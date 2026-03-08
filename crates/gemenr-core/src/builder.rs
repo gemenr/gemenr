@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 
@@ -9,7 +10,7 @@ use crate::kernel::{
     AgentRuntime, ApprovalHandler, DenyAllApprovals, EventSink, NoopEventSink, PromptComposer,
     TurnController,
 };
-use crate::model::ModelProvider;
+use crate::model::{ModelProvider, RequestContext};
 use crate::protocol::SessionId;
 use crate::tool_invoker::ToolInvoker;
 
@@ -30,6 +31,8 @@ pub struct RuntimeBuilder {
     model_name: String,
     /// Maximum tokens for requests.
     max_tokens: Option<u32>,
+    /// Optional per-request timeout applied to model and tool execution.
+    request_timeout: Option<Duration>,
     /// Token budget for context building.
     budget: TokenBudget,
     /// Confirmation handler used by runtimes built from this builder.
@@ -55,6 +58,7 @@ impl RuntimeBuilder {
             tool_dispatcher_config: "auto".to_string(),
             model_name: String::new(),
             max_tokens: None,
+            request_timeout: None,
             budget: TokenBudget::default(),
             approval_handler: Arc::new(DenyAllApprovals),
             event_sink: Arc::new(NoopEventSink),
@@ -72,6 +76,13 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn max_tokens(mut self, max: u32) -> Self {
         self.max_tokens = Some(max);
+        self
+    }
+
+    /// Set the timeout shared by model and tool requests.
+    #[must_use]
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
         self
     }
 
@@ -148,6 +159,11 @@ impl RuntimeBuilder {
             _ => Box::new(XmlToolDispatcher),
         };
 
+        let request_context = self.request_timeout.map_or_else(
+            || RequestContext::new(Arc::new(AtomicBool::new(false))),
+            |timeout| RequestContext::new(Arc::new(AtomicBool::new(false))).with_timeout(timeout),
+        );
+
         AgentRuntime::new(
             ContextManager::new(session_id, self.tape_store.clone(), self.soul.clone()),
             self.model.clone(),
@@ -159,7 +175,7 @@ impl RuntimeBuilder {
             system_prompt,
             self.model_name.clone(),
             self.max_tokens,
-            Arc::new(AtomicBool::new(false)),
+            request_context,
             Arc::clone(&self.approval_handler),
             Arc::clone(&self.event_sink),
         )
@@ -181,7 +197,7 @@ mod tests {
     use crate::error::ModelError;
     use crate::model::{
         ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse,
+        ModelResponse, RequestContext,
     };
     use crate::protocol::SessionId;
     use crate::tool_invoker::{
@@ -223,7 +239,11 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for RecordingModelProvider {
-        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _context: RequestContext,
+        ) -> Result<ModelResponse, ModelError> {
             Ok(ModelResponse {
                 content: request
                     .messages
@@ -238,7 +258,11 @@ mod tests {
             self.capabilities
         }
 
-        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            _context: RequestContext,
+        ) -> Result<ChatResponse, ModelError> {
             self.requests
                 .lock()
                 .expect("requests lock should not be poisoned")
@@ -322,7 +346,14 @@ mod tests {
     }
 
     fn soul() -> Arc<RwLock<SoulManager>> {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-builder");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/test-builder-{}-{timestamp}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&workspace).expect("test workspace should be created");
         Arc::new(RwLock::new(
             SoulManager::load(&workspace).expect("SOUL.md should load"),

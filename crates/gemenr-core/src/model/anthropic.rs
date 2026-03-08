@@ -15,7 +15,7 @@ use crate::error::ModelError;
 use crate::message::{ChatMessage, ChatRole};
 use crate::model::{
     ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-    ModelResponse, TokenUsage, ToolCall, ToolsPayload, convert_request_tools,
+    ModelResponse, RequestContext, TokenUsage, ToolCall, ToolsPayload, convert_request_tools,
 };
 use crate::tool_spec::ToolSpec;
 
@@ -24,7 +24,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_SECS: u64 = 1;
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.71 (external, cli)";
 const CLAUDE_CLI_ANTHROPIC_BETA: &str = "claude-code-20250219,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24";
@@ -68,12 +68,20 @@ impl AnthropicProvider {
         })
     }
 
-    async fn send_request_with_retry<T>(&self, request_body: &T) -> Result<String, ModelError>
+    async fn send_request_with_retry<T>(
+        &self,
+        request_body: &T,
+        context: &RequestContext,
+    ) -> Result<String, ModelError>
     where
         T: Serialize + ?Sized,
     {
         for attempt in 0..=MAX_RETRIES {
-            match self.do_send_request(request_body).await {
+            if context.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ModelError::Cancelled);
+            }
+
+            match self.do_send_request(request_body, context).await {
                 Ok(response_body) => return Ok(response_body),
                 Err(err) => {
                     let is_retryable = should_retry(&err);
@@ -97,7 +105,7 @@ impl AnthropicProvider {
                         error = %err,
                         "retrying anthropic request"
                     );
-                    sleep(delay).await;
+                    sleep_or_cancel(delay, context).await?;
                 }
             }
         }
@@ -105,24 +113,32 @@ impl AnthropicProvider {
         unreachable!("retry loop should always return a result");
     }
 
-    async fn do_send_request<T>(&self, request_body: &T) -> Result<String, ModelError>
+    async fn do_send_request<T>(
+        &self,
+        request_body: &T,
+        context: &RequestContext,
+    ) -> Result<String, ModelError>
     where
         T: Serialize + ?Sized,
     {
-        let response = self
-            .client
-            .post(&self.api_endpoint)
-            .headers(default_claude_cli_headers())
-            .header("x-api-key", &self.api_key)
-            .json(request_body)
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .send()
-            .await
-            .map_err(map_request_error)?;
+        let request_timeout = context
+            .timeout
+            .unwrap_or(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS));
+        let response = await_or_cancel(
+            self.client
+                .post(&self.api_endpoint)
+                .headers(default_claude_cli_headers())
+                .header("x-api-key", &self.api_key)
+                .json(request_body)
+                .timeout(request_timeout)
+                .send(),
+            context,
+        )
+        .await?;
 
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
-        let body = response.text().await.map_err(map_request_error)?;
+        let body = await_or_cancel(response.text(), context).await?;
 
         if status.is_success() {
             return Ok(body);
@@ -147,7 +163,11 @@ impl ModelProvider for AnthropicProvider {
         }
     }
 
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        context: RequestContext,
+    ) -> Result<ModelResponse, ModelError> {
         let request_body = build_request(&request, &self.default_model);
         debug!(
             model = %request_body.model,
@@ -156,14 +176,20 @@ impl ModelProvider for AnthropicProvider {
             "sending anthropic completion request"
         );
 
-        let response_body = self.send_request_with_retry(&request_body).await?;
+        let response_body = self
+            .send_request_with_retry(&request_body, &context)
+            .await?;
         parse_response_body(&response_body).map_err(|err| ModelError::Api {
             status: StatusCode::OK.as_u16(),
             message: truncate_error_message(&format!("failed to parse Anthropic response: {err}")),
         })
     }
 
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        context: RequestContext,
+    ) -> Result<ChatResponse, ModelError> {
         let request_body = build_chat_request(self, &request, &self.default_model)?;
         debug!(
             model = %request_body.model,
@@ -173,11 +199,47 @@ impl ModelProvider for AnthropicProvider {
             "sending anthropic chat request"
         );
 
-        let response_body = self.send_request_with_retry(&request_body).await?;
+        let response_body = self
+            .send_request_with_retry(&request_body, &context)
+            .await?;
         parse_chat_response_body(&response_body).map_err(|err| ModelError::Api {
             status: StatusCode::OK.as_u16(),
             message: truncate_error_message(&format!("failed to parse Anthropic response: {err}")),
         })
+    }
+}
+
+async fn await_or_cancel<T, Fut>(future: Fut, context: &RequestContext) -> Result<T, ModelError>
+where
+    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+{
+    tokio::pin!(future);
+
+    let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+    tokio::pin!(cancellation_future);
+
+    tokio::select! {
+        result = &mut future => result.map_err(map_request_error),
+        _ = &mut cancellation_future => Err(ModelError::Cancelled),
+    }
+}
+
+async fn sleep_or_cancel(duration: Duration, context: &RequestContext) -> Result<(), ModelError> {
+    let sleep_future = sleep(duration);
+    tokio::pin!(sleep_future);
+
+    let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+    tokio::pin!(cancellation_future);
+
+    tokio::select! {
+        _ = &mut sleep_future => Ok(()),
+        _ = &mut cancellation_future => Err(ModelError::Cancelled),
+    }
+}
+
+async fn wait_for_cancellation(cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    while !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -625,7 +687,8 @@ mod tests {
     use crate::error::ModelError;
     use crate::message::ChatMessage;
     use crate::model::{
-        ChatRequest, FinishReason, ModelCapabilities, ModelProvider, ModelRequest, ToolsPayload,
+        ChatRequest, FinishReason, ModelCapabilities, ModelProvider, ModelRequest, RequestContext,
+        ToolsPayload,
     };
     use crate::tool_spec::{RiskLevel, ToolSpec};
 
@@ -683,6 +746,7 @@ mod tests {
         async fn complete(
             &self,
             _request: ModelRequest,
+            _context: RequestContext,
         ) -> Result<crate::model::ModelResponse, ModelError> {
             unreachable!("stub provider should not be used for completion")
         }
@@ -705,6 +769,7 @@ mod tests {
         async fn complete(
             &self,
             _request: ModelRequest,
+            _context: RequestContext,
         ) -> Result<crate::model::ModelResponse, ModelError> {
             unreachable!("stub provider should not be used for completion")
         }

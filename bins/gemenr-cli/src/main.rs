@@ -8,10 +8,10 @@ use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
-    ApprovalHandler, Config, ConfigError, ConversationDriver, ConversationId, EventEnvelope,
-    EventKind, EventSink, FallbackPlan, InMemoryTapeStore, JsonlTapeStore, ModelProvider,
-    ModelRouter, ProviderType, ReplyRoute, RuntimeBuilder, SessionId, SoulManager, TapeStore,
-    ToolInvoker,
+    ApprovalDecision, ApprovalHandler, ApprovalRequest, Config, ConfigError, ConversationDriver,
+    ConversationId, EventEnvelope, EventKind, EventSink, FallbackPlan, InMemoryTapeStore,
+    JsonlTapeStore, ModelProvider, ModelRouter, ProviderType, ReplyRoute, RuntimeBuilder,
+    SessionId, SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -80,15 +80,35 @@ fn init_tracing() {
 
 struct StdinApprovalHandler;
 
-impl ApprovalHandler for StdinApprovalHandler {
-    fn confirm(&self, message: &str) -> bool {
-        eprintln!("{message} [y/N]");
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            return false;
-        }
+impl StdinApprovalHandler {
+    async fn confirm_with_reader<F>(&self, request: ApprovalRequest, reader: F) -> ApprovalDecision
+    where
+        F: FnOnce(ApprovalRequest) -> ApprovalDecision + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || reader(request))
+            .await
+            .unwrap_or(ApprovalDecision::Rejected)
+    }
+}
 
-        input.trim().eq_ignore_ascii_case("y")
+#[async_trait]
+impl ApprovalHandler for StdinApprovalHandler {
+    async fn confirm(&self, request: ApprovalRequest) -> ApprovalDecision {
+        self.confirm_with_reader(request, read_stdin_approval).await
+    }
+}
+
+fn read_stdin_approval(request: ApprovalRequest) -> ApprovalDecision {
+    eprintln!("{} [y/N]", request.message);
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return ApprovalDecision::Rejected;
+    }
+
+    if input.trim().eq_ignore_ascii_case("y") {
+        ApprovalDecision::Approved
+    } else {
+        ApprovalDecision::Rejected
     }
 }
 
@@ -661,15 +681,16 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::{
-        Cli, Commands, DEFAULT_SYSTEM_PROMPT, StdioAdapter, build_stdio_inbound,
-        configure_runtime_builder, display_agent_error, display_model_error, handle_stdio_message,
-        task_conversation_id,
+        Cli, Commands, DEFAULT_SYSTEM_PROMPT, StdinApprovalHandler, StdioAdapter,
+        build_stdio_inbound, configure_runtime_builder, display_agent_error, display_model_error,
+        handle_stdio_message, task_conversation_id,
     };
     use gemenr_core::{
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
-        ChatRequest, ChatResponse, Config, ConversationDriver, ConversationId, InMemoryTapeStore,
-        ModelCapabilities, ModelConfig, ModelError, ModelProvider, ProviderConfig, ProviderType,
-        SoulManager, TapeStore, ToolInvokeError, ToolInvokeResult, ToolSpec,
+        ApprovalDecision, ApprovalRequest, ChatRequest, ChatResponse, Config, ConversationDriver,
+        ConversationId, InMemoryTapeStore, ModelCapabilities, ModelConfig, ModelError,
+        ModelProvider, ProviderConfig, ProviderType, RequestContext, SoulManager, TapeStore,
+        ToolInvokeError, ToolInvokeResult, ToolSpec,
     };
 
     #[test]
@@ -704,6 +725,29 @@ mod tests {
             }
             Commands::Chat | Commands::Daemon => panic!("expected run command"),
         }
+    }
+
+    #[tokio::test]
+    async fn stdin_approval_runs_via_blocking_bridge() {
+        let handler = StdinApprovalHandler;
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_in_bridge = Arc::clone(&invoked);
+
+        let decision = handler
+            .confirm_with_reader(
+                ApprovalRequest {
+                    tool_name: "shell".to_string(),
+                    message: "approve shell".to_string(),
+                },
+                move |_| {
+                    invoked_in_bridge.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ApprovalDecision::Approved
+                },
+            )
+            .await;
+
+        assert_eq!(decision, ApprovalDecision::Approved);
+        assert!(invoked.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[derive(Clone, Default)]
@@ -1046,6 +1090,7 @@ mod tests {
         async fn complete(
             &self,
             _request: gemenr_core::ModelRequest,
+            _context: RequestContext,
         ) -> Result<gemenr_core::ModelResponse, ModelError> {
             unreachable!("runtime builder tests should use chat(), not complete()")
         }
@@ -1054,7 +1099,11 @@ mod tests {
             ModelCapabilities::default()
         }
 
-        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            _context: RequestContext,
+        ) -> Result<ChatResponse, ModelError> {
             self.requests
                 .lock()
                 .expect("requests lock should not be poisoned")

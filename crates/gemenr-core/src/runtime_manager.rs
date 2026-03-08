@@ -182,7 +182,7 @@ mod tests {
     use crate::message::ChatRole;
     use crate::model::{
         ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse,
+        ModelResponse, RequestContext,
     };
     use crate::tool_invoker::{
         AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
@@ -212,7 +212,11 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for RecordingModelProvider {
-        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _context: RequestContext,
+        ) -> Result<ModelResponse, ModelError> {
             Ok(ModelResponse {
                 content: request
                     .messages
@@ -225,7 +229,11 @@ mod tests {
             })
         }
 
-        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            _context: RequestContext,
+        ) -> Result<ChatResponse, ModelError> {
             self.requests
                 .lock()
                 .expect("requests lock should not be poisoned")

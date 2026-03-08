@@ -3,6 +3,8 @@ mod anthropic;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,45 @@ pub struct ModelRequest {
     pub model: String,
     /// Maximum tokens to generate. `None` means provider default.
     pub max_tokens: Option<u32>,
+}
+
+/// Shared runtime context attached to model and tool requests.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    /// Shared cancellation flag for the active turn.
+    pub cancelled: Arc<AtomicBool>,
+    /// Optional per-request timeout override.
+    pub timeout: Option<Duration>,
+}
+
+impl RequestContext {
+    /// Create a new request context from a shared cancellation source.
+    #[must_use]
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            timeout: None,
+        }
+    }
+
+    /// Override the default request timeout for this context.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Clone the underlying cancellation handle.
+    #[must_use]
+    pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)))
+    }
 }
 
 /// Complete response from a model provider.
@@ -125,7 +166,11 @@ pub struct TokenUsage {
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     /// Send a request to the model and return the complete response.
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError>;
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        context: RequestContext,
+    ) -> Result<ModelResponse, ModelError>;
 
     /// Declare provider capabilities.
     fn capabilities(&self) -> ModelCapabilities {
@@ -148,13 +193,17 @@ pub trait ModelProvider: Send + Sync {
     ///
     /// The default implementation delegates to [`ModelProvider::complete`] and
     /// ignores any provided tools.
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        context: RequestContext,
+    ) -> Result<ChatResponse, ModelError> {
         let model_request = ModelRequest {
             messages: request.messages,
             model: request.model,
             max_tokens: request.max_tokens,
         };
-        let response = self.complete(model_request).await?;
+        let response = self.complete(model_request, context).await?;
 
         Ok(ChatResponse {
             text: Some(response.content),
@@ -296,6 +345,7 @@ impl ModelRouter {
     pub async fn chat_with_fallback(
         &self,
         request: ChatRequest,
+        context: RequestContext,
     ) -> Result<ChatResponse, ModelError> {
         let provider_names = self.provider_order();
         let mut last_error = None;
@@ -304,7 +354,7 @@ impl ModelRouter {
             let provider = self
                 .provider(provider_name)
                 .expect("provider in order must be registered");
-            match provider.chat(request.clone()).await {
+            match provider.chat(request.clone(), context.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(error) if is_retryable(&error) && index + 1 < provider_names.len() => {
                     last_error = Some(error);
@@ -319,6 +369,7 @@ impl ModelRouter {
     async fn complete_with_fallback(
         &self,
         request: ModelRequest,
+        context: RequestContext,
     ) -> Result<ModelResponse, ModelError> {
         let provider_names = self.provider_order();
         let mut last_error = None;
@@ -327,7 +378,7 @@ impl ModelRouter {
             let provider = self
                 .provider(provider_name)
                 .expect("provider in order must be registered");
-            match provider.complete(request.clone()).await {
+            match provider.complete(request.clone(), context.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(error) if is_retryable(&error) && index + 1 < provider_names.len() => {
                     last_error = Some(error);
@@ -353,8 +404,12 @@ impl ModelRouter {
 
 #[async_trait]
 impl ModelProvider for ModelRouter {
-    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
-        self.complete_with_fallback(request).await
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        context: RequestContext,
+    ) -> Result<ModelResponse, ModelError> {
+        self.complete_with_fallback(request, context).await
     }
 
     fn capabilities(&self) -> ModelCapabilities {
@@ -365,8 +420,12 @@ impl ModelProvider for ModelRouter {
         self.default_provider().convert_tools(tools)
     }
 
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
-        self.chat_with_fallback(request).await
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        context: RequestContext,
+    ) -> Result<ChatResponse, ModelError> {
+        self.chat_with_fallback(request, context).await
     }
 }
 
@@ -380,12 +439,14 @@ fn is_retryable(error: &ModelError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         ChatRequest, ChatResponse, FallbackPlan, FinishReason, ModelCapabilities, ModelProvider,
-        ModelRequest, ModelResponse, ModelRouter, SharedModelProvider, TokenUsage, ToolCall,
-        build_tool_instructions_text,
+        ModelRequest, ModelResponse, ModelRouter, RequestContext, SharedModelProvider, TokenUsage,
+        ToolCall, build_tool_instructions_text,
     };
     use crate::message::ChatMessage;
     use crate::tool_spec::{RiskLevel, ToolSpec};
@@ -398,6 +459,7 @@ mod tests {
 
     struct ScriptedChatProvider {
         chat_results: Mutex<VecDeque<Result<ChatResponse, crate::ModelError>>>,
+        contexts: Mutex<Vec<RequestContext>>,
         native_tool_calling: bool,
     }
 
@@ -408,8 +470,16 @@ mod tests {
         ) -> Self {
             Self {
                 chat_results: Mutex::new(chat_results.into()),
+                contexts: Mutex::new(Vec::new()),
                 native_tool_calling,
             }
+        }
+
+        fn contexts(&self) -> Vec<RequestContext> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .clone()
         }
     }
 
@@ -418,14 +488,27 @@ mod tests {
         async fn complete(
             &self,
             _request: ModelRequest,
+            context: RequestContext,
         ) -> Result<ModelResponse, crate::ModelError> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .push(context);
             Ok(ModelResponse {
                 content: "complete".to_string(),
                 finish_reason: FinishReason::Stop,
             })
         }
 
-        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, crate::ModelError> {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            context: RequestContext,
+        ) -> Result<ChatResponse, crate::ModelError> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .push(context);
             self.chat_results
                 .lock()
                 .expect("chat results lock should not be poisoned")
@@ -446,6 +529,7 @@ mod tests {
         async fn complete(
             &self,
             request: ModelRequest,
+            _context: RequestContext,
         ) -> Result<ModelResponse, crate::ModelError> {
             let content = if self.response_text.is_empty() {
                 format!("received {} messages", request.messages.len())
@@ -538,12 +622,15 @@ mod tests {
         };
 
         let response = provider
-            .chat(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "claude-haiku-4-5-20251001".to_string(),
-                max_tokens: Some(64),
-                tools: None,
-            })
+            .chat(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "claude-haiku-4-5-20251001".to_string(),
+                    max_tokens: Some(64),
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect("chat should succeed");
 
@@ -597,16 +684,52 @@ mod tests {
         assert_eq!(
             router
                 .default_provider()
-                .complete(ModelRequest {
-                    messages: vec![ChatMessage::user("hello")],
-                    model: "claude-haiku-4-5-20251001".to_string(),
-                    max_tokens: Some(64),
-                })
+                .complete(
+                    ModelRequest {
+                        messages: vec![ChatMessage::user("hello")],
+                        model: "claude-haiku-4-5-20251001".to_string(),
+                        max_tokens: Some(64),
+                    },
+                    RequestContext::default()
+                )
                 .await
                 .expect("request should succeed")
                 .content,
             "primary"
         );
+    }
+
+    #[tokio::test]
+    async fn request_context_is_forwarded_to_provider() {
+        let provider = ScriptedChatProvider::new(
+            vec![Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            false,
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context =
+            RequestContext::new(Arc::clone(&cancelled)).with_timeout(Duration::from_secs(7));
+
+        provider
+            .chat(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: Some(32),
+                    tools: None,
+                },
+                context,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let contexts = provider.contexts();
+        assert_eq!(contexts.len(), 1);
+        assert!(Arc::ptr_eq(&contexts[0].cancelled, &cancelled));
+        assert_eq!(contexts[0].timeout, Some(Duration::from_secs(7)));
     }
 
     #[test]
@@ -659,12 +782,15 @@ mod tests {
             .expect("fallback plan should be valid");
 
         let response = router
-            .chat_with_fallback(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "test-model".to_string(),
-                max_tokens: None,
-                tools: None,
-            })
+            .chat_with_fallback(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect("backup should succeed");
 
@@ -699,12 +825,15 @@ mod tests {
             .expect("fallback plan should be valid");
 
         let response = router
-            .chat_with_fallback(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "test-model".to_string(),
-                max_tokens: None,
-                tools: None,
-            })
+            .chat_with_fallback(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect("backup should succeed");
 
@@ -739,12 +868,15 @@ mod tests {
             .expect("fallback plan should be valid");
 
         let response = router
-            .chat_with_fallback(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "test-model".to_string(),
-                max_tokens: None,
-                tools: None,
-            })
+            .chat_with_fallback(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect("backup should succeed");
 
@@ -772,12 +904,15 @@ mod tests {
             .expect("fallback plan should be valid");
 
         let error = router
-            .chat_with_fallback(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "test-model".to_string(),
-                max_tokens: None,
-                tools: None,
-            })
+            .chat_with_fallback(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect_err("auth error should not fall back");
 
@@ -808,12 +943,15 @@ mod tests {
             .expect("fallback plan should be valid");
 
         let error = router
-            .chat_with_fallback(ChatRequest {
-                messages: vec![ChatMessage::user("hello")],
-                model: "test-model".to_string(),
-                max_tokens: None,
-                tools: None,
-            })
+            .chat_with_fallback(
+                ChatRequest {
+                    messages: vec![ChatMessage::user("hello")],
+                    model: "test-model".to_string(),
+                    max_tokens: None,
+                    tools: None,
+                },
+                RequestContext::default(),
+            )
             .await
             .expect_err("api error should not fall back");
 

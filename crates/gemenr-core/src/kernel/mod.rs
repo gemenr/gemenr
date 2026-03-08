@@ -2,19 +2,24 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::json;
 
 use crate::agent::dispatcher::{ConversationMessage, ToolDispatcher, ToolExecutionResult};
 use crate::context::{ContextBuildResult, ContextManager, TokenBudget};
 use crate::message::ChatMessage;
-use crate::model::{ModelProvider, ModelRequest, ToolCall};
+use crate::model::{
+    ChatRequest, ChatResponse, ModelProvider, ModelRequest, ModelResponse, RequestContext, ToolCall,
+};
 use crate::protocol::{
     AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolCallRecord,
     ToolResultPayload, TurnId,
 };
 use crate::tool_invoker::{
-    AuthorizationDecision, PolicyContext, ToolCallRequest, ToolInvokeError, ToolInvoker,
+    AuthorizationDecision, PolicyContext, PreparedToolCall, ToolCallRequest, ToolInvokeError,
+    ToolInvokeResult, ToolInvoker,
 };
 
 pub mod prompt;
@@ -50,19 +55,40 @@ pub enum AgentError {
     TurnLimitExceeded,
 }
 
+/// Typed approval request for a pending tool execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// Tool name that triggered the approval gate.
+    pub tool_name: String,
+    /// User-facing approval prompt.
+    pub message: String,
+}
+
+/// Decision returned by an approval handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// The pending action may proceed.
+    Approved,
+    /// The pending action must be rejected.
+    Rejected,
+}
+
 /// Handles user confirmations required before tool execution.
+#[async_trait]
 pub trait ApprovalHandler: Send + Sync {
     /// Ask whether a pending tool call should proceed.
-    fn confirm(&self, message: &str) -> bool;
+    async fn confirm(&self, request: ApprovalRequest) -> ApprovalDecision;
 }
 
 /// Default approval handler used when no external confirmation mechanism exists.
 #[derive(Debug, Default)]
 pub struct DenyAllApprovals;
 
+#[async_trait]
+#[async_trait]
 impl ApprovalHandler for DenyAllApprovals {
-    fn confirm(&self, _message: &str) -> bool {
-        false
+    async fn confirm(&self, _request: ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::Rejected
     }
 }
 
@@ -105,8 +131,8 @@ pub struct AgentRuntime {
     model_name: String,
     /// Optional max tokens for requests.
     max_tokens: Option<u32>,
-    /// Shared cancellation flag for the active turn.
-    cancelled: Arc<AtomicBool>,
+    /// Shared request context for the active turn.
+    request_context: RequestContext,
     /// Confirmation handler for medium/high-risk tool execution.
     approval_handler: Arc<dyn ApprovalHandler>,
     /// Event sink used for real-time event delivery.
@@ -126,7 +152,7 @@ impl AgentRuntime {
         system_prompt: String,
         model_name: String,
         max_tokens: Option<u32>,
-        cancelled: Arc<AtomicBool>,
+        request_context: RequestContext,
         approval_handler: Arc<dyn ApprovalHandler>,
         event_sink: Arc<dyn EventSink>,
     ) -> Self {
@@ -141,7 +167,7 @@ impl AgentRuntime {
             system_prompt,
             model_name,
             max_tokens,
-            cancelled,
+            request_context,
             approval_handler,
             event_sink,
         }
@@ -162,6 +188,10 @@ impl AgentRuntime {
             Ok(response) => self.append_turn_completed(&turn_id, response).await?,
             Err(error) => self.append_turn_failed(&turn_id, error).await?,
         }
+
+        self.request_context
+            .cancelled
+            .store(false, Ordering::Relaxed);
 
         result
     }
@@ -214,7 +244,7 @@ impl AgentRuntime {
                 &self.model_name,
                 self.max_tokens,
             );
-            let response = self.model.chat(request).await?;
+            let response = self.invoke_chat_request(request).await?;
             let (text, tool_calls) = self.tool_dispatcher.parse_response(&response);
 
             match self.controller.next_action(text.clone(), tool_calls) {
@@ -271,7 +301,14 @@ impl AgentRuntime {
                         let prepared = match self.tools.authorize(&request, &policy_context) {
                             AuthorizationDecision::Prepared(prepared) => prepared,
                             AuthorizationDecision::NeedConfirmation { prepared, message } => {
-                                if !self.approval_handler.confirm(&message) {
+                                let approval = self
+                                    .approval_handler
+                                    .confirm(ApprovalRequest {
+                                        tool_name: call.name.clone(),
+                                        message: message.clone(),
+                                    })
+                                    .await;
+                                if approval != ApprovalDecision::Approved {
                                     let content = format!("Execution not approved: {message}");
                                     self.emit_tool_event(
                                         turn_id,
@@ -320,11 +357,7 @@ impl AgentRuntime {
                         )
                         .await?;
 
-                        match self
-                            .tools
-                            .invoke(prepared, Arc::clone(&self.cancelled))
-                            .await
-                        {
+                        match self.invoke_tool(prepared).await {
                             Ok(result) => {
                                 let kind = if result.is_error {
                                     EventKind::ToolFailed
@@ -383,13 +416,15 @@ impl AgentRuntime {
 
     /// Abort the currently executing turn.
     pub fn abort_turn(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.request_context
+            .cancelled
+            .store(true, Ordering::Relaxed);
     }
 
     /// Return a clone of the runtime cancellation flag for external interrupt wiring.
     #[must_use]
     pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancelled)
+        self.request_context.cancellation_handle()
     }
 
     /// Return this runtime's session identifier.
@@ -529,8 +564,7 @@ impl AgentRuntime {
         summary_messages.extend(messages.iter().cloned());
 
         let response = self
-            .model
-            .complete(ModelRequest {
+            .invoke_completion_request(ModelRequest {
                 messages: summary_messages,
                 model: self.model_name.clone(),
                 max_tokens: self.max_tokens,
@@ -541,11 +575,104 @@ impl AgentRuntime {
     }
 
     fn check_cancelled(&self) -> Result<(), AgentError> {
-        if self.cancelled.swap(false, Ordering::Relaxed) {
+        if self.request_context.cancelled.load(Ordering::Relaxed) {
             Err(AgentError::Cancelled)
         } else {
             Ok(())
         }
+    }
+
+    async fn invoke_chat_request(&self, request: ChatRequest) -> Result<ChatResponse, AgentError> {
+        let context = self.request_context.clone();
+        let request_future = self.model.chat(request, context.clone());
+
+        match self.wait_for_model_request(request_future, context).await? {
+            Some(response) => Ok(response),
+            None => Err(AgentError::Cancelled),
+        }
+    }
+
+    async fn invoke_completion_request(
+        &self,
+        request: ModelRequest,
+    ) -> Result<ModelResponse, AgentError> {
+        let context = self.request_context.clone();
+        let request_future = self.model.complete(request, context.clone());
+
+        match self.wait_for_model_request(request_future, context).await? {
+            Some(response) => Ok(response),
+            None => Err(AgentError::Cancelled),
+        }
+    }
+
+    async fn invoke_tool(
+        &self,
+        prepared: PreparedToolCall,
+    ) -> Result<ToolInvokeResult, ToolInvokeError> {
+        let context = self.request_context.clone();
+        let request_future = self.tools.invoke(prepared, context.cancellation_handle());
+        tokio::pin!(request_future);
+
+        let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+        tokio::pin!(cancellation_future);
+
+        if let Some(timeout) = context.timeout {
+            let timeout_future = tokio::time::sleep(timeout);
+            tokio::pin!(timeout_future);
+
+            tokio::select! {
+                result = &mut request_future => result,
+                _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
+                _ = &mut timeout_future => Err(ToolInvokeError::Timeout),
+            }
+        } else {
+            tokio::select! {
+                result = &mut request_future => result,
+                _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
+            }
+        }
+    }
+
+    async fn wait_for_model_request<T, Fut>(
+        &self,
+        request_future: Fut,
+        context: RequestContext,
+    ) -> Result<Option<T>, AgentError>
+    where
+        Fut: std::future::Future<Output = Result<T, crate::error::ModelError>>,
+    {
+        tokio::pin!(request_future);
+
+        let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+        tokio::pin!(cancellation_future);
+
+        let model_result = if let Some(timeout) = context.timeout {
+            let timeout_future = tokio::time::sleep(timeout);
+            tokio::pin!(timeout_future);
+
+            tokio::select! {
+                result = &mut request_future => Some(result),
+                _ = &mut cancellation_future => None,
+                _ = &mut timeout_future => Some(Err(crate::error::ModelError::Timeout)),
+            }
+        } else {
+            tokio::select! {
+                result = &mut request_future => Some(result),
+                _ = &mut cancellation_future => None,
+            }
+        };
+
+        match model_result {
+            Some(Ok(response)) => Ok(Some(response)),
+            Some(Err(crate::error::ModelError::Cancelled)) | None => Ok(None),
+            Some(Err(error)) => Err(AgentError::Model(error)),
+        }
+    }
+}
+
+async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -615,6 +742,7 @@ mod tests {
     struct ScriptedModelProvider {
         responses: Mutex<VecDeque<ChatResponse>>,
         requests: Mutex<Vec<ChatRequest>>,
+        contexts: Mutex<Vec<RequestContext>>,
         capabilities: ModelCapabilities,
     }
 
@@ -623,6 +751,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
+                contexts: Mutex::new(Vec::new()),
                 capabilities,
             }
         }
@@ -633,11 +762,26 @@ mod tests {
                 .expect("requests lock should not be poisoned")
                 .clone()
         }
+
+        fn contexts(&self) -> Vec<RequestContext> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .clone()
+        }
     }
 
     #[async_trait]
     impl ModelProvider for ScriptedModelProvider {
-        async fn complete(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            context: RequestContext,
+        ) -> Result<ModelResponse, ModelError> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .push(context);
             let chat_request = ChatRequest {
                 messages: request.messages,
                 model: request.model,
@@ -666,7 +810,15 @@ mod tests {
             self.capabilities
         }
 
-        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, ModelError> {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            context: RequestContext,
+        ) -> Result<ChatResponse, ModelError> {
+            self.contexts
+                .lock()
+                .expect("contexts lock should not be poisoned")
+                .push(context);
             self.requests
                 .lock()
                 .expect("requests lock should not be poisoned")
@@ -687,6 +839,7 @@ mod tests {
         specs: HashMap<String, ToolSpec>,
         policies: HashMap<String, ExecutionPolicy>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
+        cancellation_handles: Mutex<Vec<Arc<AtomicBool>>>,
         delay: Duration,
         invocations: AtomicUsize,
     }
@@ -702,6 +855,7 @@ mod tests {
                 specs,
                 policies: HashMap::new(),
                 outputs: Mutex::new(HashMap::new()),
+                cancellation_handles: Mutex::new(Vec::new()),
                 delay: Duration::from_millis(0),
                 invocations: AtomicUsize::new(0),
             }
@@ -733,6 +887,14 @@ mod tests {
 
         fn invocation_count(&self) -> usize {
             self.invocations.load(Ordering::Relaxed)
+        }
+
+        fn last_cancellation_handle(&self) -> Option<Arc<AtomicBool>> {
+            self.cancellation_handles
+                .lock()
+                .expect("cancellation handles lock should not be poisoned")
+                .last()
+                .cloned()
         }
     }
 
@@ -781,6 +943,11 @@ mod tests {
             prepared: PreparedToolCall,
             cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
+            self.cancellation_handles
+                .lock()
+                .expect("cancellation handles lock should not be poisoned")
+                .push(Arc::clone(&cancelled));
+
             if cancelled.load(Ordering::Relaxed) {
                 return Err(ToolInvokeError::Cancelled);
             }
@@ -884,7 +1051,7 @@ mod tests {
             "You are a helpful assistant.".to_string(),
             "test-model".to_string(),
             Some(256),
-            Arc::new(AtomicBool::new(false)),
+            RequestContext::new(Arc::new(AtomicBool::new(false))),
             approval_handler,
             Arc::new(NoopEventSink),
         )
@@ -892,9 +1059,72 @@ mod tests {
 
     struct ApproveAllApprovals;
 
+    #[async_trait]
     impl ApprovalHandler for ApproveAllApprovals {
-        fn confirm(&self, _message: &str) -> bool {
-            true
+        async fn confirm(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Approved
+        }
+    }
+
+    struct DelayedApprovalHandler {
+        delay: Duration,
+        confirmations: AtomicUsize,
+    }
+
+    impl DelayedApprovalHandler {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                confirmations: AtomicUsize::new(0),
+            }
+        }
+
+        fn confirmation_count(&self) -> usize {
+            self.confirmations.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalHandler for DelayedApprovalHandler {
+        async fn confirm(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            tokio::time::sleep(self.delay).await;
+            self.confirmations.fetch_add(1, Ordering::Relaxed);
+            ApprovalDecision::Approved
+        }
+    }
+
+    struct BlockingModelProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingModelProvider {
+        fn new(started: Arc<tokio::sync::Notify>) -> Self {
+            Self { started }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for BlockingModelProvider {
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _context: RequestContext,
+        ) -> Result<ModelResponse, ModelError> {
+            unreachable!("blocking test provider should use chat()")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            context: RequestContext,
+        ) -> Result<ChatResponse, ModelError> {
+            self.started.notify_waiters();
+            super::wait_for_cancellation(context.cancellation_handle()).await;
+            Err(ModelError::Cancelled)
+        }
+
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
         }
     }
 
@@ -1186,7 +1416,7 @@ mod tests {
         let tape_store_for_assertions = tape_store.clone();
         let mut runtime = runtime(model, tools, tape_store, Box::new(NativeToolDispatcher));
         let session_id = runtime.session_id().clone();
-        let cancelled = runtime.cancelled.clone();
+        let cancelled = runtime.cancellation_handle();
 
         let handle = tokio::spawn(async move { runtime.run_turn("cancel me").await });
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1202,6 +1432,158 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::TurnFailed))
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_turn_cancels_inflight_model_request() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_wait = started.notified();
+        let model = Arc::new(BlockingModelProvider::new(Arc::clone(&started)));
+        let tools = Arc::new(ScriptedToolInvoker::new(Vec::new()));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let tape_store_for_assertions = Arc::clone(&tape_store);
+        let mut runtime = runtime(
+            model,
+            tools,
+            Arc::clone(&tape_store),
+            Box::new(NativeToolDispatcher),
+        );
+        let session_id = runtime.session_id().clone();
+        let cancelled = runtime.cancellation_handle();
+
+        let handle = tokio::spawn(async move { runtime.run_turn("block on model").await });
+        started_wait.await;
+        cancelled.store(true, Ordering::Relaxed);
+
+        let result = handle.await.expect("task should join");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        let events = tape_store_for_assertions
+            .load_all(&session_id)
+            .await
+            .expect("events should load");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::TurnFailed))
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_handler_is_async_compatible() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("handled confirmation".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()])
+                .with_policy(
+                    "echo",
+                    ExecutionPolicy::NeedConfirmation {
+                        message: "approve echo".to_string(),
+                        sandbox: SandboxKind::Seatbelt,
+                    },
+                )
+                .with_output(
+                    "echo",
+                    Ok(ToolInvokeResult {
+                        content: "hello".to_string(),
+                        is_error: false,
+                    }),
+                ),
+        );
+        let approval_handler = Arc::new(DelayedApprovalHandler::new(Duration::from_millis(10)));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime_with_approval(
+            model,
+            tools.clone(),
+            tape_store,
+            Box::new(NativeToolDispatcher),
+            approval_handler.clone(),
+        );
+
+        let response = runtime
+            .run_turn("try confirmed tool")
+            .await
+            .expect("turn should succeed after async approval");
+
+        assert_eq!(response, "handled confirmation");
+        assert_eq!(tools.invocation_count(), 1);
+        assert_eq!(approval_handler.confirmation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_and_model_share_same_cancellation_source() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"value": "hello"}).to_string(),
+                    }],
+                    usage: None,
+                },
+                ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            ],
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let model_for_assertions = Arc::clone(&model);
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_output(
+                "echo",
+                Ok(ToolInvokeResult {
+                    content: "hello".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tools_for_assertions = Arc::clone(&tools);
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(model, tools, tape_store, Box::new(NativeToolDispatcher));
+
+        let response = runtime
+            .run_turn("share cancellation")
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(response, "done");
+        let contexts = model_for_assertions.contexts();
+        assert!(!contexts.is_empty());
+        let tool_cancelled = tools_for_assertions
+            .last_cancellation_handle()
+            .expect("tool invocation should record cancellation handle");
+        assert!(
+            contexts
+                .iter()
+                .all(|context| Arc::ptr_eq(&context.cancelled, &tool_cancelled))
         );
     }
 
