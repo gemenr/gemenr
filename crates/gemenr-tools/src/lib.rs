@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 pub mod builtin;
 pub mod handler;
 pub mod policy;
+pub mod sandbox;
 
 pub use handler::{ExecContext, ToolCallSpec, ToolError, ToolHandler, ToolOutput};
 pub use policy::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};

@@ -89,6 +89,15 @@ pub enum ToolError {
     /// Tool was not found in the registry.
     #[error("tool not found: {0}")]
     NotFound(String),
+
+    /// Requested sandbox backend is unavailable on this platform or host.
+    #[error("sandbox backend `{backend}` is unavailable: {reason}")]
+    SandboxUnavailable {
+        /// Backend name that was requested.
+        backend: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -131,6 +140,10 @@ mod tests {
         let timeout = ToolError::Timeout(Duration::from_secs(5));
         let cancelled = ToolError::Cancelled;
         let not_found = ToolError::NotFound("shell".to_string());
+        let unavailable = ToolError::SandboxUnavailable {
+            backend: "seatbelt".to_string(),
+            reason: "unsupported host".to_string(),
+        };
 
         assert_eq!(input.to_string(), "invalid input: missing field");
         assert_eq!(
@@ -140,5 +153,9 @@ mod tests {
         assert_eq!(timeout.to_string(), "execution timed out after 5s");
         assert_eq!(cancelled.to_string(), "execution cancelled");
         assert_eq!(not_found.to_string(), "tool not found: shell");
+        assert_eq!(
+            unavailable.to_string(),
+            "sandbox backend `seatbelt` is unavailable: unsupported host"
+        );
     }
 }

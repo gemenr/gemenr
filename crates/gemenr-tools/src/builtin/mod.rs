@@ -14,7 +14,10 @@ use crate::ToolPlane;
 
 /// Register all built-in Phase 1 tools into the provided tool plane.
 pub fn register_builtin_tools(plane: &mut ToolPlane, soul: Arc<RwLock<SoulManager>>) {
-    plane.register(shell::shell_spec(), Box::new(shell::ShellHandler));
+    plane.register(
+        shell::shell_spec(),
+        Box::new(shell::ShellHandler::default()),
+    );
     plane.register(fs_read::fs_read_spec(), Box::new(fs_read::FsReadHandler));
     plane.register(
         fs_write::fs_write_spec(),

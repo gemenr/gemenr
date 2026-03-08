@@ -1,15 +1,42 @@
 //! Built-in shell command execution tool.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use gemenr_core::{RiskLevel, ToolSpec};
-use tokio::process::Command;
+use gemenr_core::{ExecutionPolicy, RiskLevel, SandboxKind, ToolSpec};
 
 use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
+use crate::sandbox::{self, SandboxRunner, ShellCommand};
 
-const SHELL_OUTPUT_LIMIT: usize = 10_000;
+type RunnerSelector =
+    dyn Fn(SandboxKind) -> Result<Box<dyn SandboxRunner>, ToolError> + Send + Sync + 'static;
 
 /// Tool handler for shell command execution.
-pub struct ShellHandler;
+pub struct ShellHandler {
+    runner_selector: Arc<RunnerSelector>,
+}
+
+impl ShellHandler {
+    /// Create a shell handler with the default sandbox backend selector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            runner_selector: Arc::new(sandbox::runner_for),
+        }
+    }
+
+    /// Create a shell handler with a custom backend selector.
+    #[must_use]
+    pub fn with_runner_selector(runner_selector: Arc<RunnerSelector>) -> Self {
+        Self { runner_selector }
+    }
+}
+
+impl Default for ShellHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl ToolHandler for ShellHandler {
@@ -24,41 +51,16 @@ impl ToolHandler for ShellHandler {
             .ok_or_else(|| ToolError::Input {
                 message: "missing required field 'command'".to_string(),
             })?;
+        let shell_command = ShellCommand {
+            command: command.to_string(),
+        };
 
-        let output = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .arg("/C")
-                .arg(command)
-                .current_dir(&ctx.working_dir)
-                .output()
-                .await
-        } else {
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&ctx.working_dir)
-                .output()
-                .await
-        }
-        .map_err(|error| ToolError::Execution {
-            exit_code: None,
-            stderr: error.to_string(),
-        })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let content = truncate_output(
-            &format!("stdout:\n{}\n\nstderr:\n{}", stdout, stderr),
-            SHELL_OUTPUT_LIMIT,
-        );
-
-        if output.status.success() {
-            Ok(ToolOutput { content })
-        } else {
-            Err(ToolError::Execution {
-                exit_code: output.status.code(),
-                stderr: content,
-            })
+        match selected_sandbox(ctx.execution_policy.as_ref())? {
+            SandboxKind::None => sandbox::run_without_sandbox(&shell_command, ctx).await,
+            kind => {
+                let runner = (self.runner_selector)(kind)?;
+                runner.run(&shell_command, ctx).await
+            }
         }
     }
 }
@@ -83,25 +85,32 @@ pub fn shell_spec() -> ToolSpec {
     }
 }
 
-fn truncate_output(content: &str, limit: usize) -> String {
-    if content.chars().count() <= limit {
-        return content.to_string();
+fn selected_sandbox(policy: Option<&ExecutionPolicy>) -> Result<SandboxKind, ToolError> {
+    match policy {
+        Some(ExecutionPolicy::Allow { sandbox })
+        | Some(ExecutionPolicy::NeedConfirmation { sandbox, .. }) => Ok(*sandbox),
+        Some(ExecutionPolicy::Deny { reason }) => Err(ToolError::Execution {
+            exit_code: None,
+            stderr: format!("Denied: {reason}"),
+        }),
+        None => Ok(SandboxKind::None),
     }
-
-    let truncated = content.chars().take(limit).collect::<String>();
-    format!("{truncated}\n...[truncated]")
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use async_trait::async_trait;
     use serde_json::json;
 
-    use super::ShellHandler;
-    use crate::{ExecContext, ToolError, ToolHandler};
+    use super::{ShellHandler, shell_spec};
+    use crate::sandbox::{SandboxRunner, ShellCommand};
+    use crate::{ExecContext, ToolError, ToolHandler, ToolOutput};
+    use gemenr_core::{ExecutionPolicy, SandboxKind};
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -114,9 +123,27 @@ mod tests {
         directory
     }
 
+    #[derive(Clone)]
+    struct RecordingRunner {
+        content: &'static str,
+    }
+
+    #[async_trait]
+    impl SandboxRunner for RecordingRunner {
+        async fn run(
+            &self,
+            _command: &ShellCommand,
+            _ctx: &ExecContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: self.content.to_string(),
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn executes_simple_command() {
-        let handler = ShellHandler;
+    async fn none_sandbox_keeps_existing_behavior() {
+        let handler = ShellHandler::default();
         let context = ExecContext::default();
 
         let output = handler
@@ -130,24 +157,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_execution_error_for_failing_command() {
-        let handler = ShellHandler;
-        let context = ExecContext::default();
+    async fn policy_selects_requested_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let selector_seen = Arc::clone(&seen);
+        let handler = ShellHandler::with_runner_selector(Arc::new(move |kind| {
+            selector_seen
+                .lock()
+                .expect("selector mutex should not be poisoned")
+                .push(kind);
+            Ok(Box::new(RecordingRunner {
+                content: "sandboxed",
+            }) as Box<dyn SandboxRunner>)
+        }));
+        let context = ExecContext {
+            execution_policy: Some(ExecutionPolicy::Allow {
+                sandbox: SandboxKind::Seatbelt,
+            }),
+            ..ExecContext::default()
+        };
+
+        let output = handler
+            .execute(&context, json!({"command": "echo hello"}))
+            .await
+            .expect("command should succeed");
+
+        assert_eq!(output.content, "sandboxed");
+        assert_eq!(
+            seen.lock()
+                .expect("selector mutex should not be poisoned")
+                .as_slice(),
+            &[SandboxKind::Seatbelt]
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_backend_error_is_returned() {
+        let handler = ShellHandler::with_runner_selector(Arc::new(|kind| {
+            Err(ToolError::SandboxUnavailable {
+                backend: format!("{kind:?}"),
+                reason: "backend unavailable".to_string(),
+            })
+        }));
+        let context = ExecContext {
+            execution_policy: Some(ExecutionPolicy::Allow {
+                sandbox: SandboxKind::Landlock,
+            }),
+            ..ExecContext::default()
+        };
 
         let error = handler
-            .execute(
-                &context,
-                json!({"command": "command-that-should-not-exist-12345"}),
-            )
+            .execute(&context, json!({"command": "echo hello"}))
             .await
-            .expect_err("command should fail");
+            .expect_err("backend selection should fail");
 
-        assert!(matches!(error, ToolError::Execution { .. }));
+        assert!(matches!(error, ToolError::SandboxUnavailable { .. }));
     }
 
     #[tokio::test]
     async fn returns_input_error_when_command_is_missing() {
-        let handler = ShellHandler;
+        let handler = ShellHandler::default();
         let context = ExecContext::default();
 
         let error = handler
@@ -166,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn executes_command_in_context_working_directory() {
         let directory = temp_dir("working-dir");
-        let handler = ShellHandler;
+        let handler = ShellHandler::default();
         let context = ExecContext {
             working_dir: directory.clone(),
             timeout: Duration::from_secs(5),
@@ -189,5 +257,10 @@ mod tests {
                 .contains(directory.to_string_lossy().as_ref())
         );
         fs::remove_dir_all(directory).expect("temp directory should be removed");
+    }
+
+    #[test]
+    fn shell_tool_spec_keeps_medium_risk() {
+        assert_eq!(shell_spec().risk_level, gemenr_core::RiskLevel::Medium);
     }
 }
