@@ -5,15 +5,18 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::debug;
 
+use crate::tool_invoker::SandboxKind;
+
 const CONFIG_FILE_NAME: &str = "gemenr.toml";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_API_ENDPOINT_ENV: &str = "ANTHROPIC_API_ENDPOINT";
 const GEMENR_MODEL_ENV: &str = "GEMENR_MODEL";
+const DEFAULT_LARK_DEBOUNCE_MS: u64 = 300;
 
 /// Application configuration for Gemenr.
 ///
 /// Configuration is organized into provider definitions, model definitions,
-/// and a root model selector that chooses the active model entry.
+/// access-layer integration, and Phase 2 execution controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// The selected model configuration identifier from [`Config::models`].
@@ -27,6 +30,124 @@ pub struct Config {
     /// Valid values are `native`, `xml`, and `auto`. The default is `auto`,
     /// which lets the runtime choose based on provider capabilities.
     pub tool_dispatcher: String,
+    /// Access-layer configuration.
+    pub access: AccessConfig,
+    /// Cron-triggered jobs.
+    pub cron: Vec<CronJobConfig>,
+    /// Policy rule configuration.
+    pub policy: PolicyConfig,
+    /// Phase 2 provider fallback configuration.
+    pub fallback: Option<ModelFallbackConfig>,
+    /// External MCP server configuration.
+    pub mcp: McpConfig,
+}
+
+/// Access-layer related configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessConfig {
+    /// Lark / Feishu long-connection settings.
+    pub lark: Option<LarkConfig>,
+}
+
+/// Lark access configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LarkConfig {
+    /// App ID issued by Lark.
+    pub app_id: String,
+    /// App secret used to fetch tenant access tokens.
+    pub app_secret: String,
+    /// Optional WebSocket endpoint override for tests.
+    pub ws_endpoint: Option<String>,
+    /// Milliseconds to debounce bursts of inbound messages in one conversation.
+    pub debounce_ms: u64,
+}
+
+/// Cron-triggered task definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronJobConfig {
+    /// Stable job name.
+    pub name: String,
+    /// Cron expression.
+    pub schedule: String,
+    /// Prompt sent into task mode.
+    pub prompt: String,
+    /// Optional allowlist of tools visible to the runtime.
+    pub tools: Option<Vec<String>>,
+    /// Optional route such as `stdio:` or `lark:<chat_id>`.
+    pub report_to: Option<String>,
+}
+
+/// Root policy configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolicyConfig {
+    /// Organization-scoped rule groups.
+    pub organizations: Vec<ScopedPolicyConfig>,
+    /// Workspace-scoped rule groups.
+    pub workspaces: Vec<ScopedPolicyConfig>,
+    /// Conversation-scoped rule groups.
+    pub conversations: Vec<ScopedPolicyConfig>,
+}
+
+/// Policy rules attached to a specific scope identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedPolicyConfig {
+    /// Stable scope identifier.
+    pub id: String,
+    /// Rules evaluated within the scope.
+    pub rules: Vec<PolicyRuleConfig>,
+}
+
+/// One configured policy rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRuleConfig {
+    /// Tool name targeted by this rule.
+    pub tool: String,
+    /// Rule effect.
+    pub effect: PolicyEffect,
+    /// Sandbox backend selected when the rule applies.
+    pub sandbox: SandboxKind,
+}
+
+/// Effect configured for one policy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyEffect {
+    /// Allow the tool call.
+    Allow,
+    /// Require confirmation before execution.
+    NeedConfirmation,
+    /// Deny the tool call.
+    Deny,
+}
+
+/// Phase 2 model fallback configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFallbackConfig {
+    /// Primary provider key.
+    pub primary: String,
+    /// Backup provider keys in failover order.
+    pub backups: Vec<String>,
+}
+
+/// External stdio MCP server definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    /// Stable server name.
+    pub name: String,
+    /// Command used to start the server process.
+    pub command: String,
+    /// Command-line arguments passed to the server process.
+    pub args: Vec<String>,
+    /// Environment variables injected into the server process.
+    pub env: HashMap<String, String>,
+    /// Whether this server should be started.
+    pub enabled: bool,
+}
+
+/// Root MCP configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct McpConfig {
+    /// Configured stdio servers.
+    pub servers: Vec<McpServerConfig>,
 }
 
 /// Configuration for a model provider.
@@ -48,7 +169,7 @@ pub enum ProviderType {
 }
 
 /// Configuration for a selectable model entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     /// Provider identifier in [`Config::providers`].
     pub provider: String,
@@ -90,6 +211,15 @@ struct RawConfig {
     providers: HashMap<String, RawProviderConfig>,
     #[serde(default)]
     models: HashMap<String, RawModelConfig>,
+    #[serde(default)]
+    access: RawAccessConfig,
+    #[serde(default)]
+    cron: Vec<RawCronJobConfig>,
+    #[serde(default)]
+    policy: RawPolicyConfig,
+    fallback: Option<RawModelFallbackConfig>,
+    #[serde(default)]
+    mcp: RawMcpConfig,
 }
 
 impl Default for RawConfig {
@@ -99,6 +229,11 @@ impl Default for RawConfig {
             tool_dispatcher: default_tool_dispatcher(),
             providers: HashMap::new(),
             models: HashMap::new(),
+            access: RawAccessConfig::default(),
+            cron: Vec::new(),
+            policy: RawPolicyConfig::default(),
+            fallback: None,
+            mcp: RawMcpConfig::default(),
         }
     }
 }
@@ -118,6 +253,87 @@ struct RawModelConfig {
     provider: String,
     model: String,
     max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccessConfig {
+    lark: Option<RawLarkConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLarkConfig {
+    app_id: String,
+    app_secret: String,
+    ws_endpoint: Option<String>,
+    #[serde(default = "default_lark_debounce_ms")]
+    debounce_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCronJobConfig {
+    name: String,
+    schedule: String,
+    prompt: String,
+    tools: Option<Vec<String>>,
+    report_to: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyConfig {
+    #[serde(default)]
+    organizations: Vec<RawScopedPolicyConfig>,
+    #[serde(default)]
+    workspaces: Vec<RawScopedPolicyConfig>,
+    #[serde(default)]
+    conversations: Vec<RawScopedPolicyConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScopedPolicyConfig {
+    id: String,
+    #[serde(default)]
+    rules: Vec<RawPolicyRuleConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyRuleConfig {
+    tool: String,
+    effect: String,
+    #[serde(default = "default_sandbox_kind")]
+    sandbox: SandboxKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelFallbackConfig {
+    primary: String,
+    backups: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpConfig {
+    #[serde(default)]
+    servers: Vec<RawMcpServerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
 }
 
 impl Config {
@@ -179,15 +395,32 @@ impl Config {
 
         Ok(Self {
             model: selected_model_id,
-            providers,
+            providers: providers.clone(),
             models,
             tool_dispatcher,
+            access: build_access_config(raw_config.access)?,
+            cron: build_cron_jobs(raw_config.cron)?,
+            policy: build_policy_config(raw_config.policy)?,
+            fallback: build_fallback_config(raw_config.fallback, &providers)?,
+            mcp: build_mcp_config(raw_config.mcp)?,
         })
     }
 }
 
 fn default_tool_dispatcher() -> String {
     "auto".to_string()
+}
+
+fn default_lark_debounce_ms() -> u64 {
+    DEFAULT_LARK_DEBOUNCE_MS
+}
+
+fn default_sandbox_kind() -> SandboxKind {
+    SandboxKind::None
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn parse_tool_dispatcher(tool_dispatcher: String) -> Result<String, ConfigError> {
@@ -273,6 +506,172 @@ fn build_providers(
     Ok(providers)
 }
 
+fn build_access_config(raw_access: RawAccessConfig) -> Result<AccessConfig, ConfigError> {
+    Ok(AccessConfig {
+        lark: raw_access.lark.map(build_lark_config).transpose()?,
+    })
+}
+
+fn build_lark_config(raw_lark: RawLarkConfig) -> Result<LarkConfig, ConfigError> {
+    Ok(LarkConfig {
+        app_id: normalize_required_string(raw_lark.app_id, || {
+            "access.lark.app_id must not be empty".to_string()
+        })?,
+        app_secret: normalize_required_string(raw_lark.app_secret, || {
+            "access.lark.app_secret must not be empty".to_string()
+        })?,
+        ws_endpoint: normalize_optional_string(raw_lark.ws_endpoint),
+        debounce_ms: raw_lark.debounce_ms,
+    })
+}
+
+fn build_cron_jobs(raw_cron: Vec<RawCronJobConfig>) -> Result<Vec<CronJobConfig>, ConfigError> {
+    raw_cron
+        .into_iter()
+        .enumerate()
+        .map(|(index, job)| {
+            Ok(CronJobConfig {
+                name: normalize_required_string(job.name, || {
+                    format!("cron[{index}].name must not be empty")
+                })?,
+                schedule: normalize_required_string(job.schedule, || {
+                    format!("cron[{index}].schedule must not be empty")
+                })?,
+                prompt: normalize_required_string(job.prompt, || {
+                    format!("cron[{index}].prompt must not be empty")
+                })?,
+                tools: normalize_optional_vec(job.tools),
+                report_to: normalize_optional_string(job.report_to),
+            })
+        })
+        .collect()
+}
+
+fn build_policy_config(raw_policy: RawPolicyConfig) -> Result<PolicyConfig, ConfigError> {
+    Ok(PolicyConfig {
+        organizations: build_scoped_policy_configs(
+            raw_policy.organizations,
+            "policy.organizations",
+        )?,
+        workspaces: build_scoped_policy_configs(raw_policy.workspaces, "policy.workspaces")?,
+        conversations: build_scoped_policy_configs(
+            raw_policy.conversations,
+            "policy.conversations",
+        )?,
+    })
+}
+
+fn build_scoped_policy_configs(
+    raw_groups: Vec<RawScopedPolicyConfig>,
+    scope_name: &str,
+) -> Result<Vec<ScopedPolicyConfig>, ConfigError> {
+    raw_groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            Ok(ScopedPolicyConfig {
+                id: normalize_required_string(group.id, || {
+                    format!("{scope_name}[{index}].id must not be empty")
+                })?,
+                rules: build_policy_rules(group.rules, scope_name, index)?,
+            })
+        })
+        .collect()
+}
+
+fn build_policy_rules(
+    raw_rules: Vec<RawPolicyRuleConfig>,
+    scope_name: &str,
+    scope_index: usize,
+) -> Result<Vec<PolicyRuleConfig>, ConfigError> {
+    raw_rules
+        .into_iter()
+        .enumerate()
+        .map(|(rule_index, rule)| {
+            Ok::<PolicyRuleConfig, ConfigError>(PolicyRuleConfig {
+                tool: normalize_required_string(rule.tool, || {
+                    format!(
+                        "{scope_name}[{scope_index}].rules[{rule_index}].tool must not be empty"
+                    )
+                })?,
+                effect: parse_policy_effect(&rule.effect, scope_name, scope_index, rule_index)?,
+                sandbox: rule.sandbox,
+            })
+        })
+        .collect()
+}
+
+fn parse_policy_effect(
+    value: &str,
+    scope_name: &str,
+    scope_index: usize,
+    rule_index: usize,
+) -> Result<PolicyEffect, ConfigError> {
+    match value.trim() {
+        "allow" => Ok(PolicyEffect::Allow),
+        "confirm" | "need_confirmation" => Ok(PolicyEffect::NeedConfirmation),
+        "deny" => Ok(PolicyEffect::Deny),
+        other => Err(ConfigError::Invalid(format!(
+            "{scope_name}[{scope_index}].rules[{rule_index}].effect `{other}` is not supported"
+        ))),
+    }
+}
+
+fn build_fallback_config(
+    raw_fallback: Option<RawModelFallbackConfig>,
+    providers: &HashMap<String, ProviderConfig>,
+) -> Result<Option<ModelFallbackConfig>, ConfigError> {
+    let Some(raw_fallback) = raw_fallback else {
+        return Ok(None);
+    };
+
+    let primary = normalize_required_string(raw_fallback.primary, || {
+        "fallback.primary must not be empty".to_string()
+    })?;
+    if !providers.contains_key(&primary) {
+        return Err(ConfigError::Invalid(format!(
+            "fallback.primary references unknown provider `{primary}`"
+        )));
+    }
+
+    let backups = normalize_required_vec(raw_fallback.backups, || {
+        "fallback.backups must contain at least one provider".to_string()
+    })?;
+
+    for backup in &backups {
+        if !providers.contains_key(backup) {
+            return Err(ConfigError::Invalid(format!(
+                "fallback.backups references unknown provider `{backup}`"
+            )));
+        }
+    }
+
+    Ok(Some(ModelFallbackConfig { primary, backups }))
+}
+
+fn build_mcp_config(raw_mcp: RawMcpConfig) -> Result<McpConfig, ConfigError> {
+    let servers = raw_mcp
+        .servers
+        .into_iter()
+        .enumerate()
+        .map(|(index, server)| {
+            Ok::<McpServerConfig, ConfigError>(McpServerConfig {
+                name: normalize_required_string(server.name, || {
+                    format!("mcp.servers[{index}].name must not be empty")
+                })?,
+                command: normalize_required_string(server.command, || {
+                    format!("mcp.servers[{index}].command must not be empty")
+                })?,
+                args: normalize_string_vec(server.args),
+                env: normalize_string_map(server.env),
+                enabled: server.enabled,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+
+    Ok(McpConfig { servers })
+}
+
 fn validate_model_references(
     models: &HashMap<String, ModelConfig>,
     providers: &HashMap<String, ProviderConfig>,
@@ -347,6 +746,43 @@ fn normalize_required_string(
     error_message: impl FnOnce() -> String,
 ) -> Result<String, ConfigError> {
     normalize_optional_string(Some(value)).ok_or_else(|| ConfigError::Invalid(error_message()))
+}
+
+fn normalize_optional_vec(values: Option<Vec<String>>) -> Option<Vec<String>> {
+    values.and_then(|values| {
+        let normalized = normalize_string_vec(values);
+        (!normalized.is_empty()).then_some(normalized)
+    })
+}
+
+fn normalize_required_vec(
+    values: Vec<String>,
+    error_message: impl FnOnce() -> String,
+) -> Result<Vec<String>, ConfigError> {
+    let normalized = normalize_string_vec(values);
+    if normalized.is_empty() {
+        Err(ConfigError::Invalid(error_message()))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn normalize_string_vec(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|value| normalize_optional_string(Some(value)))
+        .collect()
+}
+
+fn normalize_string_map(values: HashMap<String, String>) -> HashMap<String, String> {
+    values
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let normalized_key = normalize_optional_string(Some(key))?;
+            let normalized_value = normalize_optional_string(Some(value))?;
+            Some((normalized_key, normalized_value))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,6 +903,10 @@ max_tokens = 256
             selected_provider.api_endpoint.as_deref(),
             Some("https://file.example/v1/messages")
         );
+        assert!(config.access.lark.is_none());
+        assert!(config.cron.is_empty());
+        assert!(config.fallback.is_none());
+        assert!(config.mcp.servers.is_empty());
     }
 
     #[test]
@@ -552,6 +992,194 @@ max_tokens = 256
 
         assert_eq!(config.model, "default");
         assert_eq!(config.tool_dispatcher, "auto");
+    }
+
+    #[test]
+    fn load_parses_lark_access_config() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[access.lark]
+app_id = "cli-app"
+app_secret = "cli-secret"
+ws_endpoint = "wss://example.invalid/ws"
+debounce_ms = 750
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+        let lark = config.access.lark.expect("lark config should exist");
+
+        assert_eq!(lark.app_id, "cli-app");
+        assert_eq!(lark.app_secret, "cli-secret");
+        assert_eq!(
+            lark.ws_endpoint.as_deref(),
+            Some("wss://example.invalid/ws")
+        );
+        assert_eq!(lark.debounce_ms, 750);
+    }
+
+    #[test]
+    fn load_parses_cron_jobs() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[[cron]]
+name = "daily-system-check"
+schedule = "0 9 * * *"
+prompt = "run checks"
+tools = ["shell", "fs.read"]
+report_to = "stdio:"
+
+[[cron]]
+name = "weekly-report"
+schedule = "0 18 * * 5"
+prompt = "send report"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+
+        assert_eq!(config.cron.len(), 2);
+        assert_eq!(
+            config.cron[0].tools.as_deref(),
+            Some(&["shell".to_string(), "fs.read".to_string()][..])
+        );
+        assert_eq!(config.cron[0].report_to.as_deref(), Some("stdio:"));
+        assert_eq!(config.cron[1].tools, None);
+        assert_eq!(config.cron[1].report_to, None);
+    }
+
+    #[test]
+    fn load_parses_mcp_servers() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = "file-api-key"
+
+[models.default]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+
+[[mcp.servers]]
+name = "filesystem"
+command = "node"
+args = ["server.js", "--stdio"]
+enabled = false
+
+[mcp.servers.env]
+NODE_ENV = "test"
+ROOT = "/tmp/project"
+"#,
+        );
+
+        let config = Config::load_from(&config_path).expect("config should parse");
+        let server = &config.mcp.servers[0];
+
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(server.command, "node");
+        assert_eq!(server.args, vec!["server.js", "--stdio"]);
+        assert_eq!(server.env.get("NODE_ENV").map(String::as_str), Some("test"));
+        assert_eq!(
+            server.env.get("ROOT").map(String::as_str),
+            Some("/tmp/project")
+        );
+        assert!(!server.enabled);
+    }
+
+    #[test]
+    fn load_rejects_empty_fallback_backups() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.primary]
+type = "anthropic"
+api_key = "primary-key"
+
+[providers.backup]
+type = "anthropic"
+api_key = "backup-key"
+
+[models.default]
+provider = "primary"
+model = "claude-haiku-4-5-20251001"
+
+[fallback]
+primary = "primary"
+backups = []
+"#,
+        );
+
+        let error = Config::load_from(&config_path)
+            .expect_err("config should reject empty fallback backups");
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("fallback.backups"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_unknown_fallback_provider() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex should lock");
+        let isolation = TestIsolation::new();
+        let config_path = write_config(
+            isolation.temp_dir(),
+            r#"
+model = "default"
+
+[providers.primary]
+type = "anthropic"
+api_key = "primary-key"
+
+[models.default]
+provider = "primary"
+model = "claude-haiku-4-5-20251001"
+
+[fallback]
+primary = "primary"
+backups = ["missing"]
+"#,
+        );
+
+        let error = Config::load_from(&config_path)
+            .expect_err("config should reject unknown fallback provider");
+        assert!(
+            matches!(error, ConfigError::Invalid(message) if message.contains("unknown provider `missing`"))
+        );
     }
 
     #[test]

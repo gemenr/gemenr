@@ -1,5 +1,7 @@
 //! Gemenr core library types and traits.
 
+/// Shared access-layer message and routing models.
+pub mod access;
 /// Agent loop components such as tool dispatch strategies.
 pub mod agent;
 /// Runtime builder for assembling agent runtimes.
@@ -23,6 +25,14 @@ pub mod tool_invoker;
 /// Tool specification types shared across providers and tools.
 pub mod tool_spec;
 
+/// Re-export of normalized inbound access messages.
+pub use access::AccessInbound;
+/// Re-export of normalized outbound access messages.
+pub use access::AccessOutbound;
+/// Re-export of access-layer conversation identifiers.
+pub use access::ConversationId;
+/// Re-export of access-layer reply routes.
+pub use access::ReplyRoute;
 /// Re-export of the application configuration type.
 pub use agent::ConversationMessage;
 /// Re-export of the native tool dispatcher.
@@ -37,16 +47,36 @@ pub use agent::ToolExecutionResult;
 pub use agent::XmlToolDispatcher;
 /// Re-export of runtime builder.
 pub use builder::RuntimeBuilder;
+/// Re-export of access-layer configuration.
+pub use config::AccessConfig;
 /// Re-export of the application configuration type.
 pub use config::Config;
 /// Re-export of configuration loading errors.
 pub use config::ConfigError;
+/// Re-export of cron job configuration.
+pub use config::CronJobConfig;
+/// Re-export of Lark access configuration.
+pub use config::LarkConfig;
+/// Re-export of MCP configuration.
+pub use config::McpConfig;
+/// Re-export of external MCP server definitions.
+pub use config::McpServerConfig;
 /// Re-export of selectable model definitions.
 pub use config::ModelConfig;
+/// Re-export of provider fallback configuration.
+pub use config::ModelFallbackConfig;
+/// Re-export of scoped policy configuration.
+pub use config::PolicyConfig;
+/// Re-export of configured policy effects.
+pub use config::PolicyEffect;
+/// Re-export of configured policy rules.
+pub use config::PolicyRuleConfig;
 /// Re-export of provider definitions.
 pub use config::ProviderConfig;
 /// Re-export of supported provider types.
 pub use config::ProviderType;
+/// Re-export of configured policy scopes.
+pub use config::ScopedPolicyConfig;
 /// Re-export of anchor checkpoint entries.
 pub use context::AnchorEntry;
 /// Re-export of anchor identifiers.
@@ -131,8 +161,12 @@ pub use protocol::SessionHint;
 pub use protocol::SessionId;
 /// Re-export of turn identifiers.
 pub use protocol::TurnId;
-/// Re-export of tool policy decisions.
-pub use tool_invoker::PolicyDecision;
+/// Re-export of final execution policies.
+pub use tool_invoker::ExecutionPolicy;
+/// Re-export of policy evaluation context.
+pub use tool_invoker::PolicyContext;
+/// Re-export of sandbox selection kinds.
+pub use tool_invoker::SandboxKind;
 /// Re-export of tool invocation errors.
 pub use tool_invoker::ToolInvokeError;
 /// Re-export of successful tool invocation results.

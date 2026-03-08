@@ -165,7 +165,9 @@ mod tests {
         ModelResponse,
     };
     use crate::protocol::SessionId;
-    use crate::tool_invoker::{PolicyDecision, ToolInvokeError, ToolInvokeResult, ToolInvoker};
+    use crate::tool_invoker::{
+        ExecutionPolicy, PolicyContext, SandboxKind, ToolInvokeError, ToolInvokeResult, ToolInvoker,
+    };
     use crate::tool_spec::{RiskLevel, ToolSpec};
 
     struct RecordingModelProvider {
@@ -256,8 +258,15 @@ mod tests {
             self.specs.values().cloned().collect()
         }
 
-        fn check_policy(&self, _name: &str, _arguments: &serde_json::Value) -> PolicyDecision {
-            PolicyDecision::Allow
+        fn check_policy(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+            _context: &PolicyContext,
+        ) -> ExecutionPolicy {
+            ExecutionPolicy::Allow {
+                sandbox: SandboxKind::None,
+            }
         }
 
         async fn invoke(

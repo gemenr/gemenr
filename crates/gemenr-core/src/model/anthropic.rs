@@ -1156,6 +1156,11 @@ mod tests {
             providers,
             models,
             tool_dispatcher: "auto".to_string(),
+            access: Default::default(),
+            cron: Vec::new(),
+            policy: Default::default(),
+            fallback: None,
+            mcp: Default::default(),
         }
     }
 

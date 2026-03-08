@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -30,7 +31,7 @@ pub enum ToolInvokeError {
     Cancelled,
 }
 
-/// Policy decision for a tool call.
+/// Backward-compatible Phase 1 policy decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
     /// Tool call is allowed without confirmation.
@@ -39,6 +40,51 @@ pub enum PolicyDecision {
     NeedConfirmation(String),
     /// Tool call is denied with the provided reason.
     Deny(String),
+}
+
+/// Context used when evaluating a tool execution policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyContext {
+    /// Organization identifier associated with the turn.
+    pub organization_id: Option<String>,
+    /// Workspace identifier associated with the turn.
+    pub workspace_id: Option<String>,
+    /// Conversation identifier associated with the turn.
+    pub conversation_id: Option<String>,
+}
+
+/// Sandbox backend selected by policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxKind {
+    /// Run the tool without a sandbox wrapper.
+    None,
+    /// Run inside a macOS Seatbelt sandbox.
+    Seatbelt,
+    /// Run inside a Linux Landlock sandbox.
+    Landlock,
+}
+
+/// Final execution plan returned by policy evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    /// Allow execution with the selected sandbox backend.
+    Allow {
+        /// Sandbox backend requested by policy.
+        sandbox: SandboxKind,
+    },
+    /// Require confirmation before execution.
+    NeedConfirmation {
+        /// User-facing confirmation prompt.
+        message: String,
+        /// Sandbox backend requested by policy.
+        sandbox: SandboxKind,
+    },
+    /// Deny execution with a human-readable reason.
+    Deny {
+        /// Reason for the denial.
+        reason: String,
+    },
 }
 
 /// Abstract interface for tool lookup, policy checks, and execution.
@@ -54,7 +100,12 @@ pub trait ToolInvoker: Send + Sync {
     fn list_specs(&self) -> Vec<ToolSpec>;
 
     /// Evaluate the policy for a tool call.
-    fn check_policy(&self, name: &str, arguments: &serde_json::Value) -> PolicyDecision;
+    fn check_policy(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &PolicyContext,
+    ) -> ExecutionPolicy;
 
     /// Execute a tool call.
     async fn invoke(
@@ -64,4 +115,57 @@ pub trait ToolInvoker: Send + Sync {
         arguments: serde_json::Value,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ToolInvokeResult, ToolInvokeError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ExecutionPolicy, SandboxKind};
+
+    #[test]
+    fn execution_policy_variants_are_comparable() {
+        assert_eq!(
+            ExecutionPolicy::Allow {
+                sandbox: SandboxKind::Seatbelt,
+            },
+            ExecutionPolicy::Allow {
+                sandbox: SandboxKind::Seatbelt,
+            }
+        );
+        assert_eq!(
+            ExecutionPolicy::NeedConfirmation {
+                message: "confirm".to_string(),
+                sandbox: SandboxKind::Landlock,
+            },
+            ExecutionPolicy::NeedConfirmation {
+                message: "confirm".to_string(),
+                sandbox: SandboxKind::Landlock,
+            }
+        );
+        assert_eq!(
+            ExecutionPolicy::Deny {
+                reason: "nope".to_string(),
+            },
+            ExecutionPolicy::Deny {
+                reason: "nope".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_kind_serializes_to_stable_values() {
+        assert_eq!(
+            serde_json::to_value(SandboxKind::None).expect("serialize"),
+            json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(SandboxKind::Seatbelt).expect("serialize"),
+            json!("seatbelt")
+        );
+        assert_eq!(
+            serde_json::to_value(SandboxKind::Landlock).expect("serialize"),
+            json!("landlock")
+        );
+    }
 }

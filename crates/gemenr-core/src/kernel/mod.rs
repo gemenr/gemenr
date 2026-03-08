@@ -10,7 +10,7 @@ use crate::context::{ContextBuildResult, ContextManager, TokenBudget};
 use crate::message::ChatMessage;
 use crate::model::{ModelProvider, ModelRequest, ToolCall};
 use crate::protocol::{EventEnvelope, EventKind, SessionId, TurnId};
-use crate::tool_invoker::{PolicyDecision, ToolInvokeError, ToolInvoker};
+use crate::tool_invoker::{ExecutionPolicy, PolicyContext, ToolInvokeError, ToolInvoker};
 
 pub mod prompt;
 pub mod turn;
@@ -233,9 +233,13 @@ impl AgentRuntime {
                     for call in tool_calls {
                         self.check_cancelled()?;
 
-                        match self.tools.check_policy(&call.name, &call.arguments) {
-                            PolicyDecision::Allow => {}
-                            PolicyDecision::NeedConfirmation(message) => {
+                        let policy_context = PolicyContext::default();
+                        match self
+                            .tools
+                            .check_policy(&call.name, &call.arguments, &policy_context)
+                        {
+                            ExecutionPolicy::Allow { .. } => {}
+                            ExecutionPolicy::NeedConfirmation { message, .. } => {
                                 if !self.approval_handler.confirm(&message) {
                                     let content = "User denied execution".to_string();
                                     self.emit_tool_event(
@@ -254,7 +258,7 @@ impl AgentRuntime {
                                     continue;
                                 }
                             }
-                            PolicyDecision::Deny(reason) => {
+                            ExecutionPolicy::Deny { reason } => {
                                 let content = format!("Denied: {reason}");
                                 self.emit_tool_event(
                                     &turn_id,
@@ -462,7 +466,7 @@ mod tests {
     use crate::error::ModelError;
     use crate::message::ChatRole;
     use crate::model::{ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelResponse};
-    use crate::tool_invoker::ToolInvokeResult;
+    use crate::tool_invoker::{ExecutionPolicy, PolicyContext, SandboxKind, ToolInvokeResult};
     use crate::tool_spec::{RiskLevel, ToolSpec};
     use async_trait::async_trait;
 
@@ -539,7 +543,7 @@ mod tests {
 
     struct ScriptedToolInvoker {
         specs: HashMap<String, ToolSpec>,
-        policies: HashMap<String, PolicyDecision>,
+        policies: HashMap<String, ExecutionPolicy>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
         delay: Duration,
     }
@@ -589,11 +593,18 @@ mod tests {
             self.specs.values().cloned().collect()
         }
 
-        fn check_policy(&self, name: &str, _arguments: &serde_json::Value) -> PolicyDecision {
+        fn check_policy(
+            &self,
+            name: &str,
+            _arguments: &serde_json::Value,
+            _context: &PolicyContext,
+        ) -> ExecutionPolicy {
             self.policies
                 .get(name)
                 .cloned()
-                .unwrap_or(PolicyDecision::Allow)
+                .unwrap_or(ExecutionPolicy::Allow {
+                    sandbox: SandboxKind::None,
+                })
         }
 
         async fn invoke(

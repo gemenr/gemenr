@@ -122,9 +122,12 @@ impl tool_invoker::ToolInvoker for ToolPlane {
         &self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> tool_invoker::PolicyDecision {
+        _context: &tool_invoker::PolicyContext,
+    ) -> tool_invoker::ExecutionPolicy {
         let Some(spec) = self.lookup(name) else {
-            return tool_invoker::PolicyDecision::Deny(format!("Tool '{}' not found", name));
+            return tool_invoker::ExecutionPolicy::Deny {
+                reason: format!("Tool '{}' not found", name),
+            };
         };
 
         let call = ToolCallSpec {
@@ -134,12 +137,17 @@ impl tool_invoker::ToolInvoker for ToolPlane {
         };
 
         match evaluate_policy(spec, &call) {
-            crate::policy::PolicyDecision::Allow => tool_invoker::PolicyDecision::Allow,
+            crate::policy::PolicyDecision::Allow => tool_invoker::ExecutionPolicy::Allow {
+                sandbox: tool_invoker::SandboxKind::None,
+            },
             crate::policy::PolicyDecision::NeedConfirmation(message) => {
-                tool_invoker::PolicyDecision::NeedConfirmation(message)
+                tool_invoker::ExecutionPolicy::NeedConfirmation {
+                    message,
+                    sandbox: tool_invoker::SandboxKind::None,
+                }
             }
             crate::policy::PolicyDecision::Deny(reason) => {
-                tool_invoker::PolicyDecision::Deny(reason)
+                tool_invoker::ExecutionPolicy::Deny { reason }
             }
         }
     }

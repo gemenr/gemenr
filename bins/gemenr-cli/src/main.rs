@@ -570,6 +570,11 @@ mod tests {
             providers,
             models,
             tool_dispatcher: "auto".to_string(),
+            access: Default::default(),
+            cron: Vec::new(),
+            policy: Default::default(),
+            fallback: None,
+            mcp: Default::default(),
         }
     }
 
@@ -658,8 +663,11 @@ mod tests {
             &self,
             _name: &str,
             _arguments: &serde_json::Value,
-        ) -> gemenr_core::PolicyDecision {
-            gemenr_core::PolicyDecision::Allow
+            _context: &gemenr_core::PolicyContext,
+        ) -> gemenr_core::ExecutionPolicy {
+            gemenr_core::ExecutionPolicy::Allow {
+                sandbox: gemenr_core::SandboxKind::None,
+            }
         }
 
         async fn invoke(
