@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::tool_spec::ToolSpec;
 
@@ -23,6 +25,9 @@ pub enum ToolInvokeError {
     /// The tool execution timed out.
     #[error("tool execution timed out")]
     Timeout,
+    /// The tool execution was cancelled.
+    #[error("tool execution cancelled")]
+    Cancelled,
 }
 
 /// Policy decision for a tool call.
@@ -57,5 +62,6 @@ pub trait ToolInvoker: Send + Sync {
         call_id: &str,
         name: &str,
         arguments: serde_json::Value,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<ToolInvokeResult, ToolInvokeError>;
 }

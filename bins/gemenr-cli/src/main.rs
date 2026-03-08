@@ -5,8 +5,9 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
-    ChatMessage, Config, ConfigError, InMemoryTapeStore, JsonlTapeStore, ModelError, ModelProvider,
-    ModelRequest, RuntimeBuilder, SoulManager, TapeStore, ToolInvoker,
+    ApprovalHandler, ChatMessage, Config, ConfigError, EventEnvelope, EventKind, EventSink,
+    InMemoryTapeStore, JsonlTapeStore, ModelError, ModelProvider, ModelRequest, RuntimeBuilder,
+    SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -70,6 +71,77 @@ fn init_tracing() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .init();
+}
+
+struct StdinApprovalHandler;
+
+impl ApprovalHandler for StdinApprovalHandler {
+    fn confirm(&self, message: &str) -> bool {
+        eprintln!("{message} [y/N]");
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return false;
+        }
+
+        input.trim().eq_ignore_ascii_case("y")
+    }
+}
+
+struct StdioEventSink;
+
+impl EventSink for StdioEventSink {
+    fn publish(&self, event: &EventEnvelope) {
+        match &event.kind {
+            EventKind::UserInput => {
+                if let Some(text) = event.payload.get("text").and_then(|value| value.as_str()) {
+                    eprintln!("[user_input] {text}");
+                }
+            }
+            EventKind::ModelResponse => {
+                if let Some(text) = event.payload.get("text").and_then(|value| value.as_str()) {
+                    eprintln!("[model_response] {text}");
+                }
+            }
+            EventKind::ToolStarted => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool");
+                eprintln!("[tool_started] {name}");
+            }
+            EventKind::ToolCompleted => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool");
+                let result = event
+                    .payload
+                    .get("result")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                eprintln!("[tool_completed] {name}: {result}");
+            }
+            EventKind::ToolFailed => {
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("tool");
+                let result = event
+                    .payload
+                    .get("result")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                eprintln!("[tool_failed] {name}: {result}");
+            }
+            EventKind::ContextSummarized => {
+                eprintln!("[context_summarized]");
+            }
+            EventKind::AnchorCreated | EventKind::Custom(_) => {}
+        }
+    }
 }
 
 async fn run_chat(provider: &dyn ModelProvider, config: &Config) {
@@ -183,16 +255,27 @@ async fn run_task(task: &str, config: &Config) {
     let builder = RuntimeBuilder::new(provider, tools, soul, tape_store)
         .model_name(selected_model.model.clone())
         .max_tokens(selected_model.max_tokens.unwrap_or(4096))
-        .tool_dispatcher(config.tool_dispatcher.clone());
+        .tool_dispatcher(config.tool_dispatcher.clone())
+        .approval_handler(Arc::new(StdinApprovalHandler))
+        .event_sink(Arc::new(StdioEventSink));
 
     let system_prompt = format!(
         "You are an autonomous agent. Execute the following task:\n\n{task}\n\nUse the available tools to complete the task. When done, provide a summary of what you accomplished."
     );
     let mut runtime = builder.build(system_prompt);
+    let cancellation_handle = runtime.cancellation_handle();
+    let interrupt_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancellation_handle.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 
     tracing::info!(target: "gemenr::cli", task = task, "starting task execution");
 
-    match runtime.run_turn(task).await {
+    let result = runtime.run_turn(task).await;
+    interrupt_task.abort();
+
+    match result {
         Ok(result) => println!("\n{result}"),
         Err(error) => {
             eprintln!("Task failed: {error}");

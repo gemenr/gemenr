@@ -1,6 +1,5 @@
 //! Runtime kernel — agent loop, prompt composition, and turn control.
 
-use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,6 +41,36 @@ pub enum AgentError {
     Cancelled,
 }
 
+/// Handles user confirmations required before tool execution.
+pub trait ApprovalHandler: Send + Sync {
+    /// Ask whether a pending tool call should proceed.
+    fn confirm(&self, message: &str) -> bool;
+}
+
+/// Default approval handler used when no external confirmation mechanism exists.
+#[derive(Debug, Default)]
+pub struct DenyAllApprovals;
+
+impl ApprovalHandler for DenyAllApprovals {
+    fn confirm(&self, _message: &str) -> bool {
+        false
+    }
+}
+
+/// Receives runtime events for presentation or observability.
+pub trait EventSink: Send + Sync {
+    /// Publish a runtime event after it has been persisted to tape.
+    fn publish(&self, event: &EventEnvelope);
+}
+
+/// Default event sink that ignores all runtime events.
+#[derive(Debug, Default)]
+pub struct NoopEventSink;
+
+impl EventSink for NoopEventSink {
+    fn publish(&self, _event: &EventEnvelope) {}
+}
+
 /// Independent runtime for a single task or conversation.
 ///
 /// Each task gets its own [`AgentRuntime`] with an independent context tape.
@@ -69,6 +98,10 @@ pub struct AgentRuntime {
     max_tokens: Option<u32>,
     /// Shared cancellation flag for the active turn.
     cancelled: Arc<AtomicBool>,
+    /// Confirmation handler for medium/high-risk tool execution.
+    approval_handler: Arc<dyn ApprovalHandler>,
+    /// Event sink used for real-time event delivery.
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl AgentRuntime {
@@ -85,6 +118,8 @@ impl AgentRuntime {
         model_name: String,
         max_tokens: Option<u32>,
         cancelled: Arc<AtomicBool>,
+        approval_handler: Arc<dyn ApprovalHandler>,
+        event_sink: Arc<dyn EventSink>,
     ) -> Self {
         Self {
             context,
@@ -98,6 +133,8 @@ impl AgentRuntime {
             model_name,
             max_tokens,
             cancelled,
+            approval_handler,
+            event_sink,
         }
     }
 
@@ -121,15 +158,13 @@ impl AgentRuntime {
                         .apply_summary(summary.clone())
                         .await
                         .map_err(|error| AgentError::Context(error.to_string()))?;
-                    self.context
-                        .append(EventEnvelope::new(
-                            self.context.session_id().clone(),
-                            Some(turn_id.clone()),
-                            EventKind::ContextSummarized,
-                            json!({"summary": summary}),
-                        ))
-                        .await
-                        .map_err(|error| AgentError::Context(error.to_string()))?;
+                    self.append_event(EventEnvelope::new(
+                        self.context.session_id().clone(),
+                        Some(turn_id.clone()),
+                        EventKind::ContextSummarized,
+                        json!({"summary": summary}),
+                    ))
+                    .await?;
 
                     match self.context.build_context(&self.budget) {
                         ContextBuildResult::Ready(messages) => messages,
@@ -193,7 +228,7 @@ impl AgentRuntime {
                         match self.tools.check_policy(&call.name, &call.arguments) {
                             PolicyDecision::Allow => {}
                             PolicyDecision::NeedConfirmation(message) => {
-                                if !self.confirm_via_stdin(&message) {
+                                if !self.approval_handler.confirm(&message) {
                                     let content = "User denied execution".to_string();
                                     self.emit_tool_event(
                                         &turn_id,
@@ -235,7 +270,12 @@ impl AgentRuntime {
 
                         match self
                             .tools
-                            .invoke(&call.id, &call.name, call.arguments.clone())
+                            .invoke(
+                                &call.id,
+                                &call.name,
+                                call.arguments.clone(),
+                                Arc::clone(&self.cancelled),
+                            )
                             .await
                         {
                             Ok(result) => {
@@ -254,6 +294,17 @@ impl AgentRuntime {
                                 });
                             }
                             Err(error) => {
+                                if matches!(error, ToolInvokeError::Cancelled) {
+                                    self.emit_tool_event(
+                                        &turn_id,
+                                        EventKind::ToolFailed,
+                                        &call.name,
+                                        "Tool execution cancelled",
+                                    )
+                                    .await?;
+                                    return Err(AgentError::Cancelled);
+                                }
+
                                 let content = tool_error_message(&error, &call.name);
                                 self.emit_tool_event(
                                     &turn_id,
@@ -287,6 +338,12 @@ impl AgentRuntime {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 
+    /// Return a clone of the runtime cancellation flag for external interrupt wiring.
+    #[must_use]
+    pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     /// Return this runtime's session identifier.
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
@@ -294,15 +351,13 @@ impl AgentRuntime {
     }
 
     async fn append_user_input(&mut self, turn_id: &TurnId, text: &str) -> Result<(), AgentError> {
-        self.context
-            .append(EventEnvelope::new(
-                self.context.session_id().clone(),
-                Some(turn_id.clone()),
-                EventKind::UserInput,
-                json!({"text": text}),
-            ))
-            .await
-            .map_err(|error| AgentError::Context(error.to_string()))
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            EventKind::UserInput,
+            json!({"text": text}),
+        ))
+        .await
     }
 
     async fn append_model_response(
@@ -310,15 +365,13 @@ impl AgentRuntime {
         turn_id: &TurnId,
         text: &str,
     ) -> Result<(), AgentError> {
-        self.context
-            .append(EventEnvelope::new(
-                self.context.session_id().clone(),
-                Some(turn_id.clone()),
-                EventKind::ModelResponse,
-                json!({"text": text}),
-            ))
-            .await
-            .map_err(|error| AgentError::Context(error.to_string()))
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            EventKind::ModelResponse,
+            json!({"text": text}),
+        ))
+        .await
     }
 
     async fn emit_tool_event(
@@ -328,18 +381,25 @@ impl AgentRuntime {
         tool_name: &str,
         content: &str,
     ) -> Result<(), AgentError> {
+        self.append_event(EventEnvelope::new(
+            self.context.session_id().clone(),
+            Some(turn_id.clone()),
+            kind,
+            json!({
+                "name": tool_name,
+                "result": content,
+            }),
+        ))
+        .await
+    }
+
+    async fn append_event(&mut self, event: EventEnvelope) -> Result<(), AgentError> {
         self.context
-            .append(EventEnvelope::new(
-                self.context.session_id().clone(),
-                Some(turn_id.clone()),
-                kind,
-                json!({
-                    "name": tool_name,
-                    "result": content,
-                }),
-            ))
+            .append(event.clone())
             .await
-            .map_err(|error| AgentError::Context(error.to_string()))
+            .map_err(|error| AgentError::Context(error.to_string()))?;
+        self.event_sink.publish(&event);
+        Ok(())
     }
 
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String, AgentError> {
@@ -360,13 +420,6 @@ impl AgentRuntime {
         Ok(response.content)
     }
 
-    fn confirm_via_stdin(&self, message: &str) -> bool {
-        eprintln!("{message} [y/N]");
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).ok();
-        input.trim().eq_ignore_ascii_case("y")
-    }
-
     fn check_cancelled(&self) -> Result<(), AgentError> {
         if self.cancelled.swap(false, Ordering::Relaxed) {
             Err(AgentError::Cancelled)
@@ -381,6 +434,7 @@ fn tool_error_message(error: &ToolInvokeError, tool_name: &str) -> String {
         ToolInvokeError::NotFound(_) => format!("Tool '{tool_name}' not found"),
         ToolInvokeError::Execution(message) => message.clone(),
         ToolInvokeError::Timeout => "Tool execution timed out".to_string(),
+        ToolInvokeError::Cancelled => format!("Tool '{tool_name}' execution cancelled"),
     }
 }
 
@@ -539,8 +593,17 @@ mod tests {
             _call_id: &str,
             name: &str,
             _arguments: serde_json::Value,
+            cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ToolInvokeError::Cancelled);
+            }
+
             tokio::time::sleep(self.delay).await;
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ToolInvokeError::Cancelled);
+            }
 
             let mut outputs_guard = self
                 .outputs
@@ -593,6 +656,8 @@ mod tests {
             "test-model".to_string(),
             Some(256),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(DenyAllApprovals),
+            Arc::new(NoopEventSink),
         )
     }
 

@@ -70,6 +70,10 @@ pub enum ToolError {
     #[error("execution timed out after {0:?}")]
     Timeout(Duration),
 
+    /// Tool execution was cancelled before completion.
+    #[error("execution cancelled")]
+    Cancelled,
+
     /// Tool was not found in the registry.
     #[error("tool not found: {0}")]
     NotFound(String),
@@ -113,6 +117,7 @@ mod tests {
             stderr: "permission denied".to_string(),
         };
         let timeout = ToolError::Timeout(Duration::from_secs(5));
+        let cancelled = ToolError::Cancelled;
         let not_found = ToolError::NotFound("shell".to_string());
 
         assert_eq!(input.to_string(), "invalid input: missing field");
@@ -121,6 +126,7 @@ mod tests {
             "execution failed (exit code Some(2)): permission denied"
         );
         assert_eq!(timeout.to_string(), "execution timed out after 5s");
+        assert_eq!(cancelled.to_string(), "execution cancelled");
         assert_eq!(not_found.to_string(), "tool not found: shell");
     }
 }

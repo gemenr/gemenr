@@ -121,6 +121,12 @@ impl ContextManager {
     pub fn build_context(&self, budget: &TokenBudget) -> ContextBuildResult {
         let mut messages =
             Vec::with_capacity(self.events.len() + usize::from(self.current_anchor.is_some()));
+        if let Some(anchor) = &self.current_anchor {
+            messages.push(ChatMessage::system(format!(
+                "Summary of earlier context:\n{}",
+                anchor.summary
+            )));
+        }
         messages.extend(events_to_messages(&self.events));
 
         if estimated_tokens(&messages) as f64 > budget.max_tokens as f64 * budget.threshold {
@@ -359,7 +365,10 @@ mod tests {
         assert!(!anchor_id.0.is_empty());
         assert_eq!(
             manager.build_context(&TokenBudget::default()),
-            ContextBuildResult::Ready(vec![ChatMessage::assistant("after anchor")])
+            ContextBuildResult::Ready(vec![
+                ChatMessage::system("Summary of earlier context:\nsummary"),
+                ChatMessage::assistant("after anchor"),
+            ])
         );
 
         let stored_anchor = tape_store
@@ -395,7 +404,9 @@ mod tests {
         assert!(!anchor_id.0.is_empty());
         assert_eq!(
             manager.build_context(&TokenBudget::default()),
-            ContextBuildResult::Ready(Vec::new())
+            ContextBuildResult::Ready(vec![ChatMessage::system(
+                "Summary of earlier context:\nsummarized context",
+            )])
         );
 
         let stored_anchor = tape_store
@@ -444,7 +455,10 @@ mod tests {
 
         assert_eq!(
             restored_manager.build_context(&TokenBudget::default()),
-            ContextBuildResult::Ready(vec![ChatMessage::assistant("after anchor")])
+            ContextBuildResult::Ready(vec![
+                ChatMessage::system("Summary of earlier context:\nphase summary"),
+                ChatMessage::assistant("after anchor"),
+            ])
         );
 
         fs::remove_dir_all(first_workspace).expect("temp directory should be removed");

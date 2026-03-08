@@ -191,7 +191,33 @@ struct AnthropicRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct AnthropicMessage {
     role: String,
-    content: String,
+    content: AnthropicMessageContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum AnthropicMessageContent {
+    Text(String),
+    Blocks(Vec<RequestContentBlock>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RequestContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,7 +376,7 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Anthr
             ChatRole::User | ChatRole::Assistant => {
                 anthropic_messages.push(AnthropicMessage {
                     role: anthropic_role(message.role).to_string(),
-                    content: message.content.clone(),
+                    content: anthropic_content(message),
                 });
             }
         }
@@ -366,6 +392,48 @@ fn anthropic_role(role: ChatRole) -> &'static str {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
     }
+}
+
+fn anthropic_content(message: &ChatMessage) -> AnthropicMessageContent {
+    if let Some(blocks) = anthropic_blocks_from_metadata(message) {
+        AnthropicMessageContent::Blocks(blocks)
+    } else {
+        AnthropicMessageContent::Text(message.content.clone())
+    }
+}
+
+fn anthropic_blocks_from_metadata(message: &ChatMessage) -> Option<Vec<RequestContentBlock>> {
+    if let Some(tool_calls) = message.metadata.get("tool_calls") {
+        let tool_calls = serde_json::from_str::<Vec<ToolCall>>(tool_calls).ok()?;
+        let mut blocks =
+            Vec::with_capacity(tool_calls.len() + usize::from(!message.content.is_empty()));
+        if !message.content.is_empty() {
+            blocks.push(RequestContentBlock::Text {
+                text: message.content.clone(),
+            });
+        }
+        blocks.extend(
+            tool_calls
+                .into_iter()
+                .map(|tool_call| RequestContentBlock::ToolUse {
+                    id: tool_call.id,
+                    name: tool_call.name,
+                    input: serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null),
+                }),
+        );
+        return Some(blocks);
+    }
+
+    let tool_use_id = message.metadata.get("tool_result_for")?;
+
+    Some(vec![RequestContentBlock::ToolResult {
+        tool_use_id: tool_use_id.clone(),
+        content: message.content.clone(),
+        is_error: message
+            .metadata
+            .get("is_error")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+    }])
 }
 
 fn parse_response_body(body: &str) -> Result<ModelResponse, serde_json::Error> {
@@ -589,9 +657,15 @@ mod tests {
         assert_eq!(system, Some("Be helpful.\nBe concise.".to_string()));
         assert_eq!(anthropic_messages.len(), 2);
         assert_eq!(anthropic_messages[0].role, "user");
-        assert_eq!(anthropic_messages[0].content, "Hello");
+        assert_eq!(
+            anthropic_messages[0].content,
+            super::AnthropicMessageContent::Text("Hello".to_string())
+        );
         assert_eq!(anthropic_messages[1].role, "assistant");
-        assert_eq!(anthropic_messages[1].content, "Hi there");
+        assert_eq!(
+            anthropic_messages[1].content,
+            super::AnthropicMessageContent::Text("Hi there".to_string())
+        );
     }
 
     #[test]
@@ -757,6 +831,44 @@ mod tests {
         assert!(value.get("temperature").is_none());
         assert_eq!(value["messages"][0]["role"], json!("user"));
         assert_eq!(value["messages"][0]["content"], json!("Hello"));
+    }
+
+    #[test]
+    fn split_system_messages_preserves_native_tool_call_blocks() {
+        let messages = vec![
+            ChatMessage::assistant("Thinking...").with_metadata(
+                "tool_calls",
+                r#"[{"id":"call-1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]"#,
+            ),
+            ChatMessage::user("/tmp/project")
+                .with_metadata("tool_result_for", "call-1")
+                .with_metadata("is_error", "false"),
+        ];
+
+        let (_, anthropic_messages) = split_system_messages(&messages);
+        let value = serde_json::to_value(&anthropic_messages).expect("messages should serialize");
+
+        assert_eq!(
+            value[0]["content"][0],
+            json!({"type": "text", "text": "Thinking..."})
+        );
+        assert_eq!(
+            value[0]["content"][1],
+            json!({
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "shell",
+                "input": {"command": "pwd"}
+            })
+        );
+        assert_eq!(
+            value[1]["content"][0],
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "/tmp/project"
+            })
+        );
     }
 
     #[test]

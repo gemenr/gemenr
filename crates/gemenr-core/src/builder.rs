@@ -5,7 +5,10 @@ use tokio::sync::RwLock;
 
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::context::{ContextManager, SoulManager, TapeStore, TokenBudget};
-use crate::kernel::{AgentRuntime, PromptComposer, TurnController};
+use crate::kernel::{
+    AgentRuntime, ApprovalHandler, DenyAllApprovals, EventSink, NoopEventSink, PromptComposer,
+    TurnController,
+};
 use crate::model::ModelProvider;
 use crate::protocol::SessionId;
 use crate::tool_invoker::ToolInvoker;
@@ -28,6 +31,10 @@ pub struct RuntimeBuilder {
     max_tokens: Option<u32>,
     /// Token budget for context building.
     budget: TokenBudget,
+    /// Confirmation handler used by runtimes built from this builder.
+    approval_handler: Arc<dyn ApprovalHandler>,
+    /// Event sink used by runtimes built from this builder.
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl RuntimeBuilder {
@@ -48,6 +55,8 @@ impl RuntimeBuilder {
             model_name: String::new(),
             max_tokens: None,
             budget: TokenBudget::default(),
+            approval_handler: Arc::new(DenyAllApprovals),
+            event_sink: Arc::new(NoopEventSink),
         }
     }
 
@@ -79,6 +88,20 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the confirmation handler used for medium/high-risk tool execution.
+    #[must_use]
+    pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = handler;
+        self
+    }
+
+    /// Set the event sink used for real-time runtime event delivery.
+    #[must_use]
+    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.event_sink = sink;
+        self
+    }
+
     /// Build an independent runtime for one task or conversation.
     #[must_use]
     pub fn build(&self, system_prompt: String) -> AgentRuntime {
@@ -101,6 +124,8 @@ impl RuntimeBuilder {
             self.model_name.clone(),
             self.max_tokens,
             Arc::new(AtomicBool::new(false)),
+            Arc::clone(&self.approval_handler),
+            Arc::clone(&self.event_sink),
         )
     }
 }
@@ -109,6 +134,7 @@ impl RuntimeBuilder {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -221,6 +247,7 @@ mod tests {
             _call_id: &str,
             _name: &str,
             _arguments: serde_json::Value,
+            _cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
             Ok(ToolInvokeResult {
                 content: String::new(),

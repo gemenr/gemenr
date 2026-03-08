@@ -1,6 +1,9 @@
 //! Tool registration, policy evaluation, and execution primitives.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use gemenr_core::{ToolSpec, tool_invoker};
@@ -64,6 +67,7 @@ impl ToolPlane {
         &self,
         call: &ToolCallSpec,
         ctx: &ExecContext,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<ToolOutput, ToolError> {
         let Some((_, handler)) = self.tools.get(&call.name) else {
             return Err(ToolError::NotFound(call.name.clone()));
@@ -71,7 +75,24 @@ impl ToolPlane {
 
         debug!(call_id = %call.call_id, tool = %call.name, "invoking tool");
 
-        match tokio::time::timeout(ctx.timeout, handler.execute(call.arguments.clone())).await {
+        let execution = async {
+            let tool_future = handler.execute(call.arguments.clone());
+            tokio::pin!(tool_future);
+
+            loop {
+                tokio::select! {
+                    result = &mut tool_future => return result,
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if cancelled.load(Ordering::Relaxed) {
+                            warn!(call_id = %call.call_id, tool = %call.name, "tool invocation cancelled");
+                            return Err(ToolError::Cancelled);
+                        }
+                    }
+                }
+            }
+        };
+
+        match tokio::time::timeout(ctx.timeout, execution).await {
             Ok(result) => result,
             Err(_) => {
                 warn!(call_id = %call.call_id, tool = %call.name, timeout = ?ctx.timeout, "tool invocation timed out");
@@ -128,6 +149,7 @@ impl tool_invoker::ToolInvoker for ToolPlane {
         call_id: &str,
         name: &str,
         arguments: serde_json::Value,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<tool_invoker::ToolInvokeResult, tool_invoker::ToolInvokeError> {
         let call = ToolCallSpec {
             call_id: call_id.to_string(),
@@ -136,13 +158,14 @@ impl tool_invoker::ToolInvoker for ToolPlane {
         };
         let ctx = ExecContext::default();
 
-        match ToolPlane::invoke(self, &call, &ctx).await {
+        match ToolPlane::invoke(self, &call, &ctx, cancelled).await {
             Ok(output) => Ok(tool_invoker::ToolInvokeResult {
                 content: output.content,
                 is_error: false,
             }),
             Err(ToolError::NotFound(name)) => Err(tool_invoker::ToolInvokeError::NotFound(name)),
             Err(ToolError::Timeout(_)) => Err(tool_invoker::ToolInvokeError::Timeout),
+            Err(ToolError::Cancelled) => Err(tool_invoker::ToolInvokeError::Cancelled),
             Err(error) => Err(tool_invoker::ToolInvokeError::Execution(error.to_string())),
         }
     }
@@ -150,6 +173,8 @@ impl tool_invoker::ToolInvoker for ToolPlane {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -240,7 +265,11 @@ mod tests {
         plane.register(spec("shell"), Box::new(StaticHandler { content: "hello" }));
 
         let output = plane
-            .invoke(&call("shell"), &ExecContext::default())
+            .invoke(
+                &call("shell"),
+                &ExecContext::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
             .await
             .expect("tool should execute");
 
@@ -252,7 +281,11 @@ mod tests {
         let plane = ToolPlane::new();
 
         let error = plane
-            .invoke(&call("missing"), &ExecContext::default())
+            .invoke(
+                &call("missing"),
+                &ExecContext::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
             .await
             .expect_err("missing tool should fail");
 
@@ -269,10 +302,24 @@ mod tests {
         };
 
         let error = plane
-            .invoke(&call("shell"), &context)
+            .invoke(&call("shell"), &context, Arc::new(AtomicBool::new(false)))
             .await
             .expect_err("slow tool should time out");
 
         assert_eq!(error, ToolError::Timeout(Duration::from_millis(10)));
+    }
+
+    #[tokio::test]
+    async fn invoke_cancels_when_flag_is_set() {
+        let mut plane = ToolPlane::new();
+        plane.register(spec("shell"), Box::new(SlowHandler));
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = plane
+            .invoke(&call("shell"), &ExecContext::default(), cancelled)
+            .await
+            .expect_err("cancelled tool should fail");
+
+        assert_eq!(error, ToolError::Cancelled);
     }
 }

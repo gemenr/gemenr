@@ -77,6 +77,14 @@ pub use kernel::ActionDecision;
 pub use kernel::AgentError;
 /// Re-export of agent runtime.
 pub use kernel::AgentRuntime;
+/// Re-export of approval handling for risky tool execution.
+pub use kernel::ApprovalHandler;
+/// Re-export of the default deny-all approval handler.
+pub use kernel::DenyAllApprovals;
+/// Re-export of runtime event delivery interface.
+pub use kernel::EventSink;
+/// Re-export of the default no-op event sink.
+pub use kernel::NoopEventSink;
 /// Re-export of prompt composition helpers.
 pub use kernel::PromptComposer;
 /// Re-export of turn decision helpers.
