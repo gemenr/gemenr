@@ -2,6 +2,8 @@
 
 /// Configuration loading for model providers.
 pub mod config;
+/// Context persistence and reconstruction primitives.
+pub mod context;
 /// Structured errors for configuration and model interactions.
 pub mod error;
 /// Core chat message types.
@@ -25,6 +27,20 @@ pub use config::ModelConfig;
 pub use config::ProviderConfig;
 /// Re-export of supported provider types.
 pub use config::ProviderType;
+/// Re-export of anchor checkpoint entries.
+pub use context::AnchorEntry;
+/// Re-export of the in-memory tape store implementation.
+pub use context::InMemoryTapeStore;
+/// Re-export of the JSONL tape store implementation.
+pub use context::JsonlTapeStore;
+/// Re-export of SOUL.md management errors.
+pub use context::SoulError;
+/// Re-export of the SOUL.md manager.
+pub use context::SoulManager;
+/// Re-export of tape storage errors.
+pub use context::TapeError;
+/// Re-export of the tape store abstraction.
+pub use context::TapeStore;
 /// Re-export of model interaction errors.
 pub use error::ModelError;
 /// Re-export of the core chat message type.
