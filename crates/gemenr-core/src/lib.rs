@@ -22,6 +22,9 @@ pub mod model;
 pub mod protocol;
 /// Long-lived conversation runtime management.
 pub mod runtime_manager;
+#[cfg(test)]
+/// Shared test-only mocks and helpers reused across crate unit tests.
+pub mod test_support;
 /// Tool invocation abstraction shared with the runtime.
 pub mod tool_invoker;
 /// Tool specification types shared across providers and tools.

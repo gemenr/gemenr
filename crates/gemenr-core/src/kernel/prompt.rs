@@ -73,31 +73,19 @@ fn estimated_soul_tokens(soul_content: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::fs;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{PromptComposer, SOUL_BUDGET_WARNING, SOUL_BUDGET_WARNING_THRESHOLD_TOKENS};
     use crate::agent::{NativeToolDispatcher, XmlToolDispatcher};
     use crate::context::{ContextManager, InMemoryTapeStore, SoulManager, TapeStore};
     use crate::message::{ChatMessage, ChatRole};
     use crate::protocol::SessionId;
+    use crate::test_support::temp_dir;
     use crate::tool_spec::{RiskLevel, ToolSpec};
     use tokio::sync::RwLock;
-
-    fn temp_dir(prefix: &str) -> std::path::PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        let directory = env::temp_dir().join(format!("gemenr-prompt-{prefix}-{timestamp}"));
-
-        fs::create_dir_all(&directory).expect("temp directory should be created");
-        directory
-    }
 
     fn sample_tool() -> ToolSpec {
         ToolSpec {

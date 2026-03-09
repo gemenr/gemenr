@@ -261,10 +261,8 @@ fn estimated_tokens(messages: &[ChatMessage]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::fs;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::{Value, json};
     use tokio::sync::RwLock;
@@ -278,21 +276,7 @@ mod tests {
         AssistantToolCallsPayload, EventEnvelope, EventKind, SessionId, ToolCallRecord,
         ToolResultPayload,
     };
-
-    fn temp_dir(prefix: &str) -> std::path::PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        let directory = env::temp_dir().join(format!(
-            "gemenr-context-{prefix}-{}-{timestamp}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-
-        fs::create_dir_all(&directory).expect("temp directory should be created");
-        directory
-    }
+    use crate::test_support::temp_dir;
 
     fn event(session_id: &SessionId, kind: EventKind, payload: Value) -> EventEnvelope {
         EventEnvelope::new(session_id.clone(), None, kind, payload)

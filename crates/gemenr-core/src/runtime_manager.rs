@@ -346,14 +346,11 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use async_trait::async_trait;
     use serde_json::json;
-    use tokio::sync::{Notify, RwLock};
+    use tokio::sync::RwLock;
     use tokio::task::yield_now;
     use tokio::time::timeout;
 
@@ -364,243 +361,14 @@ mod tests {
     use crate::access::{AccessInbound, ConversationId, ReplyRoute};
     use crate::builder::RuntimeBuilder;
     use crate::context::{InMemoryTapeStore, SoulManager, TapeStore};
-    use crate::error::ModelError;
     use crate::kernel::TurnInput;
     use crate::message::ChatRole;
-    use crate::model::{
-        ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, RequestContext,
-    };
-    use crate::tool_invoker::{
-        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
-        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
-        ToolInvokeResult,
-    };
-    use crate::tool_spec::ToolSpec;
+    use crate::test_support::{MockClock, NoopToolInvoker, RecordingModelProvider};
+    use crate::tool_invoker::PolicyContext;
 
-    struct RequestSignal {
-        started: AtomicBool,
-        notify: Notify,
-    }
-
-    impl RequestSignal {
-        fn new() -> Self {
-            Self {
-                started: AtomicBool::new(false),
-                notify: Notify::new(),
-            }
-        }
-
-        fn mark_started(&self) {
-            self.started.store(true, Ordering::SeqCst);
-            self.notify.notify_waiters();
-        }
-
-        async fn wait_started(&self) {
-            if self.started.load(Ordering::SeqCst) {
-                return;
-            }
-            self.notify.notified().await;
-        }
-    }
-
-    struct RecordingModelProvider {
-        requests: Mutex<Vec<ChatRequest>>,
-        blockers: Mutex<HashMap<String, Arc<Notify>>>,
-        signals: Mutex<HashMap<String, Arc<RequestSignal>>>,
-        inflight: AtomicUsize,
-        max_inflight: AtomicUsize,
-    }
-
-    impl RecordingModelProvider {
-        fn new() -> Self {
-            Self {
-                requests: Mutex::new(Vec::new()),
-                blockers: Mutex::new(HashMap::new()),
-                signals: Mutex::new(HashMap::new()),
-                inflight: AtomicUsize::new(0),
-                max_inflight: AtomicUsize::new(0),
-            }
-        }
-
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests
-                .lock()
-                .expect("requests lock should not be poisoned")
-                .clone()
-        }
-
-        fn block_text(&self, text: &str) -> Arc<Notify> {
-            let notify = Arc::new(Notify::new());
-            self.blockers
-                .lock()
-                .expect("blockers lock should not be poisoned")
-                .insert(text.to_string(), Arc::clone(&notify));
-            notify
-        }
-
-        async fn wait_started(&self, text: &str) {
-            let signal = self
-                .signals
-                .lock()
-                .expect("signals lock should not be poisoned")
-                .entry(text.to_string())
-                .or_insert_with(|| Arc::new(RequestSignal::new()))
-                .clone();
-            signal.wait_started().await;
-        }
-
-        fn max_inflight(&self) -> usize {
-            self.max_inflight.load(Ordering::SeqCst)
-        }
-
-        fn update_max_inflight(&self, current: usize) {
-            let mut observed = self.max_inflight.load(Ordering::SeqCst);
-            while current > observed {
-                match self.max_inflight.compare_exchange(
-                    observed,
-                    current,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => observed = actual,
-                }
-            }
-        }
-
-        fn signal_for(&self, text: &str) -> Arc<RequestSignal> {
-            self.signals
-                .lock()
-                .expect("signals lock should not be poisoned")
-                .entry(text.to_string())
-                .or_insert_with(|| Arc::new(RequestSignal::new()))
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for RecordingModelProvider {
-        async fn complete(
-            &self,
-            request: ModelRequest,
-            _context: RequestContext,
-        ) -> Result<ModelResponse, ModelError> {
-            Ok(ModelResponse {
-                content: request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == ChatRole::User)
-                    .map(|message| format!("echo:{}", message.content))
-                    .unwrap_or_else(|| "echo:".to_string()),
-                finish_reason: FinishReason::Stop,
-            })
-        }
-
-        async fn chat(
-            &self,
-            request: ChatRequest,
-            _context: RequestContext,
-        ) -> Result<ChatResponse, ModelError> {
-            self.requests
-                .lock()
-                .expect("requests lock should not be poisoned")
-                .push(request.clone());
-
-            let user_text = request
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role == ChatRole::User)
-                .map(|message| message.content.clone())
-                .unwrap_or_default();
-            self.signal_for(&user_text).mark_started();
-
-            let current_inflight = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.update_max_inflight(current_inflight);
-            let blocker = self
-                .blockers
-                .lock()
-                .expect("blockers lock should not be poisoned")
-                .get(&user_text)
-                .cloned();
-            if let Some(blocker) = blocker {
-                blocker.notified().await;
-            }
-            self.inflight.fetch_sub(1, Ordering::SeqCst);
-
-            Ok(ChatResponse {
-                text: Some(format!("echo:{user_text}")),
-                tool_calls: Vec::new(),
-                usage: None,
-            })
-        }
-
-        fn capabilities(&self) -> ModelCapabilities {
-            ModelCapabilities::default()
-        }
-    }
-
-    struct NoopToolInvoker;
-
-    impl ToolCatalog for NoopToolInvoker {
-        fn lookup(&self, _name: &str) -> Option<&ToolSpec> {
-            None
-        }
-
-        fn list_specs(&self) -> Vec<ToolSpec> {
-            Vec::new()
-        }
-    }
-
-    impl ToolAuthorizer for NoopToolInvoker {
-        fn authorize(
-            &self,
-            request: &ToolCallRequest,
-            _context: &PolicyContext,
-        ) -> AuthorizationDecision {
-            AuthorizationDecision::Prepared(PreparedToolCall {
-                request: request.clone(),
-                policy: ExecutionPolicy::Allow {
-                    sandbox: SandboxKind::None,
-                },
-            })
-        }
-    }
-
-    #[async_trait]
-    impl ToolExecutor for NoopToolInvoker {
-        async fn invoke(
-            &self,
-            prepared: PreparedToolCall,
-            _cancelled: Arc<AtomicBool>,
-        ) -> Result<ToolInvokeResult, ToolInvokeError> {
-            Err(ToolInvokeError::NotFound(prepared.request.name))
-        }
-    }
-
-    #[derive(Clone)]
-    struct ManualClock {
-        now: Arc<Mutex<Instant>>,
-    }
-
-    impl ManualClock {
-        fn new(start: Instant) -> Self {
-            Self {
-                now: Arc::new(Mutex::new(start)),
-            }
-        }
-
-        fn advance(&self, duration: Duration) {
-            let mut now = self.now.lock().expect("clock lock should not be poisoned");
-            *now += duration;
-        }
-    }
-
-    impl RuntimeClock for ManualClock {
+    impl RuntimeClock for MockClock {
         fn now(&self) -> Instant {
-            *self.now.lock().expect("clock lock should not be poisoned")
+            self.now()
         }
     }
 
@@ -692,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_conversation_is_processed_in_order() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let first_gate = model.block_text("hello");
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
         let builder = builder(model.clone(), tape_store, "ordered");
@@ -743,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_conversations_can_progress_concurrently() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let gate_a = model.block_text("one");
         let gate_b = model.block_text("two");
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
@@ -796,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn hibernate_drops_runtime_but_keeps_session_metadata() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
         let builder = builder(model, tape_store, "hibernate");
         let manager = RuntimeManager::new(builder, "system".to_string());
@@ -822,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn resume_restores_context_from_tape() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
         let builder = builder(model.clone(), tape_store, "resume");
         let manager = RuntimeManager::new(builder, "system".to_string());
@@ -861,10 +629,10 @@ mod tests {
 
     #[tokio::test]
     async fn hibernate_idle_reclaims_only_expired_handles() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
         let builder = builder(model, tape_store, "idle");
-        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let clock = Arc::new(MockClock::new(Instant::now()));
         let manager = RuntimeManager::new_with_clock(builder, "system".to_string(), clock.clone());
 
         manager
@@ -895,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn builder_task_mode_path_still_works_without_runtime_manager() {
-        let model = Arc::new(RecordingModelProvider::new());
+        let model = Arc::new(RecordingModelProvider::default());
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::default());
         let builder = builder(model, tape_store, "task-mode");
         let mut runtime = builder.build("system".to_string());

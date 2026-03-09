@@ -188,154 +188,18 @@ impl RuntimeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use async_trait::async_trait;
     use tokio::sync::RwLock;
 
     use super::RuntimeBuilder;
     use crate::agent::SelectedToolDispatcher;
     use crate::context::{InMemoryTapeStore, SoulManager, TapeStore};
-    use crate::error::ModelError;
-    use crate::model::{
-        ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelProvider, ModelRequest,
-        ModelResponse, RequestContext,
-    };
+    use crate::model::ModelCapabilities;
     use crate::protocol::SessionId;
-    use crate::tool_invoker::{
-        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
-        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
-        ToolInvokeResult,
-    };
+    use crate::test_support::{RecordingModelProvider, StaticToolInvoker};
     use crate::tool_spec::{RiskLevel, ToolSpec};
-
-    struct RecordingModelProvider {
-        responses: Mutex<VecDeque<ChatResponse>>,
-        requests: Mutex<Vec<ChatRequest>>,
-        capabilities: ModelCapabilities,
-    }
-
-    impl RecordingModelProvider {
-        fn new(capabilities: ModelCapabilities) -> Self {
-            Self {
-                responses: Mutex::new(
-                    vec![ChatResponse {
-                        text: Some("done".to_string()),
-                        tool_calls: Vec::new(),
-                        usage: None,
-                    }]
-                    .into(),
-                ),
-                requests: Mutex::new(Vec::new()),
-                capabilities,
-            }
-        }
-
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests
-                .lock()
-                .expect("requests lock should not be poisoned")
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for RecordingModelProvider {
-        async fn complete(
-            &self,
-            request: ModelRequest,
-            _context: RequestContext,
-        ) -> Result<ModelResponse, ModelError> {
-            Ok(ModelResponse {
-                content: request
-                    .messages
-                    .last()
-                    .map(|message| message.content.clone())
-                    .unwrap_or_default(),
-                finish_reason: FinishReason::Stop,
-            })
-        }
-
-        fn capabilities(&self) -> ModelCapabilities {
-            self.capabilities
-        }
-
-        async fn chat(
-            &self,
-            request: ChatRequest,
-            _context: RequestContext,
-        ) -> Result<ChatResponse, ModelError> {
-            self.requests
-                .lock()
-                .expect("requests lock should not be poisoned")
-                .push(request);
-            self.responses
-                .lock()
-                .expect("responses lock should not be poisoned")
-                .pop_front()
-                .ok_or_else(|| ModelError::Api {
-                    status: 500,
-                    message: "no scripted response available".to_string(),
-                })
-        }
-    }
-
-    struct StaticToolInvoker {
-        specs: HashMap<String, ToolSpec>,
-    }
-
-    impl StaticToolInvoker {
-        fn new(specs: Vec<ToolSpec>) -> Self {
-            Self {
-                specs: specs
-                    .into_iter()
-                    .map(|spec| (spec.name.clone(), spec))
-                    .collect(),
-            }
-        }
-    }
-
-    impl ToolCatalog for StaticToolInvoker {
-        fn lookup(&self, name: &str) -> Option<&ToolSpec> {
-            self.specs.get(name)
-        }
-
-        fn list_specs(&self) -> Vec<ToolSpec> {
-            self.specs.values().cloned().collect()
-        }
-    }
-
-    impl ToolAuthorizer for StaticToolInvoker {
-        fn authorize(
-            &self,
-            request: &ToolCallRequest,
-            _context: &PolicyContext,
-        ) -> AuthorizationDecision {
-            AuthorizationDecision::Prepared(PreparedToolCall {
-                request: request.clone(),
-                policy: ExecutionPolicy::Allow {
-                    sandbox: SandboxKind::None,
-                },
-            })
-        }
-    }
-
-    #[async_trait]
-    impl ToolExecutor for StaticToolInvoker {
-        async fn invoke(
-            &self,
-            _prepared: PreparedToolCall,
-            _cancelled: Arc<AtomicBool>,
-        ) -> Result<ToolInvokeResult, ToolInvokeError> {
-            Ok(ToolInvokeResult {
-                content: String::new(),
-                is_error: false,
-            })
-        }
-    }
 
     fn sample_tool() -> ToolSpec {
         ToolSpec {
