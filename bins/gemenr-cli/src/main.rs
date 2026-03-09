@@ -266,8 +266,9 @@ async fn handle_stdio_message(
 
 struct StdioEventSink;
 
+#[async_trait]
 impl EventSink for StdioEventSink {
-    fn publish(&self, event: &EventEnvelope) {
+    async fn publish(&self, event: &EventEnvelope) {
         match &event.kind {
             EventKind::UserInput => {
                 if let Some(text) = event.payload.get("text").and_then(|value| value.as_str()) {

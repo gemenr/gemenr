@@ -109,17 +109,19 @@ impl ApprovalHandler for DenyAllApprovals {
 }
 
 /// Receives runtime events for presentation or observability.
+#[async_trait]
 pub trait EventSink: Send + Sync {
     /// Publish a runtime event after it has been persisted to tape.
-    fn publish(&self, event: &EventEnvelope);
+    async fn publish(&self, event: &EventEnvelope);
 }
 
 /// Default event sink that ignores all runtime events.
 #[derive(Debug, Default)]
 pub struct NoopEventSink;
 
+#[async_trait]
 impl EventSink for NoopEventSink {
-    fn publish(&self, _event: &EventEnvelope) {}
+    async fn publish(&self, _event: &EventEnvelope) {}
 }
 
 /// Independent runtime for a single task or conversation.
@@ -631,7 +633,7 @@ impl AgentRuntime {
 
     async fn append_event(&mut self, event: EventEnvelope) -> Result<(), AgentError> {
         self.context.append(event.clone()).await?;
-        self.event_sink.publish(&event);
+        self.event_sink.publish(&event).await;
         Ok(())
     }
 
