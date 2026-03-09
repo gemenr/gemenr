@@ -7,7 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent::dispatcher::{ConversationMessage, SelectedToolDispatcher, ToolExecutionResult};
+use crate::agent::dispatcher::{
+    ConversationMessage, ParsedToolCall, SelectedToolDispatcher, ToolExecutionResult,
+};
 use crate::context::{ContextBuildResult, ContextManager, TokenBudget};
 use crate::message::ChatMessage;
 use crate::model::{
@@ -287,16 +289,21 @@ impl AgentRuntime {
         }
     }
 
-    async fn run_model_step(
+    /// Build the model request for the current turn-loop step.
+    ///
+    /// This gathers provider-visible context, reloads the latest `SOUL.md`
+    /// content, and composes the final chat request sent to the model.
+    async fn prepare_model_request(
         &mut self,
         turn_id: &TurnId,
-        history: &mut Vec<ConversationMessage>,
-    ) -> Result<ModelStepOutcome, AgentError> {
+        history: &[ConversationMessage],
+    ) -> Result<ChatRequest, AgentError> {
         let provider_messages = self
             .build_provider_messages_for_step(turn_id, history)
             .await?;
         let soul_content = self.context.latest_soul_content().await?;
-        let request = self.composer.build_prompt(PromptContext {
+
+        Ok(self.composer.build_prompt(PromptContext {
             soul_content: &soul_content,
             system_prompt: &self.system_prompt,
             context_messages: provider_messages,
@@ -304,8 +311,20 @@ impl AgentRuntime {
             dispatcher: &self.tool_dispatcher,
             model: &self.model_name,
             max_tokens: self.max_tokens,
-        });
-        let response = self.invoke_chat_request(request).await?;
+        }))
+    }
+
+    /// Process a single model response and determine the next turn outcome.
+    ///
+    /// This preserves the runtime's externally visible behavior by emitting the
+    /// same tape events and mutating the in-memory history in the same cases as
+    /// before the refactor.
+    async fn process_model_response(
+        &mut self,
+        turn_id: &TurnId,
+        response: ChatResponse,
+        history: &mut Vec<ConversationMessage>,
+    ) -> Result<ModelStepOutcome, AgentError> {
         let (text, tool_calls) = self.tool_dispatcher.parse_response(&response);
 
         match self.controller.next_action(text.clone(), tool_calls) {
@@ -321,17 +340,7 @@ impl AgentRuntime {
                 Ok(ModelStepOutcome::Complete(final_text))
             }
             ActionDecision::InvokeTools(tool_calls) => {
-                let assistant_tool_calls = AssistantToolCallsPayload {
-                    text: text.clone(),
-                    tool_calls: tool_calls
-                        .iter()
-                        .map(|call| ToolCallRecord {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                        })
-                        .collect(),
-                };
+                let assistant_tool_calls = assistant_tool_calls_payload(text, &tool_calls);
                 self.append_assistant_tool_calls(turn_id, &assistant_tool_calls)
                     .await?;
 
@@ -352,6 +361,23 @@ impl AgentRuntime {
                 Ok(ModelStepOutcome::InvokeTools(tool_calls))
             }
         }
+    }
+
+    /// Execute a single model step as prepare → invoke → process phases.
+    async fn run_model_step(
+        &mut self,
+        turn_id: &TurnId,
+        history: &mut Vec<ConversationMessage>,
+    ) -> Result<ModelStepOutcome, AgentError> {
+        self.check_cancelled()?;
+        let request = self.prepare_model_request(turn_id, history).await?;
+
+        self.check_cancelled()?;
+        let response = self.invoke_chat_request(request).await?;
+
+        self.check_cancelled()?;
+        self.process_model_response(turn_id, response, history)
+            .await
     }
 
     async fn execute_tool_batch(
@@ -742,6 +768,23 @@ impl AgentRuntime {
                 _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
             }
         }
+    }
+}
+
+fn assistant_tool_calls_payload(
+    text: Option<String>,
+    tool_calls: &[ParsedToolCall],
+) -> AssistantToolCallsPayload {
+    AssistantToolCallsPayload {
+        text,
+        tool_calls: tool_calls
+            .iter()
+            .map(|call| ToolCallRecord {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1300,6 +1343,75 @@ mod tests {
 
         assert_eq!(outcome, ModelStepOutcome::Complete("done".to_string()));
         assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_model_response_persists_tool_calls_and_updates_history() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            Vec::new(),
+            ModelCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            },
+        ));
+        let tools = Arc::new(ScriptedToolInvoker::new(vec![sample_tool_spec()]));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(model, tools, tape_store.clone(), NativeToolDispatcher);
+        let turn_id = TurnId::new();
+        let mut history = Vec::new();
+        let response = ChatResponse {
+            text: Some("working".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({"value": "hello"}).to_string(),
+            }],
+            usage: None,
+        };
+
+        let outcome = runtime
+            .process_model_response(&turn_id, response, &mut history)
+            .await
+            .expect("response processing should succeed");
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+
+        assert_eq!(
+            outcome,
+            ModelStepOutcome::InvokeTools(vec![crate::agent::ParsedToolCall {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                arguments: json!({"value": "hello"}),
+            }])
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0],
+            ConversationMessage::AssistantToolCalls {
+                text: Some("working".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({"value": "hello"}).to_string(),
+                }],
+            }
+        );
+
+        let assistant_event = events
+            .iter()
+            .find(|event| matches!(event.kind, EventKind::AssistantToolCalls))
+            .expect("assistant tool calls event should exist");
+        let payload = serde_json::from_value::<crate::protocol::AssistantToolCallsPayload>(
+            assistant_event.payload.clone(),
+        )
+        .expect("assistant tool calls payload should deserialize");
+        assert_eq!(payload.text.as_deref(), Some("working"));
+        assert_eq!(payload.tool_calls.len(), 1);
+        assert_eq!(payload.tool_calls[0].call_id, "call-1");
+        assert_eq!(payload.tool_calls[0].name, "echo");
+        assert_eq!(payload.tool_calls[0].arguments, json!({"value": "hello"}));
     }
 
     #[tokio::test]
