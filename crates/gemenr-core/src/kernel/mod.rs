@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tokio::task::JoinSet;
 
 use crate::agent::dispatcher::{
     ConversationMessage, ParsedToolCall, SelectedToolDispatcher, ToolExecutionResult,
@@ -36,6 +37,19 @@ use self::turn::ModelStepOutcome;
 
 const SUMMARY_PROMPT: &str = "Summarize the following conversation.";
 const MAX_TURN_STEPS: usize = 50;
+
+#[derive(Debug, Clone)]
+struct PreparedBatchMetadata {
+    order: usize,
+    call_id: String,
+    name: String,
+}
+
+#[derive(Debug)]
+struct PreparedBatchCall {
+    metadata: PreparedBatchMetadata,
+    prepared: PreparedToolCall,
+}
 
 /// Errors from the agent runtime.
 #[derive(Debug, thiserror::Error)]
@@ -386,9 +400,11 @@ impl AgentRuntime {
         tool_calls: Vec<crate::agent::dispatcher::ParsedToolCall>,
         policy_context: &PolicyContext,
     ) -> Result<ConversationMessage, AgentError> {
-        let mut results = Vec::with_capacity(tool_calls.len());
+        let mut ordered_results = vec![None; tool_calls.len()];
+        let mut prepared_calls = Vec::new();
+        let mut completion_kinds = vec![None; tool_calls.len()];
 
-        for call in tool_calls {
+        for (order, call) in tool_calls.into_iter().enumerate() {
             self.check_cancelled()?;
 
             let request = ToolCallRequest {
@@ -416,7 +432,7 @@ impl AgentRuntime {
                             &content,
                         )
                         .await?;
-                        results.push(ToolExecutionResult {
+                        ordered_results[order] = Some(ToolExecutionResult {
                             call_id: call.id,
                             name: call.name,
                             content,
@@ -436,7 +452,7 @@ impl AgentRuntime {
                         &content,
                     )
                     .await?;
-                    results.push(ToolExecutionResult {
+                    ordered_results[order] = Some(ToolExecutionResult {
                         call_id: call.id,
                         name: call.name,
                         content,
@@ -446,52 +462,139 @@ impl AgentRuntime {
                 }
             };
 
-            self.emit_tool_event(turn_id, EventKind::ToolStarted, &call.id, &call.name, "")
-                .await?;
+            prepared_calls.push(PreparedBatchCall {
+                metadata: PreparedBatchMetadata {
+                    order,
+                    call_id: call.id,
+                    name: call.name,
+                },
+                prepared,
+            });
+        }
 
-            match self.invoke_tool(prepared).await {
-                Ok(result) => {
-                    let kind = if result.is_error {
-                        EventKind::ToolFailed
-                    } else {
-                        EventKind::ToolCompleted
-                    };
-                    self.emit_tool_event(turn_id, kind, &call.id, &call.name, &result.content)
-                        .await?;
-                    results.push(ToolExecutionResult {
-                        call_id: call.id,
-                        name: call.name,
-                        content: result.content,
-                        is_error: result.is_error,
-                    });
-                }
-                Err(error) => {
-                    if matches!(error, ToolInvokeError::Cancelled) {
-                        self.emit_tool_event(
-                            turn_id,
-                            EventKind::ToolFailed,
-                            &call.id,
-                            &call.name,
-                            "Tool execution cancelled",
-                        )
-                        .await?;
+        self.check_cancelled()?;
+
+        for call in &prepared_calls {
+            self.emit_tool_event(
+                turn_id,
+                EventKind::ToolStarted,
+                &call.metadata.call_id,
+                &call.metadata.name,
+                "",
+            )
+            .await?;
+        }
+
+        if !prepared_calls.is_empty() {
+            let request_context = self.request_context.clone();
+            let mut join_set = JoinSet::new();
+            let prepared_metadata = prepared_calls
+                .iter()
+                .map(|call| call.metadata.clone())
+                .collect::<Vec<_>>();
+
+            for pending in prepared_calls {
+                let tools = Arc::clone(&self.tools);
+                let request_context = request_context.clone();
+                join_set.spawn(async move {
+                    let PreparedBatchCall { metadata, prepared } = pending;
+                    let outcome = invoke_tool_with_context(tools, prepared, request_context).await;
+                    (metadata, outcome)
+                });
+            }
+
+            let cancellation_token = self.request_context.cancellation_token.clone();
+            let atomic_cancellation =
+                wait_for_atomic_cancellation(self.request_context.cancellation_handle());
+            tokio::pin!(atomic_cancellation);
+
+            while !join_set.is_empty() {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
                         return Err(AgentError::Cancelled);
                     }
+                    _ = &mut atomic_cancellation => {
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
+                        return Err(AgentError::Cancelled);
+                    }
+                    task_result = join_set.join_next() => {
+                        let Some(task_result) = task_result else {
+                            continue;
+                        };
 
-                    let content = tool_error_message(&error, &call.name);
-                    let kind = tool_error_event_kind(&error);
-                    self.emit_tool_event(turn_id, kind, &call.id, &call.name, &content)
-                        .await?;
-                    results.push(ToolExecutionResult {
-                        call_id: call.id,
-                        name: call.name,
+                        match task_result {
+                            Ok((metadata, Ok(result))) => {
+                                completion_kinds[metadata.order] = Some(if result.is_error {
+                                    EventKind::ToolFailed
+                                } else {
+                                    EventKind::ToolCompleted
+                                });
+                                ordered_results[metadata.order] = Some(ToolExecutionResult {
+                                    call_id: metadata.call_id,
+                                    name: metadata.name,
+                                    content: result.content,
+                                    is_error: result.is_error,
+                                });
+                            }
+                            Ok((metadata, Err(error))) => {
+                                if matches!(error, ToolInvokeError::Cancelled) {
+                                    join_set.abort_all();
+                                    while join_set.join_next().await.is_some() {}
+                                    return Err(AgentError::Cancelled);
+                                }
+
+                                let content = tool_error_message(&error, &metadata.name);
+                                completion_kinds[metadata.order] = Some(tool_error_event_kind(&error));
+                                ordered_results[metadata.order] = Some(ToolExecutionResult {
+                                    call_id: metadata.call_id,
+                                    name: metadata.name,
+                                    content,
+                                    is_error: true,
+                                });
+                            }
+                            Err(join_error) => {
+                                tracing::error!("tool execution task failed: {join_error}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            for metadata in &prepared_metadata {
+                if ordered_results[metadata.order].is_none() {
+                    let content = "Tool execution task failed".to_string();
+                    completion_kinds[metadata.order] = Some(EventKind::ToolFailed);
+                    ordered_results[metadata.order] = Some(ToolExecutionResult {
+                        call_id: metadata.call_id.clone(),
+                        name: metadata.name.clone(),
                         content,
                         is_error: true,
                     });
                 }
             }
+
+            for metadata in prepared_metadata {
+                let Some(result) = ordered_results[metadata.order].as_ref() else {
+                    continue;
+                };
+                let Some(kind) = completion_kinds[metadata.order].clone() else {
+                    continue;
+                };
+                self.emit_tool_event(
+                    turn_id,
+                    kind,
+                    &result.call_id,
+                    &result.name,
+                    &result.content,
+                )
+                .await?;
+            }
         }
 
+        let results = ordered_results.into_iter().flatten().collect::<Vec<_>>();
         Ok(self.tool_dispatcher.format_results(&results))
     }
 
@@ -741,34 +844,6 @@ impl AgentRuntime {
             }
         }
     }
-
-    async fn invoke_tool(
-        &self,
-        prepared: PreparedToolCall,
-    ) -> Result<ToolInvokeResult, ToolInvokeError> {
-        let context = self.request_context.clone();
-        let request_future = self.tools.invoke(prepared, context.cancellation_handle());
-        tokio::pin!(request_future);
-
-        let cancellation_future = wait_for_cancellation(&context);
-        tokio::pin!(cancellation_future);
-
-        if let Some(timeout) = context.timeout {
-            let timeout_future = tokio::time::sleep(timeout);
-            tokio::pin!(timeout_future);
-
-            tokio::select! {
-                result = &mut request_future => result,
-                _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
-                _ = &mut timeout_future => Err(ToolInvokeError::Timeout),
-            }
-        } else {
-            tokio::select! {
-                result = &mut request_future => result,
-                _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
-            }
-        }
-    }
 }
 
 fn assistant_tool_calls_payload(
@@ -803,6 +878,34 @@ async fn wait_for_cancellation(context: &RequestContext) {
     tokio::select! {
         _ = context.cancellation_token.cancelled() => {}
         _ = &mut atomic_cancellation => {}
+    }
+}
+
+async fn invoke_tool_with_context(
+    tools: Arc<dyn ToolInvoker>,
+    prepared: PreparedToolCall,
+    context: RequestContext,
+) -> Result<ToolInvokeResult, ToolInvokeError> {
+    let request_future = tools.invoke(prepared, context.cancellation_handle());
+    tokio::pin!(request_future);
+
+    let cancellation_future = wait_for_cancellation(&context);
+    tokio::pin!(cancellation_future);
+
+    if let Some(timeout) = context.timeout {
+        let timeout_future = tokio::time::sleep(timeout);
+        tokio::pin!(timeout_future);
+
+        tokio::select! {
+            result = &mut request_future => result,
+            _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
+            _ = &mut timeout_future => Err(ToolInvokeError::Timeout),
+        }
+    } else {
+        tokio::select! {
+            result = &mut request_future => result,
+            _ = &mut cancellation_future => Err(ToolInvokeError::Cancelled),
+        }
     }
 }
 
@@ -858,7 +961,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::sync::RwLock;
 
@@ -1000,6 +1103,7 @@ mod tests {
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
         cancellation_handles: Mutex<Vec<Arc<AtomicBool>>>,
         delay: Duration,
+        tool_delays: HashMap<String, Duration>,
         invocations: AtomicUsize,
     }
 
@@ -1021,6 +1125,7 @@ mod tests {
                 outputs: Mutex::new(HashMap::new()),
                 cancellation_handles: Mutex::new(Vec::new()),
                 delay: Duration::from_millis(0),
+                tool_delays: HashMap::new(),
                 invocations: AtomicUsize::new(0),
             }
         }
@@ -1046,6 +1151,11 @@ mod tests {
 
         fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = delay;
+            self
+        }
+
+        fn with_tool_delay(mut self, name: &str, delay: Duration) -> Self {
+            self.tool_delays.insert(name.to_string(), delay);
             self
         }
 
@@ -1125,6 +1235,7 @@ mod tests {
             prepared: PreparedToolCall,
             cancelled: Arc<AtomicBool>,
         ) -> Result<ToolInvokeResult, ToolInvokeError> {
+            let tool_name = prepared.request.name.clone();
             self.cancellation_handles
                 .lock()
                 .expect("cancellation handles lock should not be poisoned")
@@ -1135,7 +1246,12 @@ mod tests {
             }
 
             self.invocations.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(self.delay).await;
+            let delay = self
+                .tool_delays
+                .get(&tool_name)
+                .copied()
+                .unwrap_or(self.delay);
+            tokio::time::sleep(delay).await;
 
             if cancelled.load(Ordering::Relaxed) {
                 return Err(ToolInvokeError::Cancelled);
@@ -1145,7 +1261,6 @@ mod tests {
                 .outputs
                 .lock()
                 .expect("outputs lock should not be poisoned");
-            let tool_name = prepared.request.name.clone();
             let Some(outputs) = outputs_guard.get_mut(&tool_name) else {
                 return Err(ToolInvokeError::NotFound(tool_name));
             };
@@ -1157,8 +1272,12 @@ mod tests {
     }
 
     fn sample_tool_spec() -> ToolSpec {
+        sample_tool_spec_named("echo")
+    }
+
+    fn sample_tool_spec_named(name: &str) -> ToolSpec {
         ToolSpec {
-            name: "echo".to_string(),
+            name: name.to_string(),
             description: "Echo content".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1275,6 +1394,41 @@ mod tests {
         }
     }
 
+    struct RecordingApprovalHandler {
+        delay: Duration,
+        started_at: Instant,
+        confirmation_offsets: Mutex<Vec<Duration>>,
+    }
+
+    impl RecordingApprovalHandler {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                started_at: Instant::now(),
+                confirmation_offsets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn confirmation_offsets(&self) -> Vec<Duration> {
+            self.confirmation_offsets
+                .lock()
+                .expect("confirmation offsets lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalHandler for RecordingApprovalHandler {
+        async fn confirm(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            self.confirmation_offsets
+                .lock()
+                .expect("confirmation offsets lock should not be poisoned")
+                .push(self.started_at.elapsed());
+            tokio::time::sleep(self.delay).await;
+            ApprovalDecision::Approved
+        }
+    }
+
     struct DelayedModelProvider {
         started: Arc<tokio::sync::Notify>,
         delay: Duration,
@@ -1312,6 +1466,13 @@ mod tests {
 
         fn capabilities(&self) -> ModelCapabilities {
             ModelCapabilities::default()
+        }
+    }
+
+    fn extract_tool_results(message: ConversationMessage) -> Vec<ToolExecutionResult> {
+        match message {
+            ConversationMessage::ToolResults(results) => results,
+            other => panic!("expected native tool results, got {other:?}"),
         }
     }
 
@@ -1451,6 +1612,329 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::user(
                 "[Tool results]\n<tool_result name=\"echo\" status=\"ok\">done</tool_result>",
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_batch_executes_independent_calls_concurrently() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            Vec::new(),
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![
+                sample_tool_spec_named("echo_one"),
+                sample_tool_spec_named("echo_two"),
+            ])
+            .with_tool_delay("echo_one", Duration::from_millis(100))
+            .with_tool_delay("echo_two", Duration::from_millis(100))
+            .with_output(
+                "echo_one",
+                Ok(ToolInvokeResult {
+                    content: "one".to_string(),
+                    is_error: false,
+                }),
+            )
+            .with_output(
+                "echo_two",
+                Ok(ToolInvokeResult {
+                    content: "two".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(model, tools, tape_store, NativeToolDispatcher);
+        let start = Instant::now();
+
+        let message = runtime
+            .execute_tool_batch(
+                &TurnId::new(),
+                vec![
+                    crate::agent::ParsedToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo_one".to_string(),
+                        arguments: json!({"value": "one"}),
+                    },
+                    crate::agent::ParsedToolCall {
+                        id: "call-2".to_string(),
+                        name: "echo_two".to_string(),
+                        arguments: json!({"value": "two"}),
+                    },
+                ],
+                &PolicyContext::default(),
+            )
+            .await
+            .expect("tool batch should succeed");
+        let elapsed = start.elapsed();
+        let results = extract_tool_results(message);
+
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "elapsed = {elapsed:?}"
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "one");
+        assert_eq!(results[1].content, "two");
+    }
+
+    #[tokio::test]
+    async fn tool_batch_preserves_result_and_event_order() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            Vec::new(),
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![
+                sample_tool_spec_named("echo_a"),
+                sample_tool_spec_named("echo_b"),
+                sample_tool_spec_named("echo_c"),
+            ])
+            .with_tool_delay("echo_a", Duration::from_millis(50))
+            .with_tool_delay("echo_b", Duration::from_millis(10))
+            .with_tool_delay("echo_c", Duration::from_millis(30))
+            .with_output(
+                "echo_a",
+                Ok(ToolInvokeResult {
+                    content: "first".to_string(),
+                    is_error: false,
+                }),
+            )
+            .with_output(
+                "echo_b",
+                Ok(ToolInvokeResult {
+                    content: "second".to_string(),
+                    is_error: false,
+                }),
+            )
+            .with_output(
+                "echo_c",
+                Ok(ToolInvokeResult {
+                    content: "third".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(model, tools, tape_store.clone(), NativeToolDispatcher);
+        let turn_id = TurnId::new();
+
+        let message = runtime
+            .execute_tool_batch(
+                &turn_id,
+                vec![
+                    crate::agent::ParsedToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo_a".to_string(),
+                        arguments: json!({"value": "first"}),
+                    },
+                    crate::agent::ParsedToolCall {
+                        id: "call-2".to_string(),
+                        name: "echo_b".to_string(),
+                        arguments: json!({"value": "second"}),
+                    },
+                    crate::agent::ParsedToolCall {
+                        id: "call-3".to_string(),
+                        name: "echo_c".to_string(),
+                        arguments: json!({"value": "third"}),
+                    },
+                ],
+                &PolicyContext::default(),
+            )
+            .await
+            .expect("tool batch should succeed");
+        let results = extract_tool_results(message);
+        let events = tape_store
+            .load_all(runtime.session_id())
+            .await
+            .expect("events should load");
+        let tool_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::ToolStarted | EventKind::ToolCompleted | EventKind::ToolFailed
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-1", "call-2", "call-3"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(tool_events.len(), 6);
+        assert_eq!(tool_events[0].kind, EventKind::ToolStarted);
+        assert_eq!(tool_events[1].kind, EventKind::ToolStarted);
+        assert_eq!(tool_events[2].kind, EventKind::ToolStarted);
+        assert_eq!(tool_events[3].kind, EventKind::ToolCompleted);
+        assert_eq!(tool_events[4].kind, EventKind::ToolCompleted);
+        assert_eq!(tool_events[5].kind, EventKind::ToolCompleted);
+        assert_eq!(
+            tool_events
+                .iter()
+                .map(|event| {
+                    event
+                        .payload
+                        .get("call_id")
+                        .and_then(|value| value.as_str())
+                        .expect("tool event should include call_id")
+                })
+                .collect::<Vec<_>>(),
+            vec!["call-1", "call-2", "call-3", "call-1", "call-2", "call-3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_batch_cancellation_aborts_remaining_tasks() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            Vec::new(),
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![
+                sample_tool_spec_named("fast"),
+                sample_tool_spec_named("slow"),
+            ])
+            .with_tool_delay("fast", Duration::from_millis(10))
+            .with_tool_delay("slow", Duration::from_secs(5))
+            .with_output(
+                "fast",
+                Ok(ToolInvokeResult {
+                    content: "fast".to_string(),
+                    is_error: false,
+                }),
+            )
+            .with_output(
+                "slow",
+                Ok(ToolInvokeResult {
+                    content: "slow".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime(model, tools, tape_store, NativeToolDispatcher);
+        let request_context = runtime.request_context.clone();
+        let start = Instant::now();
+
+        let handle = tokio::spawn(async move {
+            runtime
+                .execute_tool_batch(
+                    &TurnId::new(),
+                    vec![
+                        crate::agent::ParsedToolCall {
+                            id: "call-1".to_string(),
+                            name: "fast".to_string(),
+                            arguments: json!({"value": "fast"}),
+                        },
+                        crate::agent::ParsedToolCall {
+                            id: "call-2".to_string(),
+                            name: "slow".to_string(),
+                            arguments: json!({"value": "slow"}),
+                        },
+                    ],
+                    &PolicyContext::default(),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        request_context.cancel();
+
+        let result = handle.await.expect("task should join");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn tool_batch_runs_approvals_serially_before_parallel_execution() {
+        let model = Arc::new(ScriptedModelProvider::new(
+            Vec::new(),
+            ModelCapabilities::default(),
+        ));
+        let tools = Arc::new(
+            ScriptedToolInvoker::new(vec![
+                sample_tool_spec_named("echo_a"),
+                sample_tool_spec_named("echo_b"),
+            ])
+            .with_policy(
+                "echo_a",
+                ScriptedAuthorizationPlan::NeedConfirmation {
+                    message: "approve echo_a".to_string(),
+                    sandbox: ScriptedSandboxKind::Seatbelt,
+                },
+            )
+            .with_policy(
+                "echo_b",
+                ScriptedAuthorizationPlan::NeedConfirmation {
+                    message: "approve echo_b".to_string(),
+                    sandbox: ScriptedSandboxKind::Seatbelt,
+                },
+            )
+            .with_tool_delay("echo_a", Duration::from_millis(10))
+            .with_tool_delay("echo_b", Duration::from_millis(10))
+            .with_output(
+                "echo_a",
+                Ok(ToolInvokeResult {
+                    content: "one".to_string(),
+                    is_error: false,
+                }),
+            )
+            .with_output(
+                "echo_b",
+                Ok(ToolInvokeResult {
+                    content: "two".to_string(),
+                    is_error: false,
+                }),
+            ),
+        );
+        let approval_handler = Arc::new(RecordingApprovalHandler::new(Duration::from_millis(50)));
+        let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
+        let mut runtime = runtime_with_approval(
+            model,
+            tools,
+            tape_store,
+            NativeToolDispatcher,
+            approval_handler.clone(),
+        );
+
+        let message = runtime
+            .execute_tool_batch(
+                &TurnId::new(),
+                vec![
+                    crate::agent::ParsedToolCall {
+                        id: "call-1".to_string(),
+                        name: "echo_a".to_string(),
+                        arguments: json!({"value": "one"}),
+                    },
+                    crate::agent::ParsedToolCall {
+                        id: "call-2".to_string(),
+                        name: "echo_b".to_string(),
+                        arguments: json!({"value": "two"}),
+                    },
+                ],
+                &PolicyContext::default(),
+            )
+            .await
+            .expect("tool batch should succeed after approvals");
+        let offsets = approval_handler.confirmation_offsets();
+        let results = extract_tool_results(message);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(offsets.len(), 2);
+        assert!(
+            offsets[1] >= offsets[0] + Duration::from_millis(40),
+            "offsets = {offsets:?}"
         );
     }
 
