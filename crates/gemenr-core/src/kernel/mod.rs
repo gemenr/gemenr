@@ -209,9 +209,7 @@ impl AgentRuntime {
             }
         };
 
-        self.request_context
-            .cancelled
-            .store(false, Ordering::Relaxed);
+        self.request_context.reset();
 
         finalized
     }
@@ -490,9 +488,7 @@ impl AgentRuntime {
 
     /// Abort the currently executing turn.
     pub fn abort_turn(&self) {
-        self.request_context
-            .cancelled
-            .store(true, Ordering::Relaxed);
+        self.request_context.cancel();
     }
 
     /// Return a clone of the runtime cancellation flag for external interrupt wiring.
@@ -654,7 +650,7 @@ impl AgentRuntime {
     }
 
     fn check_cancelled(&self) -> Result<(), AgentError> {
-        if self.request_context.cancelled.load(Ordering::Relaxed) {
+        if self.request_context.is_cancelled() {
             Err(AgentError::Cancelled)
         } else {
             Ok(())
@@ -663,11 +659,29 @@ impl AgentRuntime {
 
     async fn invoke_chat_request(&self, request: ChatRequest) -> Result<ChatResponse, AgentError> {
         let context = self.request_context.clone();
-        let request_future = self.model.chat(request, context.clone());
+        let timeout = context.timeout;
+        let cancellation_token = context.cancellation_token.clone();
+        let atomic_cancellation = wait_for_atomic_cancellation(context.cancellation_handle());
+        let request_future = self.model.chat(request, context);
+        tokio::pin!(request_future);
+        tokio::pin!(atomic_cancellation);
 
-        match self.wait_for_model_request(request_future, context).await? {
-            Some(response) => Ok(response),
-            None => Err(AgentError::Cancelled),
+        if let Some(timeout) = timeout {
+            let timeout_future = tokio::time::sleep(timeout);
+            tokio::pin!(timeout_future);
+
+            tokio::select! {
+                result = &mut request_future => map_model_result(result),
+                _ = cancellation_token.cancelled() => Err(AgentError::Cancelled),
+                _ = &mut atomic_cancellation => Err(AgentError::Cancelled),
+                _ = &mut timeout_future => Err(AgentError::Model(crate::error::ModelError::Timeout)),
+            }
+        } else {
+            tokio::select! {
+                result = &mut request_future => map_model_result(result),
+                _ = cancellation_token.cancelled() => Err(AgentError::Cancelled),
+                _ = &mut atomic_cancellation => Err(AgentError::Cancelled),
+            }
         }
     }
 
@@ -676,11 +690,29 @@ impl AgentRuntime {
         request: ModelRequest,
     ) -> Result<ModelResponse, AgentError> {
         let context = self.request_context.clone();
-        let request_future = self.model.complete(request, context.clone());
+        let timeout = context.timeout;
+        let cancellation_token = context.cancellation_token.clone();
+        let atomic_cancellation = wait_for_atomic_cancellation(context.cancellation_handle());
+        let request_future = self.model.complete(request, context);
+        tokio::pin!(request_future);
+        tokio::pin!(atomic_cancellation);
 
-        match self.wait_for_model_request(request_future, context).await? {
-            Some(response) => Ok(response),
-            None => Err(AgentError::Cancelled),
+        if let Some(timeout) = timeout {
+            let timeout_future = tokio::time::sleep(timeout);
+            tokio::pin!(timeout_future);
+
+            tokio::select! {
+                result = &mut request_future => map_model_result(result),
+                _ = cancellation_token.cancelled() => Err(AgentError::Cancelled),
+                _ = &mut atomic_cancellation => Err(AgentError::Cancelled),
+                _ = &mut timeout_future => Err(AgentError::Model(crate::error::ModelError::Timeout)),
+            }
+        } else {
+            tokio::select! {
+                result = &mut request_future => map_model_result(result),
+                _ = cancellation_token.cancelled() => Err(AgentError::Cancelled),
+                _ = &mut atomic_cancellation => Err(AgentError::Cancelled),
+            }
         }
     }
 
@@ -692,7 +724,7 @@ impl AgentRuntime {
         let request_future = self.tools.invoke(prepared, context.cancellation_handle());
         tokio::pin!(request_future);
 
-        let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+        let cancellation_future = wait_for_cancellation(&context);
         tokio::pin!(cancellation_future);
 
         if let Some(timeout) = context.timeout {
@@ -711,45 +743,27 @@ impl AgentRuntime {
             }
         }
     }
+}
 
-    async fn wait_for_model_request<T, Fut>(
-        &self,
-        request_future: Fut,
-        context: RequestContext,
-    ) -> Result<Option<T>, AgentError>
-    where
-        Fut: std::future::Future<Output = Result<T, crate::error::ModelError>>,
-    {
-        tokio::pin!(request_future);
-
-        let cancellation_future = wait_for_cancellation(context.cancellation_handle());
-        tokio::pin!(cancellation_future);
-
-        let model_result = if let Some(timeout) = context.timeout {
-            let timeout_future = tokio::time::sleep(timeout);
-            tokio::pin!(timeout_future);
-
-            tokio::select! {
-                result = &mut request_future => Some(result),
-                _ = &mut cancellation_future => None,
-                _ = &mut timeout_future => Some(Err(crate::error::ModelError::Timeout)),
-            }
-        } else {
-            tokio::select! {
-                result = &mut request_future => Some(result),
-                _ = &mut cancellation_future => None,
-            }
-        };
-
-        match model_result {
-            Some(Ok(response)) => Ok(Some(response)),
-            Some(Err(crate::error::ModelError::Cancelled)) | None => Ok(None),
-            Some(Err(error)) => Err(AgentError::Model(error)),
-        }
+fn map_model_result<T>(result: Result<T, crate::error::ModelError>) -> Result<T, AgentError> {
+    match result {
+        Ok(response) => Ok(response),
+        Err(crate::error::ModelError::Cancelled) => Err(AgentError::Cancelled),
+        Err(error) => Err(AgentError::Model(error)),
     }
 }
 
-async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
+async fn wait_for_cancellation(context: &RequestContext) {
+    let atomic_cancellation = wait_for_atomic_cancellation(context.cancellation_handle());
+    tokio::pin!(atomic_cancellation);
+
+    tokio::select! {
+        _ = context.cancellation_token.cancelled() => {}
+        _ = &mut atomic_cancellation => {}
+    }
+}
+
+async fn wait_for_atomic_cancellation(cancelled: Arc<AtomicBool>) {
     while !cancelled.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1176,7 +1190,7 @@ mod tests {
             "You are a helpful assistant.".to_string(),
             "test-model".to_string(),
             Some(256),
-            RequestContext::new(Arc::new(AtomicBool::new(false))),
+            RequestContext::new(),
             approval_handler,
             Arc::new(NoopEventSink),
         )
@@ -1218,34 +1232,39 @@ mod tests {
         }
     }
 
-    struct BlockingModelProvider {
+    struct DelayedModelProvider {
         started: Arc<tokio::sync::Notify>,
+        delay: Duration,
     }
 
-    impl BlockingModelProvider {
-        fn new(started: Arc<tokio::sync::Notify>) -> Self {
-            Self { started }
+    impl DelayedModelProvider {
+        fn new(started: Arc<tokio::sync::Notify>, delay: Duration) -> Self {
+            Self { started, delay }
         }
     }
 
     #[async_trait]
-    impl ModelProvider for BlockingModelProvider {
+    impl ModelProvider for DelayedModelProvider {
         async fn complete(
             &self,
             _request: ModelRequest,
             _context: RequestContext,
         ) -> Result<ModelResponse, ModelError> {
-            unreachable!("blocking test provider should use chat()")
+            unreachable!("delayed test provider should use chat()")
         }
 
         async fn chat(
             &self,
             _request: ChatRequest,
-            context: RequestContext,
+            _context: RequestContext,
         ) -> Result<ChatResponse, ModelError> {
             self.started.notify_waiters();
-            super::wait_for_cancellation(context.cancellation_handle()).await;
-            Err(ModelError::Cancelled)
+            tokio::time::sleep(self.delay).await;
+            Ok(ChatResponse {
+                text: Some("late response".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
         }
 
         fn capabilities(&self) -> ModelCapabilities {
@@ -1668,20 +1687,26 @@ mod tests {
     async fn abort_turn_cancels_inflight_model_request() {
         let started = Arc::new(tokio::sync::Notify::new());
         let started_wait = started.notified();
-        let model = Arc::new(BlockingModelProvider::new(Arc::clone(&started)));
+        let model = Arc::new(DelayedModelProvider::new(
+            Arc::clone(&started),
+            Duration::from_secs(5),
+        ));
         let tools = Arc::new(ScriptedToolInvoker::new(Vec::new()));
         let tape_store: Arc<dyn TapeStore> = Arc::new(InMemoryTapeStore::new());
         let tape_store_for_assertions = Arc::clone(&tape_store);
         let mut runtime = runtime(model, tools, Arc::clone(&tape_store), NativeToolDispatcher);
         let session_id = runtime.session_id().clone();
-        let cancelled = runtime.cancellation_handle();
+        let request_context = runtime.request_context.clone();
 
+        let start = tokio::time::Instant::now();
         let handle = tokio::spawn(async move { runtime.run_turn("block on model").await });
         started_wait.await;
-        cancelled.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        request_context.cancel();
 
         let result = handle.await.expect("task should join");
         assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(start.elapsed() < Duration::from_secs(1));
 
         let events = tape_store_for_assertions
             .load_all(&session_id)
@@ -1692,6 +1717,16 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::TurnFailed))
         );
+    }
+
+    #[test]
+    fn cancel_sets_both_atomic_flag_and_token() {
+        let context = RequestContext::new();
+
+        context.cancel();
+
+        assert!(context.cancelled.load(Ordering::Acquire));
+        assert!(context.cancellation_token.is_cancelled());
     }
 
     #[tokio::test]

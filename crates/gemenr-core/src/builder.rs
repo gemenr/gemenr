@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -154,10 +153,11 @@ impl RuntimeBuilder {
     ) -> AgentRuntime {
         let tool_dispatcher = self.select_tool_dispatcher();
 
-        let request_context = self.request_timeout.map_or_else(
-            || RequestContext::new(Arc::new(AtomicBool::new(false))),
-            |timeout| RequestContext::new(Arc::new(AtomicBool::new(false))).with_timeout(timeout),
-        );
+        let request_context = self
+            .request_timeout
+            .map_or_else(RequestContext::new, |timeout| {
+                RequestContext::new().with_timeout(timeout)
+            });
 
         AgentRuntime::new(
             ContextManager::new(session_id, self.tape_store.clone(), self.soul.clone()),

@@ -3,11 +3,12 @@ mod anthropic;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ConfigError;
 use crate::error::ModelError;
@@ -42,16 +43,19 @@ pub struct ModelRequest {
 pub struct RequestContext {
     /// Shared cancellation flag for the active turn.
     pub cancelled: Arc<AtomicBool>,
+    /// Token-based cancellation used to interrupt async operations immediately.
+    pub cancellation_token: CancellationToken,
     /// Optional per-request timeout override.
     pub timeout: Option<Duration>,
 }
 
 impl RequestContext {
-    /// Create a new request context from a shared cancellation source.
+    /// Create a new request context with a fresh cancellation state.
     #[must_use]
-    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+    pub fn new() -> Self {
         Self {
-            cancelled,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation_token: CancellationToken::new(),
             timeout: None,
         }
     }
@@ -68,11 +72,28 @@ impl RequestContext {
     pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
     }
+
+    /// Cancel the active request for all shared clones of this context.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancellation_token.cancel();
+    }
+
+    /// Return whether the request has been cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || self.cancellation_token.is_cancelled()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cancelled.store(false, Ordering::Release);
+        self.cancellation_token = CancellationToken::new();
+    }
 }
 
 impl Default for RequestContext {
     fn default() -> Self {
-        Self::new(Arc::new(AtomicBool::new(false)))
+        Self::new()
     }
 }
 
@@ -439,7 +460,6 @@ fn is_retryable(error: &ModelError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -709,9 +729,8 @@ mod tests {
             })],
             false,
         );
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let context =
-            RequestContext::new(Arc::clone(&cancelled)).with_timeout(Duration::from_secs(7));
+        let context = RequestContext::new().with_timeout(Duration::from_secs(7));
+        let cancelled = context.cancellation_handle();
 
         provider
             .chat(

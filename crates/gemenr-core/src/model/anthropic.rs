@@ -77,7 +77,7 @@ impl AnthropicProvider {
         T: Serialize + ?Sized,
     {
         for attempt in 0..=MAX_RETRIES {
-            if context.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            if context.is_cancelled() {
                 return Err(ModelError::Cancelled);
             }
 
@@ -215,7 +215,7 @@ where
 {
     tokio::pin!(future);
 
-    let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+    let cancellation_future = wait_for_cancellation(context);
     tokio::pin!(cancellation_future);
 
     tokio::select! {
@@ -228,7 +228,7 @@ async fn sleep_or_cancel(duration: Duration, context: &RequestContext) -> Result
     let sleep_future = sleep(duration);
     tokio::pin!(sleep_future);
 
-    let cancellation_future = wait_for_cancellation(context.cancellation_handle());
+    let cancellation_future = wait_for_cancellation(context);
     tokio::pin!(cancellation_future);
 
     tokio::select! {
@@ -237,7 +237,17 @@ async fn sleep_or_cancel(duration: Duration, context: &RequestContext) -> Result
     }
 }
 
-async fn wait_for_cancellation(cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+async fn wait_for_cancellation(context: &RequestContext) {
+    let atomic_cancellation = wait_for_atomic_cancellation(context.cancellation_handle());
+    tokio::pin!(atomic_cancellation);
+
+    tokio::select! {
+        _ = context.cancellation_token.cancelled() => {}
+        _ = &mut atomic_cancellation => {}
+    }
+}
+
+async fn wait_for_atomic_cancellation(cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     while !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         sleep(Duration::from_millis(10)).await;
     }
@@ -668,10 +678,7 @@ fn retry_delay(attempt: u32, error: &ModelError) -> Duration {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use reqwest::{
@@ -1404,19 +1411,75 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancel_flag = Arc::clone(&cancelled);
+        let context = RequestContext::default();
+        let cancel_flag = context.cancellation_handle();
         tokio::spawn(async move {
             sleep(Duration::from_millis(100)).await;
             cancel_flag.store(true, Ordering::Release);
         });
 
         let error = provider_for_mock(&server)
-            .chat(test_chat_request(), RequestContext::new(cancelled))
+            .chat(test_chat_request(), context)
             .await
             .expect_err("cancelled request should fail");
 
         assert!(matches!(error, ModelError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_before_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(success_response_body("should not send")),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let context = RequestContext::default();
+        context.cancel();
+
+        let error = provider_for_mock(&server)
+            .chat(test_chat_request(), context)
+            .await
+            .expect_err("pre-cancelled request should fail");
+
+        assert!(matches!(error, ModelError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_during_retry_sleep() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("retry-after", "5")
+                    .set_body_json(error_response_body("rate_limit_error", "Rate limited")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let context = RequestContext::default();
+        let cancel_context = context.clone();
+        let provider = provider_for_mock(&server);
+        let start = tokio::time::Instant::now();
+
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            cancel_context.cancel();
+        });
+
+        let error = provider
+            .chat(test_chat_request(), context)
+            .await
+            .expect_err("retry sleep should be cancellable");
+
+        assert!(matches!(error, ModelError::Cancelled));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
