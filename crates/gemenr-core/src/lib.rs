@@ -57,8 +57,6 @@ pub use agent::ToolExecutionResult;
 pub use agent::XmlToolDispatcher;
 /// Re-export of runtime builder.
 pub use builder::RuntimeBuilder;
-/// Re-export of access-layer configuration.
-pub use config::AccessConfig;
 /// Re-export of access-layer composition-root configuration view.
 pub use config::AccessConfigView;
 /// Re-export of the application configuration type.
@@ -67,30 +65,12 @@ pub use config::Config;
 pub use config::ConfigError;
 /// Re-export of runtime composition-root configuration view.
 pub use config::CoreRuntimeConfigView;
-/// Re-export of cron job configuration.
-pub use config::CronJobConfig;
-/// Re-export of Lark access configuration.
-pub use config::LarkConfig;
-/// Re-export of MCP configuration.
-pub use config::McpConfig;
-/// Re-export of external MCP server definitions.
-pub use config::McpServerConfig;
 /// Re-export of selectable model definitions.
 pub use config::ModelConfig;
-/// Re-export of provider fallback configuration.
-pub use config::ModelFallbackConfig;
-/// Re-export of scoped policy configuration.
-pub use config::PolicyConfig;
-/// Re-export of configured policy effects.
-pub use config::PolicyEffect;
-/// Re-export of configured policy rules.
-pub use config::PolicyRuleConfig;
 /// Re-export of provider definitions.
 pub use config::ProviderConfig;
 /// Re-export of supported provider types.
 pub use config::ProviderType;
-/// Re-export of configured policy scopes.
-pub use config::ScopedPolicyConfig;
 /// Re-export of tool-plane composition-root configuration view.
 pub use config::ToolingConfigView;
 /// Re-export of anchor checkpoint entries.

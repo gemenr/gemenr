@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use gemenr_core::McpServerConfig;
+use gemenr_core::config::McpServerConfig;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -270,7 +270,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{McpClient, McpError};
-    use gemenr_core::McpServerConfig;
+    use gemenr_core::config::McpServerConfig;
     use serde_json::json;
 
     fn mock_server_config(script: &str) -> McpServerConfig {

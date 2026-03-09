@@ -42,9 +42,9 @@ pub enum AgentError {
     #[error(transparent)]
     Model(#[from] crate::error::ModelError),
 
-    /// Context management error.
+    /// Tape persistence or reconstruction error.
     #[error(transparent)]
-    Context(#[from] crate::context::TapeError),
+    Tape(#[from] crate::context::TapeError),
 
     /// SOUL.md loading error.
     #[error(transparent)]
@@ -101,7 +101,6 @@ pub trait ApprovalHandler: Send + Sync {
 #[derive(Debug, Default)]
 pub struct DenyAllApprovals;
 
-#[async_trait]
 #[async_trait]
 impl ApprovalHandler for DenyAllApprovals {
     async fn confirm(&self, _request: ApprovalRequest) -> ApprovalDecision {
@@ -786,7 +785,7 @@ fn tool_error_event_kind(error: &ToolInvokeError) -> EventKind {
 fn turn_failure_category(error: &AgentError) -> &'static str {
     match error {
         AgentError::Model(_) => "model",
-        AgentError::Context(_) => "context",
+        AgentError::Tape(_) => "tape",
         AgentError::Soul(_) => "soul",
         AgentError::Tool(_) => "tool",
         AgentError::Cancelled => "cancelled",

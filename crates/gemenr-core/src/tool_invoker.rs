@@ -46,17 +46,6 @@ pub enum ToolInvokeError {
     },
 }
 
-/// Backward-compatible Phase 1 policy decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyDecision {
-    /// Tool call is allowed without confirmation.
-    Allow,
-    /// Tool call needs user confirmation with the provided message.
-    NeedConfirmation(String),
-    /// Tool call is denied with the provided reason.
-    Deny(String),
-}
-
 /// Context used when evaluating a tool execution policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyContext {

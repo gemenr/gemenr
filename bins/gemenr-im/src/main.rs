@@ -200,9 +200,9 @@ mod tests {
 
     use super::{build_tool_invoker, load_soul_manager};
     use gemenr_core::{
-        AuthorizationDecision, Config, ConfigError, McpServerConfig, ModelConfig, PolicyContext,
-        PolicyEffect, PolicyRuleConfig, ProviderConfig, ProviderType, SandboxKind,
-        ScopedPolicyConfig,
+        AuthorizationDecision, Config, ConfigError, ModelConfig, PolicyContext, ProviderConfig,
+        ProviderType, SandboxKind,
+        config::{McpServerConfig, PolicyEffect, PolicyRuleConfig, ScopedPolicyConfig},
     };
 
     #[tokio::test]

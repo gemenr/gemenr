@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gemenr_core::{
-    ExecutionPolicy, PolicyConfig, PolicyContext, PolicyEffect, RiskLevel, SandboxKind,
-    ToolCallRequest, ToolSpec,
+    ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind, ToolCallRequest, ToolSpec,
+    config::{PolicyConfig, PolicyEffect},
 };
 
 /// Evaluates the effective execution policy for one tool invocation.
@@ -240,8 +240,8 @@ fn phase_one_default(spec: &ToolSpec) -> ExecutionPolicy {
 #[cfg(test)]
 mod tests {
     use gemenr_core::{
-        ExecutionPolicy, PolicyContext, PolicyEffect, RiskLevel, SandboxKind, ToolCallRequest,
-        ToolSpec,
+        ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind, ToolCallRequest, ToolSpec,
+        config::PolicyEffect,
     };
     use serde_json::json;
 

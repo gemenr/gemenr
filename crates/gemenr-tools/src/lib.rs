@@ -132,7 +132,7 @@ impl ToolPlane {
     /// Register enabled stdio MCP servers and their remote tools.
     pub async fn register_mcp_servers(
         &mut self,
-        config: &gemenr_core::McpConfig,
+        config: &gemenr_core::config::McpConfig,
     ) -> Result<(), crate::mcp::McpError> {
         crate::mcp::register_mcp_servers(self, config).await
     }
@@ -572,7 +572,7 @@ mod tests {
             rules: vec![PolicyRule {
                 scope: PolicyScope::Conversation("conv-1".to_string()),
                 tool_name: "shell".to_string(),
-                effect: gemenr_core::PolicyEffect::Allow,
+                effect: gemenr_core::config::PolicyEffect::Allow,
                 sandbox: SandboxKind::Seatbelt,
             }],
         }));
@@ -640,7 +640,7 @@ mod tests {
             rules: vec![PolicyRule {
                 scope: PolicyScope::Conversation("conv-1".to_string()),
                 tool_name: "shell".to_string(),
-                effect: gemenr_core::PolicyEffect::NeedConfirmation,
+                effect: gemenr_core::config::PolicyEffect::NeedConfirmation,
                 sandbox: SandboxKind::Seatbelt,
             }],
         }));

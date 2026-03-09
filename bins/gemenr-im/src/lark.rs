@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use gemenr_core::{
     AccessAdapter, AccessError, AccessInbound, AccessOutbound, ConversationDriver, ConversationId,
-    LarkConfig, ReplyRoute,
+    ReplyRoute, config::LarkConfig,
 };
 use reqwest::Client;
 use serde::Deserialize;

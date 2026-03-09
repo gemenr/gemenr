@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gemenr_core::{McpConfig, RiskLevel, ToolSpec};
+use gemenr_core::{RiskLevel, ToolSpec, config::McpConfig};
 use tokio::sync::Mutex;
 
 use crate::ToolPlane;
@@ -108,7 +108,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use gemenr_core::{McpServerConfig, ToolCatalog};
+    use gemenr_core::{ToolCatalog, config::McpServerConfig};
     use serde_json::json;
     use tokio::sync::Mutex;
 
@@ -202,7 +202,7 @@ while True:
     #[tokio::test]
     async fn enabled_servers_register_namespaced_tools() {
         let mut plane = ToolPlane::new();
-        let config = gemenr_core::McpConfig {
+        let config = gemenr_core::config::McpConfig {
             servers: vec![server_config()],
         };
 

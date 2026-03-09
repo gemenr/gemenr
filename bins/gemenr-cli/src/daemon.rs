@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use gemenr_core::{
     AccessAdapter, AccessError, AccessOutbound, AccessRouter, AgentError, Config, ConversationId,
-    CronJobConfig, LarkConfig, ReplyRoute, RuntimeBuilder, ToolInvoker,
+    ReplyRoute, RuntimeBuilder, ToolInvoker,
+    config::{CronJobConfig, LarkConfig},
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -332,9 +333,9 @@ mod tests {
         ModelResponse,
     };
     use gemenr_core::{
-        AccessAdapter, AccessError, AccessOutbound, AccessRouter, CronJobConfig, InMemoryTapeStore,
-        PolicyContext, ReplyRoute, RuntimeBuilder, SandboxKind, SoulManager, TapeStore,
-        ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec,
+        AccessAdapter, AccessError, AccessOutbound, AccessRouter, InMemoryTapeStore, PolicyContext,
+        ReplyRoute, RuntimeBuilder, SandboxKind, SoulManager, TapeStore, ToolInvokeError,
+        ToolInvokeResult, ToolInvoker, ToolSpec, config::CronJobConfig,
     };
     use serde_json::json;
     use tokio::sync::RwLock;

@@ -717,10 +717,10 @@ mod tests {
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
         ApprovalDecision, ApprovalRequest, AuthorizationDecision, ChatRequest, ChatResponse,
         Config, ConfigError, ConversationDriver, ConversationId, InMemoryTapeStore,
-        McpServerConfig, ModelCapabilities, ModelConfig, ModelError, ModelProvider, PolicyContext,
-        PolicyEffect, PolicyRuleConfig, ProviderConfig, ProviderType, RequestContext, SandboxKind,
-        ScopedPolicyConfig, SoulManager, TapeStore, ToolCallRequest, ToolInvokeError,
-        ToolInvokeResult, ToolSpec,
+        ModelCapabilities, ModelConfig, ModelError, ModelProvider, PolicyContext, ProviderConfig,
+        ProviderType, RequestContext, SandboxKind, SoulManager, TapeStore, ToolCallRequest,
+        ToolInvokeError, ToolInvokeResult, ToolSpec,
+        config::{McpServerConfig, PolicyEffect, PolicyRuleConfig, ScopedPolicyConfig},
     };
 
     #[test]
