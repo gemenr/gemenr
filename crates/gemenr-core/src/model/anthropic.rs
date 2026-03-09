@@ -668,13 +668,22 @@ fn retry_delay(attempt: u32, error: &ModelError) -> Duration {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
 
     use reqwest::{
-        StatusCode,
+        Client, StatusCode,
         header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT},
     };
     use serde_json::json;
+    use tokio::time::sleep;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
 
     use super::{
         ANTHROPIC_API_URL, ANTHROPIC_VERSION, AnthropicProvider, AnthropicRequest,
@@ -688,9 +697,80 @@ mod tests {
     use crate::message::ChatMessage;
     use crate::model::{
         ChatRequest, FinishReason, ModelCapabilities, ModelProvider, ModelRequest, RequestContext,
-        ToolsPayload,
+        TokenUsage, ToolsPayload,
     };
     use crate::tool_spec::{RiskLevel, ToolSpec};
+
+    fn provider_for_mock(server: &MockServer) -> AnthropicProvider {
+        AnthropicProvider {
+            client: Client::new(),
+            api_key: "test-api-key".to_string(),
+            api_endpoint: format!("{}/v1/messages", server.uri()),
+            default_model: "claude-haiku-4-5-20251001".to_string(),
+        }
+    }
+
+    fn success_response_body(text: &str) -> serde_json::Value {
+        json!({
+            "id": "msg_test_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20
+            }
+        })
+    }
+
+    fn tool_use_response_body(
+        tool_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "id": "msg_test_456",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I'll use a tool."},
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": input
+                }
+            ],
+            "model": "claude-haiku-4-5-20251001",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 15, "output_tokens": 30}
+        })
+    }
+
+    fn error_response_body(error_type: &str, message: &str) -> serde_json::Value {
+        json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        })
+    }
+
+    fn default_request_context() -> RequestContext {
+        RequestContext::default()
+    }
+
+    fn test_chat_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage::user("Hello from the mock test")],
+            model: String::new(),
+            max_tokens: Some(128),
+            tools: None,
+        }
+    }
 
     #[test]
     fn capabilities_enable_native_tool_calling_without_vision() {
@@ -1201,6 +1281,225 @@ mod tests {
             ),
             Duration::from_secs(7)
         );
+    }
+
+    #[tokio::test]
+    async fn test_chat_success_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-api-key"))
+            .and(header("anthropic-version", ANTHROPIC_VERSION))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(success_response_body("Hello, world!")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = provider_for_mock(&server)
+            .chat(test_chat_request(), default_request_context())
+            .await
+            .expect("mocked request should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("Hello, world!"));
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("retry-after", "0")
+                    .set_body_json(error_response_body("rate_limit_error", "Rate limited")),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let error = provider_for_mock(&server)
+            .chat(test_chat_request(), default_request_context())
+            .await
+            .expect_err("rate limit response should fail");
+
+        assert!(matches!(
+            error,
+            ModelError::RateLimit {
+                retry_after: Some(delay),
+            } if delay.is_zero()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_failure_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(error_response_body(
+                    "authentication_error",
+                    "Invalid API key",
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = provider_for_mock(&server)
+            .chat(test_chat_request(), default_request_context())
+            .await
+            .expect_err("auth response should fail");
+
+        assert!(matches!(error, ModelError::Auth(message) if message == "Invalid API key"));
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(success_response_body("delayed")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = provider_for_mock(&server);
+        let request_body =
+            build_chat_request(&provider, &test_chat_request(), &provider.default_model)
+                .expect("request should build");
+        let context = default_request_context().with_timeout(Duration::from_millis(100));
+        let error = provider
+            .do_send_request(&request_body, &context)
+            .await
+            .expect_err("delayed response should time out");
+
+        assert!(matches!(error, ModelError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn test_request_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(success_response_body("should not complete")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&cancelled);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            cancel_flag.store(true, Ordering::Release);
+        });
+
+        let error = provider_for_mock(&server)
+            .chat(test_chat_request(), RequestContext::new(cancelled))
+            .await
+            .expect_err("cancelled request should fail");
+
+        assert!(matches!(error, ModelError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_response_parsing() {
+        let server = MockServer::start().await;
+        let tool_input = json!({ "path": "/tmp/test.txt" });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(tool_use_response_body(
+                    "toolu_01",
+                    "fs.read",
+                    tool_input.clone(),
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut request = test_chat_request();
+        request.tools = Some(vec![test_tool_spec()]);
+
+        let response = provider_for_mock(&server)
+            .chat(request, default_request_context())
+            .await
+            .expect("tool use response should parse");
+
+        assert_eq!(response.text.as_deref(), Some("I'll use a tool."));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "toolu_01");
+        assert_eq!(response.tool_calls[0].name, "fs.read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.tool_calls[0].arguments)
+                .expect("tool arguments should be valid json"),
+            tool_input
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_error_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(error_response_body("api_error", "Service unavailable")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = provider_for_mock(&server)
+            .chat(test_chat_request(), default_request_context())
+            .await
+            .expect_err("server error should fail");
+
+        assert!(matches!(
+            error,
+            ModelError::Api { status: 500, ref message } if message == "Service unavailable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-api-key"))
+            .and(header("anthropic-version", ANTHROPIC_VERSION))
+            .and(header("content-type", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(success_response_body("headers ok")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = provider_for_mock(&server)
+            .chat(test_chat_request(), default_request_context())
+            .await
+            .expect("header-validated request should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("headers ok"));
     }
 
     fn test_config(api_endpoint: Option<&str>) -> Config {
