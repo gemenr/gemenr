@@ -33,15 +33,25 @@ pub fn allowlist_tool_invoker(
     inner: Arc<dyn tool_invoker::ToolInvoker>,
     allowed: &[String],
 ) -> Arc<dyn tool_invoker::ToolInvoker> {
+    let allowed_set: HashSet<String> = allowed.iter().cloned().collect();
+    let allowed_specs = inner
+        .list_specs()
+        .iter()
+        .filter(|spec| allowed_set.contains(&spec.name))
+        .cloned()
+        .collect();
+
     Arc::new(AllowlistedToolInvoker {
         inner,
-        allowed: allowed.iter().cloned().collect(),
+        allowed: allowed_set,
+        allowed_specs,
     })
 }
 
 struct AllowlistedToolInvoker {
     inner: Arc<dyn tool_invoker::ToolInvoker>,
     allowed: HashSet<String>,
+    allowed_specs: Vec<ToolSpec>,
 }
 
 impl tool_invoker::ToolCatalog for AllowlistedToolInvoker {
@@ -53,12 +63,8 @@ impl tool_invoker::ToolCatalog for AllowlistedToolInvoker {
         }
     }
 
-    fn list_specs(&self) -> Vec<ToolSpec> {
-        self.inner
-            .list_specs()
-            .into_iter()
-            .filter(|spec| self.allowed.contains(&spec.name))
-            .collect()
+    fn list_specs(&self) -> &[ToolSpec] {
+        &self.allowed_specs
     }
 }
 
@@ -105,6 +111,7 @@ pub struct ToolCatalog {
 /// Central registry and execution engine for tools.
 pub struct ToolPlane {
     tools: HashMap<String, (ToolSpec, Box<dyn ToolHandler>)>,
+    specs_cache: Vec<ToolSpec>,
     policy_evaluator: Arc<dyn PolicyEvaluator>,
 }
 
@@ -120,6 +127,7 @@ impl ToolPlane {
     pub fn with_policy_evaluator(policy_evaluator: Arc<dyn PolicyEvaluator>) -> Self {
         Self {
             tools: HashMap::new(),
+            specs_cache: Vec::new(),
             policy_evaluator,
         }
     }
@@ -140,6 +148,20 @@ impl ToolPlane {
     /// Register a tool with its specification and handler.
     pub fn register(&mut self, spec: ToolSpec, handler: Box<dyn ToolHandler>) {
         debug!(tool = %spec.name, "registering tool");
+        let cache_spec = spec.clone();
+
+        if let Some(existing) = self
+            .specs_cache
+            .iter_mut()
+            .find(|existing| existing.name == cache_spec.name)
+        {
+            *existing = cache_spec;
+        } else {
+            self.specs_cache.push(cache_spec);
+            self.specs_cache
+                .sort_by(|left, right| left.name.cmp(&right.name));
+        }
+
         self.tools.insert(spec.name.clone(), (spec, handler));
     }
 
@@ -152,14 +174,9 @@ impl ToolPlane {
     /// List all registered tools as a catalog.
     #[must_use]
     pub fn list(&self) -> ToolCatalog {
-        let mut tools = self
-            .tools
-            .values()
-            .map(|(spec, _)| spec.clone())
-            .collect::<Vec<_>>();
-        tools.sort_by(|left, right| left.name.cmp(&right.name));
-
-        ToolCatalog { tools }
+        ToolCatalog {
+            tools: self.specs_cache.clone(),
+        }
     }
 
     /// Authorize a tool call request against the configured policy evaluator.
@@ -249,8 +266,8 @@ impl tool_invoker::ToolCatalog for ToolPlane {
         ToolPlane::lookup(self, name)
     }
 
-    fn list_specs(&self) -> Vec<ToolSpec> {
-        self.list().tools
+    fn list_specs(&self) -> &[ToolSpec] {
+        &self.specs_cache
     }
 }
 
@@ -300,7 +317,7 @@ mod tests {
     use async_trait::async_trait;
     use gemenr_core::{
         AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, RiskLevel,
-        SandboxKind,
+        SandboxKind, ToolCatalog as _,
     };
     use serde_json::json;
 
@@ -444,6 +461,26 @@ mod tests {
 
         assert_eq!(catalog.tools.len(), 2);
         assert_eq!(names, vec!["fs.read", "shell"]);
+    }
+
+    #[test]
+    fn test_list_specs_returns_reference() {
+        let mut plane = ToolPlane::new();
+        plane.register(spec("fs.read"), Box::new(StaticHandler { content: "a" }));
+        plane.register(spec("shell"), Box::new(StaticHandler { content: "b" }));
+
+        let first = plane.list_specs();
+        let second = plane.list_specs();
+
+        assert_eq!(first.len(), 2);
+        assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
+        assert_eq!(
+            first
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fs.read", "shell"]
+        );
     }
 
     #[tokio::test]
@@ -693,37 +730,33 @@ mod allowlist_tests {
 
     use super::allowlist_tool_invoker;
 
-    struct StaticInvoker;
+    struct StaticInvoker {
+        specs: Vec<gemenr_core::ToolSpec>,
+    }
+
+    impl StaticInvoker {
+        fn new() -> Self {
+            Self {
+                specs: ["shell", "fs.read"]
+                    .into_iter()
+                    .map(|name| gemenr_core::ToolSpec {
+                        name: name.to_string(),
+                        description: name.to_string(),
+                        input_schema: json!({}),
+                        risk_level: RiskLevel::Low,
+                    })
+                    .collect(),
+            }
+        }
+    }
 
     impl ToolCatalog for StaticInvoker {
         fn lookup(&self, name: &str) -> Option<&gemenr_core::ToolSpec> {
-            match name {
-                "shell" => Some(Box::leak(Box::new(gemenr_core::ToolSpec {
-                    name: "shell".to_string(),
-                    description: "shell".to_string(),
-                    input_schema: json!({}),
-                    risk_level: RiskLevel::Low,
-                }))),
-                "fs.read" => Some(Box::leak(Box::new(gemenr_core::ToolSpec {
-                    name: "fs.read".to_string(),
-                    description: "fs.read".to_string(),
-                    input_schema: json!({}),
-                    risk_level: RiskLevel::Low,
-                }))),
-                _ => None,
-            }
+            self.specs.iter().find(|spec| spec.name == name)
         }
 
-        fn list_specs(&self) -> Vec<gemenr_core::ToolSpec> {
-            ["shell", "fs.read"]
-                .into_iter()
-                .map(|name| gemenr_core::ToolSpec {
-                    name: name.to_string(),
-                    description: name.to_string(),
-                    input_schema: json!({}),
-                    risk_level: RiskLevel::Low,
-                })
-                .collect()
+        fn list_specs(&self) -> &[gemenr_core::ToolSpec] {
+            &self.specs
         }
     }
 
@@ -758,7 +791,7 @@ mod allowlist_tests {
 
     #[test]
     fn allowlist_wrapper_denies_before_execution() {
-        let view = allowlist_tool_invoker(Arc::new(StaticInvoker), &["shell".to_string()]);
+        let view = allowlist_tool_invoker(Arc::new(StaticInvoker::new()), &["shell".to_string()]);
         let specs = view.list_specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "shell");

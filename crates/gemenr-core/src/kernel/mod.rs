@@ -27,7 +27,7 @@ pub mod prompt;
 /// Turn-state transitions and decisions.
 pub mod turn;
 
-pub use prompt::PromptComposer;
+pub use prompt::{PromptComposer, PromptContext};
 pub use turn::{ActionDecision, TurnController, TurnState};
 
 use self::turn::ModelStepOutcome;
@@ -298,15 +298,15 @@ impl AgentRuntime {
             .build_provider_messages_for_step(turn_id, history)
             .await?;
         let soul_content = self.context.latest_soul_content().await?;
-        let request = self.composer.build_prompt(
-            &soul_content,
-            &self.system_prompt,
-            provider_messages,
-            &self.tools.list_specs(),
-            &self.tool_dispatcher,
-            &self.model_name,
-            self.max_tokens,
-        );
+        let request = self.composer.build_prompt(PromptContext {
+            soul_content: &soul_content,
+            system_prompt: &self.system_prompt,
+            context_messages: provider_messages,
+            tools: self.tools.list_specs(),
+            dispatcher: &self.tool_dispatcher,
+            model: &self.model_name,
+            max_tokens: self.max_tokens,
+        });
         let response = self.invoke_chat_request(request).await?;
         let (text, tool_calls) = self.tool_dispatcher.parse_response(&response);
 
@@ -917,6 +917,7 @@ mod tests {
 
     struct ScriptedToolInvoker {
         specs: HashMap<String, ToolSpec>,
+        specs_cache: Vec<ToolSpec>,
         policies: HashMap<String, ExecutionPolicy>,
         authorization_contexts: Mutex<Vec<PolicyContext>>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
@@ -927,13 +928,17 @@ mod tests {
 
     impl ScriptedToolInvoker {
         fn new(specs: Vec<ToolSpec>) -> Self {
-            let specs = specs
-                .into_iter()
+            let mut specs_cache = specs;
+            specs_cache.sort_by(|left, right| left.name.cmp(&right.name));
+            let specs = specs_cache
+                .iter()
+                .cloned()
                 .map(|spec| (spec.name.clone(), spec))
                 .collect();
 
             Self {
                 specs,
+                specs_cache,
                 policies: HashMap::new(),
                 authorization_contexts: Mutex::new(Vec::new()),
                 outputs: Mutex::new(HashMap::new()),
@@ -992,8 +997,8 @@ mod tests {
             self.specs.get(name)
         }
 
-        fn list_specs(&self) -> Vec<ToolSpec> {
-            self.specs.values().cloned().collect()
+        fn list_specs(&self) -> &[ToolSpec] {
+            &self.specs_cache
         }
     }
 

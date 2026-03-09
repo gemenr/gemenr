@@ -202,8 +202,8 @@ impl ToolCatalog for NoopToolInvoker {
         None
     }
 
-    fn list_specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
+    fn list_specs(&self) -> &[ToolSpec] {
+        &[]
     }
 }
 
@@ -251,8 +251,8 @@ impl ToolCatalog for StaticToolInvoker {
         self.specs.iter().find(|spec| spec.name == name)
     }
 
-    fn list_specs(&self) -> Vec<ToolSpec> {
-        self.specs.clone()
+    fn list_specs(&self) -> &[ToolSpec] {
+        &self.specs
     }
 }
 

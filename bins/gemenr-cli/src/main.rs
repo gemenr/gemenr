@@ -1280,8 +1280,8 @@ while True:
             None
         }
 
-        fn list_specs(&self) -> Vec<ToolSpec> {
-            Vec::new()
+        fn list_specs(&self) -> &[ToolSpec] {
+            &[]
         }
     }
 

@@ -443,8 +443,8 @@ mod tests {
             self.specs.iter().find(|spec| spec.name == name)
         }
 
-        fn list_specs(&self) -> Vec<ToolSpec> {
-            self.specs.clone()
+        fn list_specs(&self) -> &[ToolSpec] {
+            &self.specs
         }
     }
 

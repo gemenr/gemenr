@@ -120,6 +120,8 @@ pub use kernel::EventSink;
 pub use kernel::NoopEventSink;
 /// Re-export of prompt composition helpers.
 pub use kernel::PromptComposer;
+/// Re-export of structured prompt composition input.
+pub use kernel::PromptContext;
 /// Re-export of turn decision helpers.
 pub use kernel::TurnController;
 /// Re-export of structured runtime turn input.

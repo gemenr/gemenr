@@ -135,8 +135,11 @@ pub trait ToolCatalog: Send + Sync {
     /// Look up a registered tool definition by name.
     fn lookup(&self, name: &str) -> Option<&ToolSpec>;
 
-    /// List all registered tool specifications.
-    fn list_specs(&self) -> Vec<ToolSpec>;
+    /// Borrow all registered tool specifications.
+    ///
+    /// Implementations should retain an internal cache so callers can inspect
+    /// tool metadata without forcing a fresh allocation on every turn.
+    fn list_specs(&self) -> &[ToolSpec];
 }
 
 /// Abstract interface for policy authorization.
@@ -315,8 +318,8 @@ mod tests {
                 None
             }
 
-            fn list_specs(&self) -> Vec<crate::tool_spec::ToolSpec> {
-                Vec::new()
+            fn list_specs(&self) -> &[crate::tool_spec::ToolSpec] {
+                &[]
             }
         }
 

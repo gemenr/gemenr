@@ -12,56 +12,69 @@ const SOUL_BUDGET_WARNING: &str = "SOUL.md is near its prompt budget. Preserve d
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PromptComposer;
 
+/// Runtime context for prompt composition.
+///
+/// Bundles all data required by [`PromptComposer::build_prompt`] into a single
+/// structured input so the kernel can evolve prompt assembly without growing
+/// the method signature further.
+#[derive(Debug)]
+pub struct PromptContext<'a> {
+    /// SOUL.md content to inject into the synthesized system prompt.
+    pub soul_content: &'a str,
+    /// Base system prompt text configured for the runtime.
+    pub system_prompt: &'a str,
+    /// Conversation history messages to append after the system message.
+    pub context_messages: Vec<ChatMessage>,
+    /// Tool specifications available for the current turn.
+    pub tools: &'a [ToolSpec],
+    /// Dispatcher that decides prompt instructions and tool payload mode.
+    pub dispatcher: &'a SelectedToolDispatcher,
+    /// Target model identifier for the outgoing request.
+    pub model: &'a str,
+    /// Maximum tokens to request from the provider, when configured.
+    pub max_tokens: Option<u32>,
+}
+
 impl PromptComposer {
     /// Build a complete chat request for the configured model.
     ///
     /// The resulting request always begins with a synthesized system message,
     /// followed by the provided context messages in their original order.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn build_prompt(
-        &self,
-        soul_content: &str,
-        system_prompt: &str,
-        context_messages: Vec<ChatMessage>,
-        tools: &[ToolSpec],
-        dispatcher: &SelectedToolDispatcher,
-        model: &str,
-        max_tokens: Option<u32>,
-    ) -> ChatRequest {
+    pub fn build_prompt(&self, ctx: PromptContext<'_>) -> ChatRequest {
         let mut system = String::new();
 
-        if !soul_content.trim().is_empty() {
-            system.push_str(soul_content);
+        if !ctx.soul_content.trim().is_empty() {
+            system.push_str(ctx.soul_content);
             system.push_str("\n\n");
 
-            if estimated_soul_tokens(soul_content) > SOUL_BUDGET_WARNING_THRESHOLD_TOKENS {
+            if estimated_soul_tokens(ctx.soul_content) > SOUL_BUDGET_WARNING_THRESHOLD_TOKENS {
                 system.push_str(SOUL_BUDGET_WARNING);
                 system.push_str("\n\n");
             }
         }
 
-        system.push_str(system_prompt);
+        system.push_str(ctx.system_prompt);
 
-        let tool_instructions = dispatcher.prompt_instructions(tools);
+        let tool_instructions = ctx.dispatcher.prompt_instructions(ctx.tools);
         if !tool_instructions.is_empty() {
             system.push_str("\n\n");
             system.push_str(&tool_instructions);
         }
 
         let mut messages = vec![ChatMessage::system(system)];
-        messages.extend(context_messages);
+        messages.extend(ctx.context_messages);
 
-        let request_tools = if dispatcher.should_send_tool_specs() && !tools.is_empty() {
-            Some(tools.to_vec())
+        let request_tools = if ctx.dispatcher.should_send_tool_specs() && !ctx.tools.is_empty() {
+            Some(ctx.tools.to_vec())
         } else {
             None
         };
 
         ChatRequest {
             messages,
-            model: model.to_string(),
-            max_tokens,
+            model: ctx.model.to_string(),
+            max_tokens: ctx.max_tokens,
             tools: request_tools,
         }
     }
@@ -78,10 +91,13 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{PromptComposer, SOUL_BUDGET_WARNING, SOUL_BUDGET_WARNING_THRESHOLD_TOKENS};
+    use super::{
+        PromptComposer, PromptContext, SOUL_BUDGET_WARNING, SOUL_BUDGET_WARNING_THRESHOLD_TOKENS,
+    };
     use crate::agent::{NativeToolDispatcher, XmlToolDispatcher};
     use crate::context::{ContextManager, InMemoryTapeStore, SoulManager, TapeStore};
     use crate::message::{ChatMessage, ChatRole};
+    use crate::model::ChatRequest;
     use crate::protocol::SessionId;
     use crate::test_support::temp_dir;
     use crate::tool_spec::{RiskLevel, ToolSpec};
@@ -102,19 +118,26 @@ mod tests {
         }
     }
 
+    fn build_prompt(composer: &PromptComposer, ctx: PromptContext<'_>) -> ChatRequest {
+        composer.build_prompt(ctx)
+    }
+
     #[test]
-    fn build_prompt_basic_includes_messages_and_model() {
+    fn test_build_prompt_with_context() {
         let composer = PromptComposer;
         let context_messages = vec![ChatMessage::user("hello")];
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            context_messages,
-            &[sample_tool()],
-            &NativeToolDispatcher,
-            "claude-haiku-4-5-20251001",
-            Some(256),
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages,
+                tools: &[sample_tool()],
+                dispatcher: &NativeToolDispatcher,
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: Some(256),
+            },
         );
 
         assert_eq!(request.model, "claude-haiku-4-5-20251001");
@@ -128,14 +151,17 @@ mod tests {
     fn build_prompt_injects_soul_content_when_present() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "# SOUL\nRemember constraints.",
-            "Base prompt",
-            Vec::new(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "# SOUL\nRemember constraints.",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.messages.len(), 1);
@@ -165,14 +191,17 @@ mod tests {
             .latest_soul_content()
             .await
             .expect("latest soul content should be readable");
-        let request = composer.build_prompt(
-            &latest_soul,
-            "Base prompt",
-            Vec::new(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: &latest_soul,
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert!(request.messages[0].content.starts_with(updated_content));
@@ -180,17 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_skips_empty_soul_header() {
+    fn test_build_prompt_empty_soul() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.messages[0].content, "Base prompt");
@@ -204,31 +236,37 @@ mod tests {
             "a".repeat((SOUL_BUDGET_WARNING_THRESHOLD_TOKENS * 4) + 1)
         );
 
-        let request = composer.build_prompt(
-            &large_soul,
-            "Base prompt",
-            Vec::new(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: &large_soul,
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert!(request.messages[0].content.contains(SOUL_BUDGET_WARNING));
     }
 
     #[test]
-    fn build_prompt_injects_xml_tool_instructions() {
+    fn test_build_prompt_xml_dispatcher() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &[sample_tool()],
-            &XmlToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[sample_tool()],
+                dispatcher: &XmlToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         let system = &request.messages[0].content;
@@ -241,14 +279,17 @@ mod tests {
     fn build_prompt_does_not_inject_native_tool_instructions() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &[sample_tool()],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[sample_tool()],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         let system = &request.messages[0].content;
@@ -262,14 +303,17 @@ mod tests {
         let composer = PromptComposer;
         let tools = vec![sample_tool()];
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &tools,
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &tools,
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.tools, Some(tools));
@@ -279,14 +323,17 @@ mod tests {
     fn build_prompt_omits_tools_for_xml_dispatcher() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &[sample_tool()],
-            &XmlToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[sample_tool()],
+                dispatcher: &XmlToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.tools, None);
@@ -297,14 +344,17 @@ mod tests {
         let composer = PromptComposer;
         let tools = vec![sample_tool()];
 
-        let native_request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &tools,
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let native_request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &tools,
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
         let native_system = &native_request.messages[0].content;
         assert!(native_system.contains("Base prompt"));
@@ -312,14 +362,17 @@ mod tests {
         assert!(!native_system.contains("You have access to the following tools"));
         assert_eq!(native_request.tools, Some(tools.clone()));
 
-        let xml_request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &tools,
-            &XmlToolDispatcher,
-            "model",
-            None,
+        let xml_request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &tools,
+                dispatcher: &XmlToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
         let xml_system = &xml_request.messages[0].content;
         assert!(xml_system.contains("Base prompt"));
@@ -336,14 +389,17 @@ mod tests {
             ChatMessage::assistant("answer"),
         ];
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            context_messages.clone(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: context_messages.clone(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.messages[0].role, ChatRole::System);
@@ -354,14 +410,17 @@ mod tests {
     fn build_prompt_omits_native_tools_when_list_is_empty() {
         let composer = PromptComposer;
 
-        let request = composer.build_prompt(
-            "",
-            "Base prompt",
-            Vec::new(),
-            &[],
-            &NativeToolDispatcher,
-            "model",
-            None,
+        let request = build_prompt(
+            &composer,
+            PromptContext {
+                soul_content: "",
+                system_prompt: "Base prompt",
+                context_messages: Vec::new(),
+                tools: &[],
+                dispatcher: &NativeToolDispatcher,
+                model: "model",
+                max_tokens: None,
+            },
         );
 
         assert_eq!(request.tools, None);
