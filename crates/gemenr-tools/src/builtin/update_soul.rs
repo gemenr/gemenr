@@ -51,8 +51,8 @@ impl ToolHandler for UpdateSoulHandler {
         let mut soul = self.soul.write().await;
 
         match action {
-            "append" => soul.append(section, content),
-            "replace" => soul.update(section, content),
+            "append" => soul.append_async(section, content).await,
+            "replace" => soul.update_async(section, content).await,
             other => {
                 return Err(ToolError::Input {
                     message: format!("invalid action '{other}'"),

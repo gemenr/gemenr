@@ -1,3 +1,5 @@
+//! CLI entry point for task and chat runtimes.
+
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,13 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use gemenr_core::config::ProviderType;
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
     ApprovalDecision, ApprovalHandler, ApprovalRequest, Config, ConfigError, ConversationDriver,
     ConversationId, EventEnvelope, EventKind, EventSink, FallbackPlan, InMemoryTapeStore,
-    JsonlTapeStore, ModelProvider, ModelRouter, PolicyContext, ProviderType, ReplyRoute,
-    RuntimeBuilder, SessionId, SoulManager, TapeStore, ToolInvoker, TurnInput,
+    JsonlTapeStore, ModelProvider, ModelRouter, PolicyContext, ReplyRoute, RuntimeBuilder,
+    SessionId, SoulManager, TapeStore, ToolInvoker, TurnInput,
 };
 use gemenr_tools::{RuleBasedPolicyEvaluator, ToolPlane, builtin};
 use tokio::sync::RwLock;
@@ -718,11 +721,12 @@ mod tests {
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
         ApprovalDecision, ApprovalRequest, AuthorizationDecision, ChatRequest, ChatResponse,
         Config, ConfigError, ConversationDriver, ConversationId, ExecutionContext,
-        InMemoryTapeStore, ModelCapabilities, ModelConfig, ModelError, ModelProvider,
-        PolicyContext, ProviderConfig, ProviderType, RequestContext, SoulManager, TapeStore,
-        ToolCallRequest, ToolInvokeError, ToolInvokeResult, ToolSpec,
+        InMemoryTapeStore, ModelCapabilities, ModelError, ModelProvider, PolicyContext,
+        RequestContext, SoulManager, TapeStore, ToolCallRequest, ToolInvokeError, ToolInvokeResult,
+        ToolSpec,
         config::{
-            McpServerConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind, ScopedPolicyConfig,
+            McpServerConfig, ModelConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind,
+            ProviderConfig, ProviderType, ScopedPolicyConfig,
         },
     };
 

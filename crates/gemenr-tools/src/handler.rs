@@ -68,7 +68,10 @@ impl Default for ExecContext {
 pub enum ToolError {
     /// Invalid or malformed input arguments.
     #[error("invalid input: {message}")]
-    Input { message: String },
+    Input {
+        /// Human-readable validation failure details.
+        message: String,
+    },
 
     /// Tool execution failed.
     #[error("execution failed (exit code {exit_code:?}): {stderr}")]

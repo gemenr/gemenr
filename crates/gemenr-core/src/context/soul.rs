@@ -28,40 +28,38 @@ pub struct SoulManager {
     cached_mtime: Arc<AtomicU64>,
 }
 
-/// Lock-free state used to avoid taking the `SOUL.md` write lock when mtime is unchanged.
+/// Shared state used to avoid taking the `SOUL.md` write lock when mtime is unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct SoulManagerState {
-    path: PathBuf,
-    cached_mtime: Arc<AtomicU64>,
+    manager: Arc<RwLock<SoulManager>>,
 }
 
 impl SoulManagerState {
-    /// Create fast-path reload state from an existing manager.
+    /// Create fast-path reload state from a shared manager handle.
     #[must_use]
-    pub(crate) fn new(manager: &SoulManager) -> Self {
-        Self {
-            path: manager.path.clone(),
-            cached_mtime: Arc::clone(&manager.cached_mtime),
-        }
+    pub(crate) fn new(manager: Arc<RwLock<SoulManager>>) -> Self {
+        Self { manager }
     }
 
     /// Return the latest `SOUL.md` content, reloading from disk only when mtime changes.
-    pub(crate) async fn latest_content(
-        &self,
-        manager: &RwLock<SoulManager>,
-    ) -> Result<String, SoulError> {
-        let current_mtime = SoulFileState::read_mtime_async(self.path.clone()).await?;
-        let cached_mtime = self.cached_mtime.load(Ordering::Acquire);
+    pub(crate) async fn latest_content(&self) -> Result<String, SoulError> {
+        let (path, cached_mtime, cached_content) = {
+            let guard = self.manager.read().await;
+            (
+                guard.path.clone(),
+                guard.cached_mtime.load(Ordering::Acquire),
+                guard.content.clone(),
+            )
+        };
+
+        let current_mtime = SoulFileState::read_mtime_async(path).await?;
 
         if current_mtime == cached_mtime {
-            let guard = manager.read().await;
-            return Ok(guard.content().to_string());
+            return Ok(cached_content);
         }
 
-        let mut guard = manager.write().await;
-        let rechecked_mtime = SoulFileState::read_mtime_async(self.path.clone()).await?;
-        let latest_cached_mtime = self.cached_mtime.load(Ordering::Acquire);
-        if rechecked_mtime == latest_cached_mtime {
+        let mut guard = self.manager.write().await;
+        if current_mtime == guard.cached_mtime.load(Ordering::Acquire) {
             return Ok(guard.content().to_string());
         }
 
@@ -93,12 +91,6 @@ impl SoulManager {
     #[must_use]
     pub fn content(&self) -> &str {
         &self.content
-    }
-
-    /// Return state used by lock-free readers to fast-path unchanged files.
-    #[must_use]
-    pub(crate) fn state(&self) -> SoulManagerState {
-        SoulManagerState::new(self)
     }
 
     /// Reload `SOUL.md` from disk when the file changed.
@@ -440,7 +432,7 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio::time::timeout;
 
-    use super::{DEFAULT_SOUL_TEMPLATE, SoulError, SoulManager};
+    use super::{DEFAULT_SOUL_TEMPLATE, SoulError, SoulManager, SoulManagerState};
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let timestamp = SystemTime::now()
@@ -603,17 +595,14 @@ mod tests {
         let soul = Arc::new(RwLock::new(
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
-        let state = soul.read().await.state();
+        let state = SoulManagerState::new(Arc::clone(&soul));
         let expected = soul.read().await.content().to_string();
         let read_guard = soul.read().await;
 
-        let content = timeout(
-            Duration::from_millis(100),
-            state.latest_content(soul.as_ref()),
-        )
-        .await
-        .expect("latest_content should not wait for a write lock")
-        .expect("latest_content should succeed");
+        let content = timeout(Duration::from_millis(100), state.latest_content())
+            .await
+            .expect("latest_content should not wait for a write lock")
+            .expect("latest_content should succeed");
 
         assert_eq!(content, expected);
         drop(read_guard);
@@ -627,13 +616,13 @@ mod tests {
         let soul = Arc::new(RwLock::new(
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
-        let state = soul.read().await.state();
+        let state = SoulManagerState::new(Arc::clone(&soul));
         let updated_content = "# Identity\nexternal update\n\n# Preferences\nprefs\n\n# Experiences\nexp\n\n# Notes\nnotes\n";
 
         rewrite_with_fresh_mtime(&soul_path, updated_content);
 
         let content = state
-            .latest_content(soul.as_ref())
+            .latest_content()
             .await
             .expect("latest_content should reload after external modification");
 
@@ -664,16 +653,13 @@ mod tests {
         let soul = Arc::new(RwLock::new(
             SoulManager::load(&directory).expect("SOUL.md should load"),
         ));
-        let state = soul.read().await.state();
+        let state = SoulManagerState::new(Arc::clone(&soul));
         let expected = soul.read().await.content().to_string();
         let mut handles = Vec::new();
 
         for _ in 0..8 {
-            let soul = Arc::clone(&soul);
             let state = state.clone();
-            handles.push(tokio::spawn(async move {
-                state.latest_content(soul.as_ref()).await
-            }));
+            handles.push(tokio::spawn(async move { state.latest_content().await }));
         }
 
         for handle in handles {

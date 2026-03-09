@@ -1,12 +1,15 @@
+//! IM daemon entry point for long-lived conversation runtimes.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use gemenr_core::config::ProviderType;
 use gemenr_core::model::AnthropicProvider;
 use gemenr_core::{
     AccessError, AccessInbound, AccessOutbound, Config, ConfigError, ConversationDriver,
-    DenyAllApprovals, InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter, ProviderType,
+    DenyAllApprovals, InMemoryTapeStore, JsonlTapeStore, ModelProvider, ModelRouter,
     RuntimeBuilder, RuntimeManager, SoulManager, TapeStore, ToolInvoker,
 };
 use gemenr_tools::{RuleBasedPolicyEvaluator, ToolPlane, builtin};
@@ -200,10 +203,10 @@ mod tests {
 
     use super::{build_tool_invoker, load_soul_manager};
     use gemenr_core::{
-        AuthorizationDecision, Config, ConfigError, ModelConfig, PolicyContext, ProviderConfig,
-        ProviderType,
+        AuthorizationDecision, Config, ConfigError, PolicyContext,
         config::{
-            McpServerConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind, ScopedPolicyConfig,
+            McpServerConfig, ModelConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind,
+            ProviderConfig, ProviderType, ScopedPolicyConfig,
         },
     };
 

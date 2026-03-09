@@ -68,12 +68,6 @@ pub use config::Config;
 pub use config::ConfigError;
 /// Re-export of runtime composition-root configuration view.
 pub use config::CoreRuntimeConfigView;
-/// Re-export of selectable model definitions.
-pub use config::ModelConfig;
-/// Re-export of provider definitions.
-pub use config::ProviderConfig;
-/// Re-export of supported provider types.
-pub use config::ProviderType;
 /// Re-export of tool-plane composition-root configuration view.
 pub use config::ToolingConfigView;
 /// Re-export of anchor checkpoint entries.

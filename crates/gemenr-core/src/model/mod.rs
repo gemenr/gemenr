@@ -125,11 +125,20 @@ pub struct ModelCapabilities {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolsPayload {
     /// OpenAI Chat Completions function-calling format.
-    OpenAI { tools: Vec<serde_json::Value> },
+    OpenAI {
+        /// Provider-native tool definitions.
+        tools: Vec<serde_json::Value>,
+    },
     /// Anthropic Messages API tool format.
-    Anthropic { tools: Vec<serde_json::Value> },
+    Anthropic {
+        /// Provider-native tool definitions.
+        tools: Vec<serde_json::Value>,
+    },
     /// Prompt-guided fallback where tool descriptions are injected as text.
-    PromptGuided { instructions: String },
+    PromptGuided {
+        /// Serialized tool instructions injected into the prompt.
+        instructions: String,
+    },
 }
 
 /// Structured chat request used by the agent loop.

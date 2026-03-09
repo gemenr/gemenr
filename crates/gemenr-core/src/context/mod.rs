@@ -67,7 +67,7 @@ pub struct ContextManager {
     tape_store: Arc<dyn TapeStore>,
     /// Shared SOUL.md manager.
     soul: Arc<RwLock<SoulManager>>,
-    /// Lock-free SOUL.md reload state shared across calls.
+    /// Shared SOUL.md reload state reused across calls.
     soul_state: SoulManagerState,
 }
 
@@ -79,12 +79,7 @@ impl ContextManager {
         tape_store: Arc<dyn TapeStore>,
         soul: Arc<RwLock<SoulManager>>,
     ) -> Self {
-        let soul_state = {
-            let guard = soul
-                .try_read()
-                .expect("soul lock should be available during context construction");
-            guard.state()
-        };
+        let soul_state = SoulManagerState::new(Arc::clone(&soul));
 
         Self {
             session_id,
@@ -171,7 +166,7 @@ impl ContextManager {
 
     /// Return the latest SOUL.md content, reloading it from disk when needed.
     pub async fn latest_soul_content(&self) -> Result<String, SoulError> {
-        self.soul_state.latest_content(self.soul.as_ref()).await
+        self.soul_state.latest_content().await
     }
 
     /// Return the session identifier.
