@@ -178,14 +178,12 @@ pub use runtime_manager::RuntimeManager;
 pub use runtime_manager::RuntimeManagerError;
 /// Re-export of tool authorization decisions.
 pub use tool_invoker::AuthorizationDecision;
-/// Re-export of final execution policies.
-pub use tool_invoker::ExecutionPolicy;
+/// Re-export of opaque tool execution contexts.
+pub use tool_invoker::ExecutionContext;
 /// Re-export of policy evaluation context.
 pub use tool_invoker::PolicyContext;
 /// Re-export of prepared tool calls that carry authorization results.
 pub use tool_invoker::PreparedToolCall;
-/// Re-export of sandbox selection kinds.
-pub use tool_invoker::SandboxKind;
 /// Re-export of tool authorization contract.
 pub use tool_invoker::ToolAuthorizer;
 /// Re-export of tool call request payloads.

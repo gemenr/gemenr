@@ -201,8 +201,10 @@ mod tests {
     use super::{build_tool_invoker, load_soul_manager};
     use gemenr_core::{
         AuthorizationDecision, Config, ConfigError, ModelConfig, PolicyContext, ProviderConfig,
-        ProviderType, SandboxKind,
-        config::{McpServerConfig, PolicyEffect, PolicyRuleConfig, ScopedPolicyConfig},
+        ProviderType,
+        config::{
+            McpServerConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind, ScopedPolicyConfig,
+        },
     };
 
     #[tokio::test]
@@ -213,7 +215,7 @@ mod tests {
             rules: vec![PolicyRuleConfig {
                 tool: "shell".to_string(),
                 effect: PolicyEffect::Deny,
-                sandbox: SandboxKind::None,
+                sandbox: PolicySandboxKind::None,
             }],
         }];
 

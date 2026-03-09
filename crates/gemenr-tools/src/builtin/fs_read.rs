@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use gemenr_core::{RiskLevel, ToolSpec};
 
-use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput, trace_tool_failure};
 
 const FILE_READ_LIMIT: usize = 50_000;
 
@@ -29,9 +29,12 @@ impl ToolHandler for FsReadHandler {
 
         let content = tokio::fs::read_to_string(resolved_path)
             .await
-            .map_err(|error| ToolError::Execution {
-                exit_code: None,
-                stderr: error.to_string(),
+            .map_err(|error| {
+                trace_tool_failure("fs.read", "read_to_string", &error);
+                ToolError::Execution {
+                    exit_code: None,
+                    stderr: error.to_string(),
+                }
             })?;
 
         Ok(ToolOutput {

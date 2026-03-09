@@ -1,9 +1,66 @@
 use std::sync::Arc;
 
 use gemenr_core::{
-    ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind, ToolCallRequest, ToolSpec,
-    config::{PolicyConfig, PolicyEffect},
+    ExecutionContext, PolicyContext, RiskLevel, ToolCallRequest, ToolSpec,
+    config::{PolicyConfig, PolicyEffect, PolicySandboxKind},
 };
+use serde::{Deserialize, Serialize};
+
+/// Sandbox execution backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxKind {
+    /// No sandboxing.
+    None,
+    /// macOS Seatbelt sandbox.
+    Seatbelt,
+    /// Linux Landlock sandbox.
+    Landlock,
+}
+
+impl From<PolicySandboxKind> for SandboxKind {
+    fn from(value: PolicySandboxKind) -> Self {
+        match value {
+            PolicySandboxKind::None => Self::None,
+            PolicySandboxKind::Seatbelt => Self::Seatbelt,
+            PolicySandboxKind::Landlock => Self::Landlock,
+        }
+    }
+}
+
+/// Execution policy determined by the policy evaluator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    /// Allow execution with the selected sandbox backend.
+    Allow {
+        /// Sandbox backend requested by policy.
+        sandbox: SandboxKind,
+    },
+    /// Require confirmation before execution.
+    NeedConfirmation {
+        /// User-facing confirmation prompt.
+        message: String,
+        /// Sandbox backend requested by policy.
+        sandbox: SandboxKind,
+    },
+    /// Deny execution with a human-readable reason.
+    Deny {
+        /// Reason for the denial.
+        reason: String,
+    },
+}
+
+impl ExecutionPolicy {
+    /// Convert this policy into an opaque execution context for a prepared call.
+    #[must_use]
+    pub fn into_execution_context(self) -> ExecutionContext {
+        let sandbox = match self {
+            Self::Allow { sandbox } | Self::NeedConfirmation { sandbox, .. } => sandbox,
+            Self::Deny { .. } => SandboxKind::None,
+        };
+        ExecutionContext::new(sandbox)
+    }
+}
 
 /// Evaluates the effective execution policy for one tool invocation.
 pub trait PolicyEvaluator: Send + Sync {
@@ -62,7 +119,7 @@ impl RuleBasedPolicyEvaluator {
                 scope: PolicyScope::Organization(scope.id.clone()),
                 tool_name: rule.tool.clone(),
                 effect: rule.effect,
-                sandbox: rule.sandbox,
+                sandbox: rule.sandbox.into(),
             })
         });
         let workspaces = config.workspaces.iter().flat_map(|scope| {
@@ -70,7 +127,7 @@ impl RuleBasedPolicyEvaluator {
                 scope: PolicyScope::Workspace(scope.id.clone()),
                 tool_name: rule.tool.clone(),
                 effect: rule.effect,
-                sandbox: rule.sandbox,
+                sandbox: rule.sandbox.into(),
             })
         });
         let conversations = config.conversations.iter().flat_map(|scope| {
@@ -78,7 +135,7 @@ impl RuleBasedPolicyEvaluator {
                 scope: PolicyScope::Conversation(scope.id.clone()),
                 tool_name: rule.tool.clone(),
                 effect: rule.effect,
-                sandbox: rule.sandbox,
+                sandbox: rule.sandbox.into(),
             })
         });
 
@@ -239,10 +296,9 @@ fn phase_one_default(spec: &ToolSpec) -> ExecutionPolicy {
 
 #[cfg(test)]
 mod tests {
-    use gemenr_core::{
-        ExecutionPolicy, PolicyContext, RiskLevel, SandboxKind, ToolCallRequest, ToolSpec,
-        config::PolicyEffect,
-    };
+    use gemenr_core::{PolicyContext, RiskLevel, ToolCallRequest, ToolSpec, config::PolicyEffect};
+
+    use crate::policy::{ExecutionPolicy, SandboxKind};
     use serde_json::json;
 
     use super::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};

@@ -5,7 +5,7 @@ use gemenr_core::{RiskLevel, ToolSpec, config::McpConfig};
 use tokio::sync::Mutex;
 
 use crate::ToolPlane;
-use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput, trace_tool_failure};
 use crate::mcp::client::{McpClient, McpError, McpRemoteTool};
 
 /// Build the namespaced local tool name for one remote MCP tool.
@@ -97,6 +97,7 @@ fn remote_tool_spec(server_name: &str, remote: &McpRemoteTool) -> ToolSpec {
 }
 
 fn mcp_error_to_tool_error(error: McpError) -> ToolError {
+    trace_tool_failure("mcp", "call_tool", &error);
     ToolError::Execution {
         exit_code: None,
         stderr: error.to_string(),

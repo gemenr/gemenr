@@ -5,8 +5,6 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::debug;
 
-use crate::tool_invoker::SandboxKind;
-
 const CONFIG_FILE_NAME: &str = "gemenr.toml";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_API_ENDPOINT_ENV: &str = "ANTHROPIC_API_ENDPOINT";
@@ -132,7 +130,19 @@ pub struct PolicyRuleConfig {
     /// Rule effect.
     pub effect: PolicyEffect,
     /// Sandbox backend selected when the rule applies.
-    pub sandbox: SandboxKind,
+    pub sandbox: PolicySandboxKind,
+}
+
+/// Sandbox backend configured for one policy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySandboxKind {
+    /// Run the tool without a sandbox wrapper.
+    None,
+    /// Run inside a macOS Seatbelt sandbox.
+    Seatbelt,
+    /// Run inside a Linux Landlock sandbox.
+    Landlock,
 }
 
 /// Effect configured for one policy rule.
@@ -333,7 +343,7 @@ struct RawPolicyRuleConfig {
     tool: String,
     effect: String,
     #[serde(default = "default_sandbox_kind")]
-    sandbox: SandboxKind,
+    sandbox: PolicySandboxKind,
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,8 +476,8 @@ fn default_lark_debounce_ms() -> u64 {
     DEFAULT_LARK_DEBOUNCE_MS
 }
 
-fn default_sandbox_kind() -> SandboxKind {
-    SandboxKind::None
+fn default_sandbox_kind() -> PolicySandboxKind {
+    PolicySandboxKind::None
 }
 
 fn default_enabled() -> bool {
@@ -1257,7 +1267,7 @@ args = ["server.js"]
                     rules: vec![PolicyRuleConfig {
                         tool: "shell".to_string(),
                         effect: PolicyEffect::Allow,
-                        sandbox: super::SandboxKind::None,
+                        sandbox: super::PolicySandboxKind::None,
                     }],
                 }],
                 workspaces: Vec::new(),

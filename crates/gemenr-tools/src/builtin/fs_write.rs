@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use gemenr_core::{RiskLevel, ToolSpec};
 
-use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput, trace_tool_failure};
 
 /// Tool handler for writing text files to disk.
 pub struct FsWriteHandler;
@@ -34,19 +34,23 @@ impl ToolHandler for FsWriteHandler {
         if let Some(parent) = resolved_path.parent()
             && !parent.as_os_str().is_empty()
         {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| ToolError::Execution {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                trace_tool_failure("fs.write", "create_dir_all", &error);
+                ToolError::Execution {
                     exit_code: None,
                     stderr: error.to_string(),
-                })?;
+                }
+            })?;
         }
 
         tokio::fs::write(&resolved_path, content)
             .await
-            .map_err(|error| ToolError::Execution {
-                exit_code: None,
-                stderr: error.to_string(),
+            .map_err(|error| {
+                trace_tool_failure("fs.write", "write", &error);
+                ToolError::Execution {
+                    exit_code: None,
+                    stderr: error.to_string(),
+                }
             })?;
 
         Ok(ToolOutput {

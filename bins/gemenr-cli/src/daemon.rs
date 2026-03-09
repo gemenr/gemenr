@@ -333,9 +333,9 @@ mod tests {
         ModelResponse,
     };
     use gemenr_core::{
-        AccessAdapter, AccessError, AccessOutbound, AccessRouter, InMemoryTapeStore, PolicyContext,
-        ReplyRoute, RuntimeBuilder, SandboxKind, SoulManager, TapeStore, ToolInvokeError,
-        ToolInvokeResult, ToolInvoker, ToolSpec, config::CronJobConfig,
+        AccessAdapter, AccessError, AccessOutbound, AccessRouter, ExecutionContext,
+        InMemoryTapeStore, PolicyContext, ReplyRoute, RuntimeBuilder, SoulManager, TapeStore,
+        ToolInvokeError, ToolInvokeResult, ToolInvoker, ToolSpec, config::CronJobConfig,
     };
     use serde_json::json;
     use tokio::sync::RwLock;
@@ -456,9 +456,7 @@ mod tests {
         ) -> gemenr_core::AuthorizationDecision {
             gemenr_core::AuthorizationDecision::Prepared(gemenr_core::PreparedToolCall {
                 request: request.clone(),
-                policy: gemenr_core::ExecutionPolicy::Allow {
-                    sandbox: SandboxKind::None,
-                },
+                execution_context: ExecutionContext::new(()),
             })
         }
     }

@@ -25,7 +25,10 @@ pub use mcp::{
     McpClient, McpError, McpRemoteTool, McpToolAdapter, McpToolResult, mcp_tool_name,
     register_mcp_servers,
 };
-pub use policy::{PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator};
+pub use policy::{
+    ExecutionPolicy, PolicyEvaluator, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator,
+    SandboxKind,
+};
 
 /// Create a filtered tool invoker view that only exposes `allowed` tools.
 #[must_use]
@@ -193,19 +196,23 @@ impl ToolPlane {
         };
 
         let policy = self.policy_evaluator.evaluate(context, spec, request);
-        let prepared = tool_invoker::PreparedToolCall {
-            request: request.clone(),
-            policy: policy.clone(),
-        };
-
         match policy {
-            tool_invoker::ExecutionPolicy::Allow { .. } => {
-                tool_invoker::AuthorizationDecision::Prepared(prepared)
+            ExecutionPolicy::Allow { sandbox } => {
+                tool_invoker::AuthorizationDecision::Prepared(tool_invoker::PreparedToolCall {
+                    request: request.clone(),
+                    execution_context: tool_invoker::ExecutionContext::new(sandbox),
+                })
             }
-            tool_invoker::ExecutionPolicy::NeedConfirmation { message, .. } => {
-                tool_invoker::AuthorizationDecision::NeedConfirmation { prepared, message }
+            ExecutionPolicy::NeedConfirmation { message, sandbox } => {
+                tool_invoker::AuthorizationDecision::NeedConfirmation {
+                    prepared: tool_invoker::PreparedToolCall {
+                        request: request.clone(),
+                        execution_context: tool_invoker::ExecutionContext::new(sandbox),
+                    },
+                    message,
+                }
             }
-            tool_invoker::ExecutionPolicy::Deny { reason } => {
+            ExecutionPolicy::Deny { reason } => {
                 tool_invoker::AuthorizationDecision::Denied { reason }
             }
         }
@@ -225,7 +232,18 @@ impl ToolPlane {
         debug!(call_id = %prepared.request.call_id, tool = %prepared.request.name, "invoking tool");
 
         let mut execution_context = ctx.clone();
-        execution_context.execution_policy = Some(prepared.policy.clone());
+        execution_context.sandbox = prepared
+            .execution_context
+            .downcast_ref::<SandboxKind>()
+            .copied()
+            .unwrap_or_else(|| {
+                warn!(
+                    call_id = %prepared.request.call_id,
+                    tool = %prepared.request.name,
+                    "prepared tool call missing sandbox context; defaulting to unsandboxed execution"
+                );
+                SandboxKind::None
+            });
 
         let execution = async {
             let tool_future =
@@ -301,9 +319,12 @@ impl tool_invoker::ToolExecutor for ToolPlane {
             Err(ToolError::NotFound(name)) => Err(tool_invoker::ToolInvokeError::NotFound(name)),
             Err(ToolError::Timeout(_)) => Err(tool_invoker::ToolInvokeError::Timeout),
             Err(ToolError::Cancelled) => Err(tool_invoker::ToolInvokeError::Cancelled),
-            Err(error) => Err(tool_invoker::ToolInvokeError::Execution {
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                handler::trace_tool_failure(&prepared.request.name, "invoke", &error);
+                Err(tool_invoker::ToolInvokeError::Execution {
+                    message: error.to_string(),
+                })
+            }
         }
     }
 }
@@ -316,14 +337,13 @@ mod tests {
 
     use async_trait::async_trait;
     use gemenr_core::{
-        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, RiskLevel,
-        SandboxKind, ToolCatalog as _,
+        AuthorizationDecision, PolicyContext, PreparedToolCall, RiskLevel, ToolCatalog as _,
     };
     use serde_json::json;
 
     use super::{
-        ExecContext, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator, ToolCallSpec, ToolError,
-        ToolHandler, ToolOutput, ToolPlane,
+        ExecContext, ExecutionPolicy, PolicyRule, PolicyScope, RuleBasedPolicyEvaluator,
+        SandboxKind, ToolCallSpec, ToolError, ToolHandler, ToolOutput, ToolPlane,
     };
 
     struct StaticHandler {
@@ -370,6 +390,21 @@ mod tests {
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput {
                 content: ctx.working_dir.display().to_string(),
+            })
+        }
+    }
+
+    struct SandboxEchoHandler;
+
+    #[async_trait]
+    impl ToolHandler for SandboxEchoHandler {
+        async fn execute(
+            &self,
+            ctx: &ExecContext,
+            _args: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: format!("{:?}", ctx.sandbox),
             })
         }
     }
@@ -425,7 +460,7 @@ mod tests {
     fn prepared_call(name: &str, policy: ExecutionPolicy) -> PreparedToolCall {
         PreparedToolCall {
             request: call(name),
-            policy,
+            execution_context: policy.into_execution_context(),
         }
     }
 
@@ -533,6 +568,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoke_downcasts_prepared_sandbox_context() {
+        let mut plane = ToolPlane::new();
+        plane.register(spec("shell"), Box::new(SandboxEchoHandler));
+
+        let output = plane
+            .invoke(
+                &prepared_call(
+                    "shell",
+                    ExecutionPolicy::Allow {
+                        sandbox: SandboxKind::Seatbelt,
+                    },
+                ),
+                &ExecContext::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("sandbox should be forwarded");
+
+        assert_eq!(output.content, "Seatbelt");
+    }
+
+    #[tokio::test]
     async fn invoke_returns_not_found_for_missing_tool() {
         let plane = ToolPlane::new();
 
@@ -628,19 +685,23 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            decision,
-            AuthorizationDecision::Prepared(PreparedToolCall {
-                request: ToolCallSpec {
-                    call_id: "call-1".to_string(),
-                    name: "shell".to_string(),
-                    arguments: json!({"command": "pwd"}),
-                },
-                policy: ExecutionPolicy::Allow {
-                    sandbox: SandboxKind::Seatbelt,
-                },
-            })
-        );
+        match decision {
+            AuthorizationDecision::Prepared(prepared) => {
+                assert_eq!(
+                    prepared.request,
+                    ToolCallSpec {
+                        call_id: "call-1".to_string(),
+                        name: "shell".to_string(),
+                        arguments: json!({"command": "pwd"}),
+                    }
+                );
+                assert_eq!(
+                    prepared.execution_context.downcast_ref::<SandboxKind>(),
+                    Some(&SandboxKind::Seatbelt)
+                );
+            }
+            other => panic!("expected prepared decision, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -696,23 +757,24 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            decision,
-            AuthorizationDecision::NeedConfirmation {
-                prepared: PreparedToolCall {
-                    request: ToolCallSpec {
+        match decision {
+            AuthorizationDecision::NeedConfirmation { prepared, message } => {
+                assert_eq!(message, "Tool 'shell' requires confirmation");
+                assert_eq!(
+                    prepared.request,
+                    ToolCallSpec {
                         call_id: "call-1".to_string(),
                         name: "shell".to_string(),
                         arguments: json!({"command": "pwd"}),
-                    },
-                    policy: ExecutionPolicy::NeedConfirmation {
-                        message: "Tool 'shell' requires confirmation".to_string(),
-                        sandbox: SandboxKind::Seatbelt,
-                    },
-                },
-                message: "Tool 'shell' requires confirmation".to_string(),
+                    }
+                );
+                assert_eq!(
+                    prepared.execution_context.downcast_ref::<SandboxKind>(),
+                    Some(&SandboxKind::Seatbelt)
+                );
             }
-        );
+            other => panic!("expected confirmation decision, got {other:?}"),
+        }
     }
 }
 
@@ -723,12 +785,12 @@ mod allowlist_tests {
 
     use async_trait::async_trait;
     use gemenr_core::{
-        AuthorizationDecision, ExecutionPolicy, PreparedToolCall, RiskLevel, ToolAuthorizer,
+        AuthorizationDecision, ExecutionContext, PreparedToolCall, RiskLevel, ToolAuthorizer,
         ToolCatalog, ToolExecutor, ToolInvokeError, ToolInvokeResult,
     };
     use serde_json::json;
 
-    use super::allowlist_tool_invoker;
+    use super::{SandboxKind, allowlist_tool_invoker};
 
     struct StaticInvoker {
         specs: Vec<gemenr_core::ToolSpec>,
@@ -768,9 +830,7 @@ mod allowlist_tests {
         ) -> AuthorizationDecision {
             AuthorizationDecision::Prepared(PreparedToolCall {
                 request: request.clone(),
-                policy: ExecutionPolicy::Allow {
-                    sandbox: gemenr_core::SandboxKind::None,
-                },
+                execution_context: ExecutionContext::new(SandboxKind::None),
             })
         }
     }

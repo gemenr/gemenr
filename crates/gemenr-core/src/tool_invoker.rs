@@ -1,9 +1,10 @@
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::tool_spec::ToolSpec;
+use async_trait::async_trait;
 
 /// Result of a successful tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,38 +58,43 @@ pub struct PolicyContext {
     pub conversation_id: Option<String>,
 }
 
-/// Sandbox backend selected by policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxKind {
-    /// Run the tool without a sandbox wrapper.
-    None,
-    /// Run inside a macOS Seatbelt sandbox.
-    Seatbelt,
-    /// Run inside a Linux Landlock sandbox.
-    Landlock,
+/// Opaque execution context attached to a prepared tool call.
+///
+/// The authorizer populates this with implementation-specific data, and the
+/// executor consumes it. Core does not inspect or interpret this value.
+pub struct ExecutionContext(Box<dyn Any + Send + Sync>);
+
+impl ExecutionContext {
+    /// Create a new execution context wrapping the given value.
+    #[must_use]
+    pub fn new<T>(value: T) -> Self
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        Self(Box::new(value))
+    }
+
+    /// Attempt to downcast the context to a concrete type by reference.
+    #[must_use]
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+
+    /// Attempt to consume and downcast the context to a concrete type.
+    pub fn downcast<T: Any>(self) -> Result<T, Self> {
+        match self.0.downcast::<T>() {
+            Ok(value) => Ok(*value),
+            Err(value) => Err(Self(value)),
+        }
+    }
 }
 
-/// Final execution plan returned by policy evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionPolicy {
-    /// Allow execution with the selected sandbox backend.
-    Allow {
-        /// Sandbox backend requested by policy.
-        sandbox: SandboxKind,
-    },
-    /// Require confirmation before execution.
-    NeedConfirmation {
-        /// User-facing confirmation prompt.
-        message: String,
-        /// Sandbox backend requested by policy.
-        sandbox: SandboxKind,
-    },
-    /// Deny execution with a human-readable reason.
-    Deny {
-        /// Reason for the denial.
-        reason: String,
-    },
+impl fmt::Debug for ExecutionContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionContext")
+            .field("type_id", &(*self.0).type_id())
+            .finish()
+    }
 }
 
 /// Tool call payload used during the authorization phase.
@@ -102,17 +108,17 @@ pub struct ToolCallRequest {
     pub arguments: serde_json::Value,
 }
 
-/// Authorized tool call that carries the resolved execution policy forward.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A tool call that has been authorized and is ready for execution.
+#[derive(Debug)]
 pub struct PreparedToolCall {
-    /// Original tool call request.
+    /// The original call request.
     pub request: ToolCallRequest,
-    /// Execution policy resolved during authorization.
-    pub policy: ExecutionPolicy,
+    /// Opaque execution context from the authorizer.
+    pub execution_context: ExecutionContext,
 }
 
 /// Result of authorizing a tool call request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AuthorizationDecision {
     /// The tool call is ready to execute immediately.
     Prepared(PreparedToolCall),
@@ -181,55 +187,31 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
-        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError,
-        ToolInvokeResult, ToolInvoker,
+        AuthorizationDecision, ExecutionContext, PolicyContext, PreparedToolCall, ToolAuthorizer,
+        ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError, ToolInvokeResult, ToolInvoker,
     };
 
-    #[test]
-    fn execution_policy_variants_are_comparable() {
-        assert_eq!(
-            ExecutionPolicy::Allow {
-                sandbox: SandboxKind::Seatbelt,
-            },
-            ExecutionPolicy::Allow {
-                sandbox: SandboxKind::Seatbelt,
-            }
-        );
-        assert_eq!(
-            ExecutionPolicy::NeedConfirmation {
-                message: "confirm".to_string(),
-                sandbox: SandboxKind::Landlock,
-            },
-            ExecutionPolicy::NeedConfirmation {
-                message: "confirm".to_string(),
-                sandbox: SandboxKind::Landlock,
-            }
-        );
-        assert_eq!(
-            ExecutionPolicy::Deny {
-                reason: "nope".to_string(),
-            },
-            ExecutionPolicy::Deny {
-                reason: "nope".to_string(),
-            }
-        );
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestSandboxKind {
+        None,
+        Seatbelt,
+        Landlock,
     }
 
     #[test]
-    fn sandbox_kind_serializes_to_stable_values() {
+    fn execution_context_supports_type_erasure_round_trip() {
+        let context = ExecutionContext::new(TestSandboxKind::Landlock);
+
         assert_eq!(
-            serde_json::to_value(SandboxKind::None).expect("serialize"),
-            json!("none")
+            context.downcast_ref::<TestSandboxKind>(),
+            Some(&TestSandboxKind::Landlock)
         );
-        assert_eq!(
-            serde_json::to_value(SandboxKind::Seatbelt).expect("serialize"),
-            json!("seatbelt")
-        );
-        assert_eq!(
-            serde_json::to_value(SandboxKind::Landlock).expect("serialize"),
-            json!("landlock")
-        );
+
+        let restored = ExecutionContext::new(TestSandboxKind::Seatbelt)
+            .downcast::<TestSandboxKind>()
+            .expect("context should downcast");
+
+        assert_eq!(restored, TestSandboxKind::Seatbelt);
     }
 
     #[test]
@@ -291,22 +273,24 @@ mod tests {
             name: "shell".to_string(),
             arguments: json!({"command": "pwd"}),
         };
-        let prepared = PreparedToolCall {
+        let decision = AuthorizationDecision::Prepared(PreparedToolCall {
             request: request.clone(),
-            policy: ExecutionPolicy::NeedConfirmation {
-                message: "confirm shell".to_string(),
-                sandbox: SandboxKind::Seatbelt,
-            },
-        };
+            execution_context: ExecutionContext::new(TestSandboxKind::Seatbelt),
+        });
 
-        assert_eq!(
-            AuthorizationDecision::Prepared(prepared.clone()),
-            AuthorizationDecision::Prepared(prepared.clone())
-        );
-        assert_eq!(prepared.request, request);
-        assert_eq!(prepared.request.call_id, "call-1");
-        assert_eq!(prepared.request.name, "shell");
-        assert_eq!(prepared.request.arguments, json!({"command": "pwd"}));
+        match decision {
+            AuthorizationDecision::Prepared(prepared) => {
+                assert_eq!(prepared.request, request);
+                assert_eq!(prepared.request.call_id, "call-1");
+                assert_eq!(prepared.request.name, "shell");
+                assert_eq!(prepared.request.arguments, json!({"command": "pwd"}));
+                assert_eq!(
+                    prepared.execution_context.downcast_ref::<TestSandboxKind>(),
+                    Some(&TestSandboxKind::Seatbelt)
+                );
+            }
+            other => panic!("expected prepared decision, got {other:?}"),
+        }
     }
 
     #[test]
@@ -331,9 +315,7 @@ mod tests {
             ) -> AuthorizationDecision {
                 AuthorizationDecision::Prepared(PreparedToolCall {
                     request: request.clone(),
-                    policy: ExecutionPolicy::Allow {
-                        sandbox: SandboxKind::None,
-                    },
+                    execution_context: ExecutionContext::new(TestSandboxKind::None),
                 })
             }
         }

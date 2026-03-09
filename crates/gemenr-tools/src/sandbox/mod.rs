@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use gemenr_core::SandboxKind;
 use tokio::process::Command;
 
-use crate::handler::{ExecContext, ToolError, ToolOutput};
+use crate::SandboxKind;
+use crate::handler::{ExecContext, ToolError, ToolOutput, trace_tool_failure};
 
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -77,13 +77,13 @@ pub(crate) fn push_shell_invocation(command: &mut Command, shell_command: &str) 
 }
 
 pub(crate) async fn collect_output(mut command: Command) -> Result<ToolOutput, ToolError> {
-    let output = command
-        .output()
-        .await
-        .map_err(|error| ToolError::Execution {
+    let output = command.output().await.map_err(|error| {
+        trace_tool_failure("shell", "spawn", &error);
+        ToolError::Execution {
             exit_code: None,
             stderr: error.to_string(),
-        })?;
+        }
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -113,10 +113,8 @@ fn truncate_output(content: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gemenr_core::SandboxKind;
-
     use super::runner_for;
-    use crate::ToolError;
+    use crate::{SandboxKind, ToolError};
 
     #[test]
     fn backend_selection_matches_current_platform() {

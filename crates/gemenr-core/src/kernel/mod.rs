@@ -813,8 +813,8 @@ mod tests {
     use crate::message::{ChatMessage, ChatRole};
     use crate::model::{ChatRequest, ChatResponse, FinishReason, ModelCapabilities, ModelResponse};
     use crate::tool_invoker::{
-        AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
-        ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeResult,
+        AuthorizationDecision, ExecutionContext, PolicyContext, PreparedToolCall, ToolAuthorizer,
+        ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeResult,
     };
     use crate::tool_spec::{RiskLevel, ToolSpec};
     use async_trait::async_trait;
@@ -915,10 +915,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedSandboxKind {
+        None,
+        Seatbelt,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ScriptedAuthorizationPlan {
+        Allow {
+            sandbox: ScriptedSandboxKind,
+        },
+        NeedConfirmation {
+            message: String,
+            sandbox: ScriptedSandboxKind,
+        },
+        Deny {
+            reason: String,
+        },
+    }
+
     struct ScriptedToolInvoker {
         specs: HashMap<String, ToolSpec>,
         specs_cache: Vec<ToolSpec>,
-        policies: HashMap<String, ExecutionPolicy>,
+        policies: HashMap<String, ScriptedAuthorizationPlan>,
         authorization_contexts: Mutex<Vec<PolicyContext>>,
         outputs: Mutex<HashMap<String, VecDeque<Result<ToolInvokeResult, ToolInvokeError>>>>,
         cancellation_handles: Mutex<Vec<Arc<AtomicBool>>>,
@@ -962,7 +982,7 @@ mod tests {
             self
         }
 
-        fn with_policy(mut self, name: &str, policy: ExecutionPolicy) -> Self {
+        fn with_policy(mut self, name: &str, policy: ScriptedAuthorizationPlan) -> Self {
             self.policies.insert(name.to_string(), policy);
             self
         }
@@ -1012,24 +1032,31 @@ mod tests {
                 .lock()
                 .expect("authorization contexts lock should not be poisoned")
                 .push(context.clone());
-            let policy =
-                self.policies
-                    .get(&request.name)
-                    .cloned()
-                    .unwrap_or(ExecutionPolicy::Allow {
-                        sandbox: SandboxKind::None,
-                    });
-            let prepared = PreparedToolCall {
-                request: request.clone(),
-                policy: policy.clone(),
-            };
+            let plan = self.policies.get(&request.name).cloned().unwrap_or(
+                ScriptedAuthorizationPlan::Allow {
+                    sandbox: ScriptedSandboxKind::None,
+                },
+            );
 
-            match policy {
-                ExecutionPolicy::Allow { .. } => AuthorizationDecision::Prepared(prepared),
-                ExecutionPolicy::NeedConfirmation { message, .. } => {
-                    AuthorizationDecision::NeedConfirmation { prepared, message }
+            match plan {
+                ScriptedAuthorizationPlan::Allow { sandbox } => {
+                    AuthorizationDecision::Prepared(PreparedToolCall {
+                        request: request.clone(),
+                        execution_context: ExecutionContext::new(sandbox),
+                    })
                 }
-                ExecutionPolicy::Deny { reason } => AuthorizationDecision::Denied { reason },
+                ScriptedAuthorizationPlan::NeedConfirmation { message, sandbox } => {
+                    AuthorizationDecision::NeedConfirmation {
+                        prepared: PreparedToolCall {
+                            request: request.clone(),
+                            execution_context: ExecutionContext::new(sandbox),
+                        },
+                        message,
+                    }
+                }
+                ScriptedAuthorizationPlan::Deny { reason } => {
+                    AuthorizationDecision::Denied { reason }
+                }
             }
         }
     }
@@ -1695,9 +1722,9 @@ mod tests {
             ScriptedToolInvoker::new(vec![sample_tool_spec()])
                 .with_policy(
                     "echo",
-                    ExecutionPolicy::NeedConfirmation {
+                    ScriptedAuthorizationPlan::NeedConfirmation {
                         message: "approve echo".to_string(),
-                        sandbox: SandboxKind::Seatbelt,
+                        sandbox: ScriptedSandboxKind::Seatbelt,
                     },
                 )
                 .with_output(
@@ -1919,9 +1946,9 @@ mod tests {
             ScriptedToolInvoker::new(vec![sample_tool_spec()])
                 .with_policy(
                     "echo",
-                    ExecutionPolicy::NeedConfirmation {
+                    ScriptedAuthorizationPlan::NeedConfirmation {
                         message: "approve echo".to_string(),
-                        sandbox: SandboxKind::Seatbelt,
+                        sandbox: ScriptedSandboxKind::Seatbelt,
                     },
                 )
                 .with_output(
@@ -1977,7 +2004,7 @@ mod tests {
         let tools = Arc::new(
             ScriptedToolInvoker::new(vec![sample_tool_spec()]).with_policy(
                 "echo",
-                ExecutionPolicy::Deny {
+                ScriptedAuthorizationPlan::Deny {
                     reason: "policy blocked tool".to_string(),
                 },
             ),

@@ -1,11 +1,15 @@
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gemenr_core::{ExecutionPolicy, PolicyContext, ToolCallRequest};
+use gemenr_core::{PolicyContext, ToolCallRequest};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::policy::SandboxKind;
 
 /// Handler for executing a registered tool.
 ///
@@ -41,8 +45,8 @@ pub struct ExecContext {
     pub timeout: Duration,
     /// Policy context associated with the invocation.
     pub policy_context: PolicyContext,
-    /// Effective execution policy selected for the call.
-    pub execution_policy: Option<ExecutionPolicy>,
+    /// Sandbox backend selected for the prepared call.
+    pub sandbox: SandboxKind,
     /// Shared cancellation flag propagated from the runtime.
     pub cancelled: Arc<AtomicBool>,
 }
@@ -53,7 +57,7 @@ impl Default for ExecContext {
             working_dir: std::env::current_dir().unwrap_or_default(),
             timeout: Duration::from_secs(120),
             policy_context: PolicyContext::default(),
-            execution_policy: None,
+            sandbox: SandboxKind::None,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -97,6 +101,32 @@ pub enum ToolError {
     },
 }
 
+pub(crate) fn trace_tool_failure<E>(tool_name: &str, action: &str, error: &E)
+where
+    E: StdError + 'static,
+{
+    warn!(
+        tool_name,
+        action,
+        error = %error,
+        error_debug = ?error,
+        error_chain = ?error_chain(error),
+        "Tool execution failed"
+    );
+}
+
+fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+    let mut chain = vec![error.to_string()];
+    let mut source = error.source();
+
+    while let Some(next) = source {
+        chain.push(next.to_string());
+        source = next.source();
+    }
+
+    chain
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -105,6 +135,7 @@ mod tests {
     use serde_json::json;
 
     use super::{ExecContext, ToolCallSpec, ToolError};
+    use crate::policy::SandboxKind;
 
     #[test]
     fn tool_call_spec_exposes_fields() {
@@ -124,6 +155,13 @@ mod tests {
         let context = ExecContext::default();
 
         assert_eq!(context.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn exec_context_defaults_to_unsandboxed_execution() {
+        let context = ExecContext::default();
+
+        assert_eq!(context.sandbox, SandboxKind::None);
     }
 
     #[test]

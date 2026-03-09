@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gemenr_core::{ExecutionPolicy, RiskLevel, SandboxKind, ToolSpec};
+use gemenr_core::{RiskLevel, ToolSpec};
 
+use crate::SandboxKind;
 use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
 use crate::sandbox::{self, SandboxRunner, ShellCommand};
 
@@ -55,7 +56,7 @@ impl ToolHandler for ShellHandler {
             command: command.to_string(),
         };
 
-        match selected_sandbox(ctx.execution_policy.as_ref())? {
+        match ctx.sandbox {
             SandboxKind::None => sandbox::run_without_sandbox(&shell_command, ctx).await,
             kind => {
                 let runner = (self.runner_selector)(kind)?;
@@ -85,18 +86,6 @@ pub fn shell_spec() -> ToolSpec {
     }
 }
 
-fn selected_sandbox(policy: Option<&ExecutionPolicy>) -> Result<SandboxKind, ToolError> {
-    match policy {
-        Some(ExecutionPolicy::Allow { sandbox })
-        | Some(ExecutionPolicy::NeedConfirmation { sandbox, .. }) => Ok(*sandbox),
-        Some(ExecutionPolicy::Deny { reason }) => Err(ToolError::Execution {
-            exit_code: None,
-            stderr: format!("Denied: {reason}"),
-        }),
-        None => Ok(SandboxKind::None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -109,8 +98,7 @@ mod tests {
 
     use super::{ShellHandler, shell_spec};
     use crate::sandbox::{SandboxRunner, ShellCommand};
-    use crate::{ExecContext, ToolError, ToolHandler, ToolOutput};
-    use gemenr_core::{ExecutionPolicy, SandboxKind};
+    use crate::{ExecContext, SandboxKind, ToolError, ToolHandler, ToolOutput};
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -170,9 +158,7 @@ mod tests {
             }) as Box<dyn SandboxRunner>)
         }));
         let context = ExecContext {
-            execution_policy: Some(ExecutionPolicy::Allow {
-                sandbox: SandboxKind::Seatbelt,
-            }),
+            sandbox: SandboxKind::Seatbelt,
             ..ExecContext::default()
         };
 
@@ -199,9 +185,7 @@ mod tests {
             })
         }));
         let context = ExecContext {
-            execution_policy: Some(ExecutionPolicy::Allow {
-                sandbox: SandboxKind::Landlock,
-            }),
+            sandbox: SandboxKind::Landlock,
             ..ExecContext::default()
         };
 

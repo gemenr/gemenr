@@ -19,8 +19,8 @@ use crate::model::{
     ModelResponse, RequestContext,
 };
 use crate::tool_invoker::{
-    AuthorizationDecision, ExecutionPolicy, PolicyContext, PreparedToolCall, SandboxKind,
-    ToolAuthorizer, ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError, ToolInvokeResult,
+    AuthorizationDecision, ExecutionContext, PolicyContext, PreparedToolCall, ToolAuthorizer,
+    ToolCallRequest, ToolCatalog, ToolExecutor, ToolInvokeError, ToolInvokeResult,
 };
 use crate::tool_spec::ToolSpec;
 
@@ -215,9 +215,7 @@ impl ToolAuthorizer for NoopToolInvoker {
     ) -> AuthorizationDecision {
         AuthorizationDecision::Prepared(PreparedToolCall {
             request: request.clone(),
-            policy: ExecutionPolicy::Allow {
-                sandbox: SandboxKind::None,
-            },
+            execution_context: ExecutionContext::new(()),
         })
     }
 }
@@ -264,9 +262,7 @@ impl ToolAuthorizer for StaticToolInvoker {
     ) -> AuthorizationDecision {
         AuthorizationDecision::Prepared(PreparedToolCall {
             request: request.clone(),
-            policy: ExecutionPolicy::Allow {
-                sandbox: SandboxKind::None,
-            },
+            execution_context: ExecutionContext::new(()),
         })
     }
 }

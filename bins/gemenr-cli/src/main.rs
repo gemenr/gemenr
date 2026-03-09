@@ -717,11 +717,13 @@ mod tests {
     use gemenr_core::{
         AccessAdapter, AccessError, AccessInbound, AccessOutbound, AccessRouter, AgentError,
         ApprovalDecision, ApprovalRequest, AuthorizationDecision, ChatRequest, ChatResponse,
-        Config, ConfigError, ConversationDriver, ConversationId, InMemoryTapeStore,
-        ModelCapabilities, ModelConfig, ModelError, ModelProvider, PolicyContext, ProviderConfig,
-        ProviderType, RequestContext, SandboxKind, SoulManager, TapeStore, ToolCallRequest,
-        ToolInvokeError, ToolInvokeResult, ToolSpec,
-        config::{McpServerConfig, PolicyEffect, PolicyRuleConfig, ScopedPolicyConfig},
+        Config, ConfigError, ConversationDriver, ConversationId, ExecutionContext,
+        InMemoryTapeStore, ModelCapabilities, ModelConfig, ModelError, ModelProvider,
+        PolicyContext, ProviderConfig, ProviderType, RequestContext, SoulManager, TapeStore,
+        ToolCallRequest, ToolInvokeError, ToolInvokeResult, ToolSpec,
+        config::{
+            McpServerConfig, PolicyEffect, PolicyRuleConfig, PolicySandboxKind, ScopedPolicyConfig,
+        },
     };
 
     #[test]
@@ -1043,7 +1045,7 @@ mod tests {
             rules: vec![PolicyRuleConfig {
                 tool: "shell".to_string(),
                 effect: PolicyEffect::Deny,
-                sandbox: SandboxKind::None,
+                sandbox: PolicySandboxKind::None,
             }],
         }];
 
@@ -1293,9 +1295,7 @@ while True:
         ) -> gemenr_core::AuthorizationDecision {
             gemenr_core::AuthorizationDecision::Prepared(gemenr_core::PreparedToolCall {
                 request: request.clone(),
-                policy: gemenr_core::ExecutionPolicy::Allow {
-                    sandbox: gemenr_core::SandboxKind::None,
-                },
+                execution_context: ExecutionContext::new(()),
             })
         }
     }

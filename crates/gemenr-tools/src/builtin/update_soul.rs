@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use gemenr_core::{RiskLevel, SoulManager, ToolSpec};
 use tokio::sync::RwLock;
 
-use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput};
+use crate::handler::{ExecContext, ToolError, ToolHandler, ToolOutput, trace_tool_failure};
 
 /// Tool handler for updating persistent `SOUL.md` memory.
 pub struct UpdateSoulHandler {
@@ -59,9 +59,12 @@ impl ToolHandler for UpdateSoulHandler {
                 });
             }
         }
-        .map_err(|error| ToolError::Execution {
-            exit_code: None,
-            stderr: error.to_string(),
+        .map_err(|error| {
+            trace_tool_failure("update_soul", "update", &error);
+            ToolError::Execution {
+                exit_code: None,
+                stderr: error.to_string(),
+            }
         })?;
 
         Ok(ToolOutput {
