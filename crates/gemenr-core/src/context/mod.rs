@@ -17,6 +17,7 @@ pub mod soul;
 /// Tape storage backends and anchor loading.
 pub mod tape;
 
+use soul::SoulManagerState;
 pub use soul::{SoulError, SoulManager};
 pub use tape::{AnchorEntry, InMemoryTapeStore, JsonlTapeStore, TapeError, TapeStore};
 
@@ -66,6 +67,8 @@ pub struct ContextManager {
     tape_store: Arc<dyn TapeStore>,
     /// Shared SOUL.md manager.
     soul: Arc<RwLock<SoulManager>>,
+    /// Lock-free SOUL.md reload state shared across calls.
+    soul_state: SoulManagerState,
 }
 
 impl ContextManager {
@@ -76,12 +79,20 @@ impl ContextManager {
         tape_store: Arc<dyn TapeStore>,
         soul: Arc<RwLock<SoulManager>>,
     ) -> Self {
+        let soul_state = {
+            let guard = soul
+                .try_read()
+                .expect("soul lock should be available during context construction");
+            guard.state()
+        };
+
         Self {
             session_id,
             events: Vec::new(),
             current_anchor: None,
             tape_store,
             soul,
+            soul_state,
         }
     }
 
@@ -160,9 +171,7 @@ impl ContextManager {
 
     /// Return the latest SOUL.md content, reloading it from disk when needed.
     pub async fn latest_soul_content(&self) -> Result<String, SoulError> {
-        let mut soul = self.soul.write().await;
-        soul.reload_if_changed()?;
-        Ok(soul.content().to_string())
+        self.soul_state.latest_content(self.soul.as_ref()).await
     }
 
     /// Return the session identifier.
